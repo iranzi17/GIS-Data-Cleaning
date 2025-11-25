@@ -1,0 +1,14 @@
+.DS_Store
+Thumbs.db
+*.zip
+*.tmp
+*.log
+*.pyc
+__pycache__/
+*.gdb/
+reference_data/Jabana1.gdb/
+reference_data/SUBSTATION 1-25102025_harmonized.xlsx
+reference_data/SUBSTATION 1-25102025_harmonized2.xlsx
+reference_data/SUBSTATIONS 2-251025_harmonized.xlsx
+reference_data/SUBSTATIONS 2-251025_harmonized2.xlsx
+reference_data/~$SUBSTATIONS 2-251025_harmonized2.xlsx
