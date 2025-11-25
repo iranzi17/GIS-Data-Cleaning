@@ -13,6 +13,7 @@ import geopandas as gpd
 import pandas as pd
 import streamlit as st
 
+
 # =====================================================================
 # PATHS
 # =====================================================================
@@ -24,6 +25,7 @@ REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
+
 
 # =====================================================================
 # HEADER CLEANING UTILITIES
@@ -149,36 +151,153 @@ def list_gpkg_layers(path: Path) -> list[str]:
             return []
 
 
+_REFERENCE_ALIAS_COLUMNS: list[str] | None = None
+
+
+def get_reference_columns() -> list[str]:
+    """Collect column names from reference GeoPackages to enrich fuzzy aliases."""
+    global _REFERENCE_ALIAS_COLUMNS
+    if _REFERENCE_ALIAS_COLUMNS is not None:
+        return _REFERENCE_ALIAS_COLUMNS
+    cols: set[str] = set()
+    try:
+        for p in REFERENCE_DATA_DIR.glob("*.gpkg"):
+            for lyr in list_gpkg_layers(p):
+                try:
+                    gdf = gpd.read_file(p, layer=lyr, rows=1)
+                    cols.update(gdf.columns)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    _REFERENCE_ALIAS_COLUMNS = list(cols)
+    return _REFERENCE_ALIAS_COLUMNS
+
+
 def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshold: float = 0.6) -> dict[str, str]:
     """Return mapping target_field -> source_col using fuzzy/containment with alias boost."""
     alias_map = {
-        "countryofmanufacturer": ["manufacturingcountry", "countryofmanufacturing", "countryoforigin"],
+        "countryofmanufacturer": ["manufacturingcountry", "countryofmanufacturing", "countryoforigin", "countryofmanufacture"],
+        "countryofmanufacture": ["countryofmanufacturer", "countrymanufacturer"],
         "manufacturer": ["manufactoringcompany", "manufacturingcompany"],
         "manufactureryear": ["manufacturingyear", "yearofmanufacturer", "manufacturing_year"],
         "temperature range": ["temperaturerange", "temperature_range"],
+        "typemodel": ["type_model", "type/model", "type model", "type-model"],
+        "standards": ["standard", "std"],
+        "standard": ["standards", "std"],
+        "light_impulse_withsand_kv": [
+            "impulsewithstandvoltage",
+            "impulsewithstand",
+            "impulsewithstandvoltage1250msfullwavekv",
+            "impulsewithstandvoltage1250msfullwave",
+            "impulsewithstandvoltagepeak",
+        ],
+        "ratedimpulsewithstandvol": [
+            "impulsewithstandvoltage",
+            "ratedimpulsewithstandvoltage",
+            "impulsewithstandvoltage1250msfullwavekv",
+            "impulsewithstandvoltage1250msfullwave",
+        ],
+        "powerfrequencywithstandvol": [
+            "powerfrequencywithstandvoltage",
+            "powerfrequencywithstandvoltage1minprimaryside",
+            "powerfrequencywithstandvoltage1minute",
+            "powerfrequencywithstandvoltage1min",
+            "powerfrequencywithstandvoltageprimary",
+        ],
     }
+
+    def _tokenize(text: str) -> set[str]:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
+        return {tok for tok in cleaned.split() if tok}
+
+    def _variants(norm: str) -> set[str]:
+        variants = {norm}
+        if norm.endswith("ies") and len(norm) > 4:
+            variants.add(norm[:-3] + "y")
+        if norm.endswith("s") and len(norm) > 3:
+            variants.add(norm[:-1])
+        elif len(norm) > 3:
+            variants.add(norm + "s")
+        if "manufacturer" in norm:
+            variants.add(norm.replace("manufacturer", "manufacture"))
+        if "manufacture" in norm:
+            variants.add(norm.replace("manufacture", "manufacturer"))
+        return {v for v in variants if v}
+
     norm_target = {normalize_for_compare(t): t for t in target_fields}
     alias_norm = {normalize_for_compare(k): [normalize_for_compare(v) for v in vals] for k, vals in alias_map.items()}
+
+    # Enrich aliases using sample GPKG columns
+    dynamic_alias: dict[str, set[str]] = {nt: set() for nt in norm_target}
+    ref_cols = get_reference_columns()
+    for col in ref_cols:
+        norm_col = normalize_for_compare(col)
+        tokens_col = _tokenize(col)
+        best_nt = None
+        best_score = 0.0
+        for nt in norm_target:
+            score = difflib.SequenceMatcher(None, norm_col, nt).ratio()
+            if norm_col and nt and (norm_col in nt or nt in norm_col):
+                score = max(score, 0.9)
+            if tokens_col and _tokenize(nt):
+                overlap = len(tokens_col & _tokenize(nt)) / max(len(tokens_col | _tokenize(nt)), 1)
+                score = max(score, overlap)
+            if score > best_score:
+                best_score = score
+                best_nt = nt
+        if best_nt and best_score >= 0.8:
+            dynamic_alias.setdefault(best_nt, set()).add(norm_col)
+
+    target_meta = {
+        tname: {
+            "norm": nt,
+            "variants": _variants(nt),
+            "tokens": _tokenize(tname),
+            "aliases": set(alias_norm.get(nt, [])) | dynamic_alias.get(nt, set()),
+        }
+        for nt, tname in norm_target.items()
+    }
+
     result: dict[str, str] = {}
+    result_scores: dict[str, float] = {}
     for src in source_cols:
         norm_src = normalize_for_compare(src)
+        src_variants = _variants(norm_src)
+        src_tokens = _tokenize(src)
         best = None
         best_score = threshold
-        for nt, tname in norm_target.items():
-            if not norm_src and not nt:
-                continue
-            ratio = difflib.SequenceMatcher(None, norm_src, nt).ratio()
-            if norm_src and nt and (norm_src in nt or nt in norm_src):
-                ratio = max(ratio, 0.9)
-            # alias boost
-            aliases = alias_norm.get(nt, [])
-            if norm_src in aliases:
-                ratio = max(ratio, 0.95)
-            if ratio > best_score or (abs(ratio - best_score) < 1e-6 and best and len(tname) < len(best)):
+        for tname, meta in target_meta.items():
+            score = 0.0
+            if meta["aliases"] and any(v in meta["aliases"] for v in src_variants):
+                score = max(score, 0.97)
+            for sv in src_variants:
+                for tv in meta["variants"]:
+                    if not sv and not tv:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, sv, tv).ratio()
+                    if sv and tv and (sv in tv or tv in sv):
+                        ratio = max(ratio, 0.92)
+                    score = max(score, ratio)
+            if src_tokens and meta["tokens"]:
+                overlap = len(src_tokens & meta["tokens"]) / max(len(src_tokens | meta["tokens"]), 1)
+                if overlap:
+                    token_score = overlap + (0.05 if overlap == 1 else 0)
+                    score = max(score, token_score)
+            if score > best_score or (best is None and score >= threshold) or (
+                abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
+            ):
                 best = tname
-                best_score = ratio
-        if best and best not in result:
-            result[best] = src
+                best_score = score
+        if best:
+            prev = result_scores.get(best, -1)
+            if (
+                best not in result
+                or best_score > prev + 1e-6
+                or (abs(best_score - prev) < 1e-6 and len(src) < len(result.get(best, src + "x")))
+            ):
+                result[best] = src
+                result_scores[best] = best_score
     return result
 
 
@@ -241,6 +360,10 @@ def assign_ct_labels(
     return working
 
 
+# =====================================================================
+# SCHEMA FIELD LOADING (POWERFUL MERGED VERSION)
+# =====================================================================
+
 def load_schema_fields(
     schema_path: Path,
     sheet_name: str,
@@ -250,7 +373,14 @@ def load_schema_fields(
     field_col: int | None = None,
     type_col: int | None = None,
 ) -> tuple[list[str], dict[str, str], dict[str, str]]:
-    """Load field names/types (and aliases if present) for a specific equipment/device from a schema sheet."""
+    """
+    Load field names, types, and aliases for a specific equipment/device from a schema sheet.
+
+    This is the merged, more powerful version:
+    - Detects header, field, type, and alias columns.
+    - Handles Hydro PP / Solar PP special layouts.
+    - Returns (fields, type_map, alias_map).
+    """
     schema_raw = pd.read_excel(schema_path, sheet_name=sheet_name, dtype=str, header=None)
 
     alias_col: int | None = None
@@ -291,15 +421,16 @@ def load_schema_fields(
     schema_df = schema_raw.copy()
     # Fill down device column to apply to blank rows
     schema_df.iloc[:, device_col] = schema_df.iloc[:, device_col].ffill()
+
+    # Trim header rows if present
+    if header_row is not None and len(schema_df) > header_row:
+        schema_df = schema_df.iloc[header_row + 1 :]
+
     # Filter by equipment name (case-insensitive, normalized) if provided
     if equipment_name is not None:
         target_norm = normalize_for_compare(equipment_name)
         mask = schema_df.iloc[:, device_col].fillna("").map(normalize_for_compare) == target_norm
         schema_df = schema_df.loc[mask].copy()
-
-    # Trim header rows if present
-    if header_row is not None and len(schema_df) > header_row:
-        schema_df = schema_df.iloc[header_row + 1 :]
 
     # Ensure columns exist
     while schema_df.shape[1] <= max(field_col, type_col):
@@ -315,9 +446,7 @@ def load_schema_fields(
     schema_df["type"] = schema_df["type"].fillna("").map(str)
     schema_df = schema_df[schema_df["field"] != ""]
     schema_df = schema_df[
-        schema_df["field"].map(
-            lambda x: normalize_for_compare(x) not in ("field", "fieldname", "datatype", "data type")
-        )
+        schema_df["field"].map(lambda x: normalize_for_compare(x) not in ("field", "fieldname"))
     ]
     fields = schema_df["field"].tolist()
     type_map = dict(zip(schema_df["field"], schema_df["type"]))
@@ -340,7 +469,11 @@ def list_schema_equipments(schema_path: Path, sheet_name: str, device_col: int =
     return sorted(set(devices))
 
 
-_NUM_REGEX = re.compile(r"[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?".replace("\\\\", "\\"))
+# =====================================================================
+# TYPE COERCION UTILITIES
+# =====================================================================
+
+_NUM_REGEX = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 
 def _extract_first_number(value: Any) -> float | None:
@@ -364,10 +497,10 @@ def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
     t = normalize_for_compare(type_str or "")
     if not isinstance(series, pd.Series):
         return series
-    if "int" in t:
+    if any(tok in t for tok in ("int", "integer", "long", "short", "bigint", "smallint")):
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="Int64")
-    if any(tok in t for tok in ("double", "float", "decimal", "real")):
+    if any(tok in t for tok in ("double", "float", "decimal", "real", "number")):
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="float64")
     if "bool" in t:
@@ -375,6 +508,10 @@ def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
     # default to string for text-like
     return series.astype("string")
 
+
+# =====================================================================
+# NORMALIZATION HELPERS
+# =====================================================================
 
 def normalize_for_compare(name: Any) -> str:
     """Prepare string for joining / comparisons by stripping punctuation & spaces."""
@@ -528,13 +665,15 @@ def ensure_valid_gpkg_dtypes(series: pd.Series) -> pd.Series:
     elif pd.api.types.is_timedelta64_dtype(series):
         series = series.astype(str)
 
+    if pd.api.types.is_numeric_dtype(series):
+        if pd.api.types.is_integer_dtype(series):
+            return series.astype("Int64")
+        return series.astype("float64")
+
     if pd.api.types.is_object_dtype(series) or any(
         isinstance(v, (list, dict, set, tuple)) for v in series.dropna().head(5)
     ):
         series = series.apply(lambda v: str(v) if v is not None else None)
-
-    if pd.api.types.is_numeric_dtype(series):
-        series = series.astype("float64" if pd.api.types.is_float_dtype(series) else series.dtype)
 
     return series
 
@@ -560,7 +699,7 @@ def sanitize_gdf_for_gpkg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             continue
         series = ensure_valid_gpkg_dtypes(out[col])
         mask = pd.isna(series)
-        if mask.any():
+        if mask.any() and not pd.api.types.is_numeric_dtype(series):
             series = series.astype(object)
             series[mask] = None
         out[col] = series
@@ -572,7 +711,7 @@ def sanitize_gdf_for_gpkg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # MERGE LOGIC
 # =====================================================================
 
-def merge_without_duplicates(gdf, df, left_key, right_key):
+def merge_without_duplicates(gdf: gpd.GeoDataFrame, df: pd.DataFrame, left_key: str, right_key: str) -> gpd.GeoDataFrame:
     """
     Join df onto gdf with Excel values overwriting GeoPackage values when matched.
     Uses normalized key lookup instead of pandas merge to avoid ambiguous truthiness
@@ -652,6 +791,10 @@ def derive_layer_name_from_filename(name: str) -> str:
     return base
 
 
+# =====================================================================
+# STREAMLIT APP
+# =====================================================================
+
 def run_app() -> None:
     """Streamlit entrypoint."""
     st.set_page_config(page_title="Internal Substation Attribute Loader", layout="wide")
@@ -659,7 +802,9 @@ def run_app() -> None:
     st.title("Internal Substation Attribute Loader")
     st.caption("Use the internal master workbook to populate attributes for a single substation.")
 
-    # Select workbook
+    # -------------------------------------------------------------
+    # 1. SELECT REFERENCE WORKBOOK
+    # -------------------------------------------------------------
     workbooks = list_reference_workbooks()
     if not workbooks:
         st.error("No reference workbooks found in reference_data.")
@@ -677,7 +822,9 @@ def run_app() -> None:
 
     st.info(f"Using workbook: **{selected_label}**")
 
-    # Upload GPKG
+    # -------------------------------------------------------------
+    # 2. UPLOAD GPKG
+    # -------------------------------------------------------------
     gpkg_file = st.file_uploader("Upload GeoPackage (.gpkg)", type=["gpkg"])
     if gpkg_file is None:
         st.stop()
@@ -692,7 +839,9 @@ def run_app() -> None:
     st.write(f"Features: **{len(gdf):,}**")
     st.dataframe(gdf.head(PREVIEW_ROWS))
 
-    # Select sheet
+    # -------------------------------------------------------------
+    # 3. SELECT SHEET (EQUIPMENT TYPE)
+    # -------------------------------------------------------------
     excel_file = pd.ExcelFile(workbook_path)
     sheet = st.selectbox("Select Equipment Type (Excel Sheet)", excel_file.sheet_names)
     if not sheet:
@@ -712,7 +861,9 @@ def run_app() -> None:
         st.error(f"Error loading sheet {sheet}: {e}")
         st.stop()
 
-    # Detect substation column
+    # -------------------------------------------------------------
+    # 4. DETECT & SELECT SUBSTATION COLUMN
+    # -------------------------------------------------------------
     sub_col = detect_substation_column(df)
 
     st.subheader("Substation Selection")
@@ -725,15 +876,17 @@ def run_app() -> None:
 
     # Extract substations
     raw_subs = df[sub_col].dropna().map(lambda x: str(x))
-    # Remove invisible/bom spaces but keep normal ASCII spaces
+
     def _clean_sub_value(val: str) -> str:
+        # Remove invisible/bom spaces but keep normal ASCII spaces
         for ch in INVISIBLE_HEADER_CHARS:
             val = val.replace(ch, "")
         return val.strip()
 
     raw_subs = raw_subs.map(_clean_sub_value).replace("", pd.NA).dropna()
+
     # Build mapping of normalized -> representative label
-    norm_to_label = {}
+    norm_to_label: dict[str, str] = {}
     for val in raw_subs:
         norm = normalize_value_for_compare(val)
         if norm and norm not in norm_to_label:
@@ -756,12 +909,13 @@ def run_app() -> None:
     st.write(f"Filtered rows: **{len(filtered_df)}**")
     st.dataframe(filtered_df.head(PREVIEW_ROWS))
 
-    # Join fields
+    # -------------------------------------------------------------
+    # 5. JOIN FIELDS
+    # -------------------------------------------------------------
     st.subheader("Join Fields")
     left_key = st.selectbox("Field in GeoPackage (left key)", gdf.columns)
     right_key = st.selectbox("Field in Excel sheet (right key)", filtered_df.columns)
 
-    # Merge button
     if st.button("Merge and Prepare Updated GeoPackage"):
         try:
             merged = merge_without_duplicates(gdf, filtered_df, left_key, right_key)
@@ -792,18 +946,20 @@ def run_app() -> None:
             st.error(f"Merge failed: {e}")
 
     # =====================================================================
-    # CT PROXIMITY AUTO-LABELLING
+    # 6. CT PROXIMITY AUTO-LABELLING
     # =====================================================================
     st.header("CT Proximity Auto-Labelling")
     st.caption(
-        "Upload equipment and transformer GeoPackages. Select a substation and the app will assign CT1, CT2, ... based on proximity to the nearest transformer."
+        "Upload equipment and transformer GeoPackages. "
+        "Select a substation and the app will assign CT1, CT2, ... based on proximity to the nearest transformer."
     )
 
     ct_gpkg = st.file_uploader("Upload Equipment GeoPackage (CTs)", type=["gpkg"], key="ct_gpkg")
     xf_gpkg = st.file_uploader("Upload Transformer GeoPackage", type=["gpkg"], key="xf_gpkg")
 
     if ct_gpkg is not None and xf_gpkg is not None:
-        temp_ct_path = temp_xf_path = None
+        temp_ct_path: Path | None = None
+        temp_xf_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                 tmp.write(ct_gpkg.getbuffer())
@@ -815,479 +971,179 @@ def run_app() -> None:
             ct_layers = list_gpkg_layers(temp_ct_path)
             xf_layers = list_gpkg_layers(temp_xf_path)
 
-            gdf_ct = None
-            gdf_xf = None
-
             if not ct_layers:
-                # Fallback: try default layer read
                 try:
                     gdf_ct = gpd.read_file(temp_ct_path)
                     ct_layers = [derive_layer_name_from_filename(ct_gpkg.name)]
                 except Exception:
                     st.error("No layers found in the equipment GeoPackage.")
+                    return
+            else:
+                layer_ct = st.selectbox("Select CT Equipment Layer", ct_layers, key="ct_layer")
+                gdf_ct = gpd.read_file(temp_ct_path, layer=layer_ct)
+
             if not xf_layers:
                 try:
                     gdf_xf = gpd.read_file(temp_xf_path)
                     xf_layers = [derive_layer_name_from_filename(xf_gpkg.name)]
                 except Exception:
                     st.error("No layers found in the transformer GeoPackage.")
-
-            if ct_layers and xf_layers:
-                ct_layer = st.selectbox("Select equipment layer", ct_layers)
-                xf_layer = st.selectbox("Select transformer layer", xf_layers)
-
-                if gdf_ct is None:
-                    gdf_ct = gpd.read_file(temp_ct_path, layer=ct_layer)
-                if gdf_xf is None:
-                    gdf_xf = gpd.read_file(temp_xf_path, layer=xf_layer)
-
-                st.write(f"Loaded **{len(gdf_ct):,}** equipment feature(s) from layer **{ct_layer}**.")
-                st.write(f"Loaded **{len(gdf_xf):,}** transformer feature(s) from layer **{xf_layer}**.")
-
-                # Detect substation column
-                sub_col_guess = detect_substation_column(gdf_ct)
-                st.subheader("Substation Selection (CT labelling)")
-                sub_col_ct = st.selectbox(
-                    "Select Substation Column",
-                    gdf_ct.columns,
-                    index=(gdf_ct.columns.get_loc(sub_col_guess) if sub_col_guess in gdf_ct.columns else 0),
-                    key="ct_sub_col",
-                )
-                if sub_col_ct != sub_col_guess:
-                    st.info(f"Using manual selection: **{sub_col_ct}**")
-                else:
-                    st.success(f"Detected Substation Column: **{sub_col_ct}**")
-
-                # Substation selection from reference workbook/sheet
-                st.subheader("Select Substation from Reference Workbook")
-                ref_wbs = list_reference_workbooks()
-                if not ref_wbs:
-                    st.error("No reference workbooks found in reference_data.")
-                    selected_sub_ct = None
-                else:
-                    ref_labels = list(ref_wbs.keys())
-                    ref_label = st.selectbox("Reference workbook", ref_labels, index=0, key="ct_ref_wb")
-                    ref_path = ref_wbs[ref_label]
-                    try:
-                        ref_excel = pd.ExcelFile(ref_path)
-                        ref_sheet = st.selectbox("Reference sheet", ref_excel.sheet_names, key="ct_ref_sheet")
-                        raw_ref = pd.read_excel(ref_path, sheet_name=ref_sheet, dtype=str, header=None)
-                        ref_header_row = _detect_header_row(raw_ref)
-                        ref_header = ensure_unique_columns([_clean_column_name(c) for c in raw_ref.iloc[ref_header_row]])
-                        ref_df = raw_ref.iloc[ref_header_row + 1 :].copy()
-                        ref_df.columns = ref_header
-                        ref_df.reset_index(drop=True, inplace=True)
-                        ref_df = _apply_global_forward_fill(ref_df)
-                        ref_df = clean_empty_rows(ref_df)
-                        ref_sub_col = detect_substation_column(ref_df)
-                        if ref_sub_col is None:
-                            ref_sub_col = st.selectbox("Select Substation Column (reference)", ref_df.columns, key="ct_ref_subcol")
-                        subs = (
-                            ref_df[ref_sub_col]
-                            .dropna()
-                            .map(lambda x: strip_unicode_spaces(str(x)).strip())
-                            .replace("", pd.NA)
-                            .dropna()
-                            .unique()
-                        )
-                        subs = sorted(subs)
-                        selected_sub_ct = st.selectbox("Choose Substation (CT labelling)", subs, key="ct_ref_sub")
-                    except Exception as exc:
-                        st.error(f"Failed to read reference workbook: {exc}")
-                        selected_sub_ct = None
-
-                    # CT/transformer markers (no type column required)
-                    type_col_ct = "__equipment_kind"
-                    ct_kw_default = "ct"
-                    transformer_kw_default = "transformer"
-                    ct_kw = st.text_input("CT keywords (comma-separated)", ct_kw_default)
-                    transformer_kw = st.text_input("Transformer keywords (comma-separated)", transformer_kw_default)
-                    ct_keywords = [normalize_value_for_compare(k) for k in ct_kw.split(",") if k.strip()]
-                    transformer_keywords = [normalize_value_for_compare(k) for k in transformer_kw.split(",") if k.strip()]
-
-                    output_field = st.text_input("Output CT label field", "CT_LABEL")
-
-                    if st.button("Assign CT Labels"):
-                        try:
-                            # Merge transformer geometries into equipment GDF for proximity
-                            # Keep only rows for the selected substation in transformers
-                            xf_norm_sub = normalize_value_for_compare(selected_sub_ct)
-                            xf_norm_col = gdf_xf[sub_col_ct].map(normalize_value_for_compare) if sub_col_ct in gdf_xf.columns else pd.Series([], dtype=object)
-                            xf_mask = (xf_norm_col == xf_norm_sub).fillna(False) if not xf_norm_col.empty else pd.Series([], dtype=bool)
-                            gdf_xf_sel = gdf_xf.loc[xf_mask] if not xf_mask.empty else gdf_xf
-
-                            # Temporarily add transformer rows into equipment GDF with a marker to distinguish
-                            xf_copy = gdf_xf_sel.copy()
-                            gdf_ct_copy = gdf_ct.copy()
-
-                            # Align CRS
-                            if gdf_ct_copy.crs and xf_copy.crs and gdf_ct_copy.crs != xf_copy.crs:
-                                try:
-                                    xf_copy = xf_copy.to_crs(gdf_ct_copy.crs)
-                                except Exception:
-                                    pass
-
-                            gdf_ct_copy[type_col_ct] = "ct"
-                            xf_copy[type_col_ct] = "transformer"
-                            gdf_combined = pd.concat([gdf_ct_copy, xf_copy], ignore_index=True, sort=False)
-                            gdf_combined = gpd.GeoDataFrame(gdf_combined, geometry="geometry", crs=gdf_ct_copy.crs or xf_copy.crs)
-
-                            labelled = assign_ct_labels(
-                                gdf_combined,
-                                sub_col=sub_col_ct,
-                                sub_value=selected_sub_ct,
-                                type_col=type_col_ct,
-                                ct_keywords=ct_keywords,
-                                transformer_keywords=transformer_keywords,
-                                output_field=output_field,
-                            )
-
-                            # Extract labelled equipment portion only
-                            labelled_eq = labelled.iloc[: len(gdf_ct)].copy()
-
-                            norm_sel = normalize_value_for_compare(selected_sub_ct)
-                            mask_sel = (labelled_eq[sub_col_ct].map(normalize_value_for_compare) == norm_sel).fillna(False)
-                            subset = labelled_eq.loc[mask_sel].copy()
-                            st.success("CT labels assigned based on proximity to nearest transformer.")
-                            st.dataframe(subset.head(PREVIEW_ROWS))
-
-                            # Preview map (best-effort)
-                            try:
-                                import pydeck as p
-
-                                subset_vis = subset.copy()
-                                if subset_vis.crs and subset_vis.crs.is_projected:
-                                    subset_vis = subset_vis.to_crs(4326)
-
-                                ct_mask = subset_vis[output_field].notna()
-                                ct_points = subset_vis.loc[ct_mask, [output_field, "geometry"]]
-
-                                transf_vis = gdf_xf_sel.copy()
-                                if transf_vis.crs and transf_vis.crs.is_projected:
-                                    transf_vis = transf_vis.to_crs(4326)
-                                transf_points = transf_vis[[sub_col_ct, "geometry"]] if sub_col_ct in transf_vis.columns else pd.DataFrame()
-
-                                def to_latlon(df):
-                                    return pd.DataFrame(
-                                        {
-                                            "lat": df.geometry.y,
-                                            "lon": df.geometry.x,
-                                            "label": df.iloc[:, 0],
-                                        }
-                                    )
-
-                                layers_pd = []
-                                if not transf_points.empty:
-                                    transf_latlon = to_latlon(transf_points)
-                                    layers_pd.append(
-                                        p.Layer(
-                                            "ScatterplotLayer",
-                                            transf_latlon,
-                                            get_position="[lon, lat]",
-                                            get_fill_color=[0, 102, 204, 200],
-                                            get_radius=15,
-                                            pickable=True,
-                                        )
-                                    )
-                                if not ct_points.empty:
-                                    ct_latlon = to_latlon(ct_points)
-                                    layers_pd.append(
-                                        p.Layer(
-                                            "ScatterplotLayer",
-                                            ct_latlon,
-                                            get_position="[lon, lat]",
-                                            get_fill_color=[255, 99, 71, 200],
-                                            get_radius=12,
-                                            pickable=True,
-                                        )
-                                    )
-                                if layers_pd:
-                                    midpoint = None
-                                    try:
-                                        midpoint = [ct_points.geometry.x.mean(), ct_points.geometry.y.mean()]
-                                    except Exception:
-                                        pass
-                                    st.pydeck_chart(
-                                        p.Deck(
-                                            layers=layers_pd,
-                                            initial_view_state=p.ViewState(
-                                                latitude=midpoint[1] if midpoint else 0,
-                                                longitude=midpoint[0] if midpoint else 0,
-                                                zoom=12,
-                                            ),
-                                            tooltip={"text": "{label}"},
-                                        )
-                                    )
-                            except Exception:
-                                st.info("Map preview unavailable (pydeck/CRS issue).")
-
-                            # Save updated equipment layer
-                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp_out:
-                                out_path = tmp_out.name
-                            safe_labelled = sanitize_gdf_for_gpkg(labelled_eq)
-                            safe_labelled.to_file(out_path, driver="GPKG", layer=ct_layer)
-                            with open(out_path, "rb") as f:
-                                data_bytes = f.read()
-                            st.download_button(
-                                "Download CT-labelled Equipment GeoPackage",
-                                data=data_bytes,
-                                file_name=ct_gpkg.name,
-                                mime="application/geopackage+sqlite3",
-                            )
-                        except Exception as e:
-                            st.error(f"CT labelling failed: {e}")
-        finally:
-            if temp_ct_path and temp_ct_path.exists():
-                temp_ct_path.unlink()
-            if temp_xf_path and temp_xf_path.exists():
-                temp_xf_path.unlink()
-
-    # =====================================================================
-    # SCHEMA MAPPING FOR EQUIPMENT GPKG
-    # =====================================================================
-    st.header("Schema Mapping: Equipment GPKG to Electric Device Fields")
-    st.caption(
-        "Upload an equipment GeoPackage, pick a layer and a schema sheet, review/adjust the suggested column mapping, and download an updated GPKG with standardized fields."
-    )
-
-    source_type = st.selectbox("Equipment data source", ["GeoPackage (gpkg)", "FileGDB (gdb/zip)"], index=0, key="map_source")
-    map_file = None
-    if source_type.startswith("GeoPackage"):
-        map_file = st.file_uploader("Upload Equipment GeoPackage for Schema Mapping", type=["gpkg"], key="map_gpkg")
-    else:
-        map_file = st.file_uploader("Upload Equipment FileGDB for Schema Mapping (zip the .gdb folder)", type=["gdb", "zip"], key="map_gdb")
-
-    if map_file is not None:
-        temp_map_path = None
-        temp_gdb_dir = None
-        try:
-            if source_type.startswith("GeoPackage"):
-                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                    tmp.write(map_file.getbuffer())
-                    temp_map_path = Path(tmp.name)
-            else:
-                ext = Path(map_file.name).suffix.lower()
-                if ext == ".zip":
-                    temp_gdb_dir = Path(tempfile.mkdtemp())
-                    zip_path = temp_gdb_dir / "gdb.zip"
-                    with open(zip_path, "wb") as tmp:
-                        tmp.write(map_file.getbuffer())
-                    with zipfile.ZipFile(zip_path, "r") as zf:
-                        zf.extractall(temp_gdb_dir)
-                    gdb_dirs = list(temp_gdb_dir.glob("**/*.gdb"))
-                    if not gdb_dirs:
-                        st.error("No .gdb folder found inside the zip.")
-                        return
-                    temp_map_path = gdb_dirs[0]
-                elif ext == ".gdb":
-                    # Browsers typically cannot upload a .gdb folder directly; advise zipping
-                    st.error("Please upload the FileGDB as a .zip containing the .gdb folder.")
                     return
-                else:
-                    st.error("Unsupported FileGDB upload. Please zip the .gdb folder.")
-                    return
-
-            layers_map = list_gpkg_layers(temp_map_path)
-            layer_map = st.selectbox("Select layer", layers_map if layers_map else [])
-            if not layers_map:
-                st.error("No layers found in the uploaded GeoPackage.")
             else:
-                gdf_map = gpd.read_file(temp_map_path, layer=layer_map)
-                st.write(f"Loaded **{len(gdf_map):,}** feature(s) from layer **{layer_map}**.")
+                layer_xf = st.selectbox("Select Transformer Layer", xf_layers, key="xf_layer")
+                gdf_xf = gpd.read_file(temp_xf_path, layer=layer_xf)
 
-                # Schema selection
-                schema_files = list_reference_workbooks()
-                if not schema_files:
-                    st.error("No reference workbooks found in reference_data.")
-                else:
-                    schema_label = st.selectbox("Schema workbook", list(schema_files.keys()), index=0, key="schema_wb")
-                    schema_path = schema_files[schema_label]
-                    schema_excel = pd.ExcelFile(schema_path)
-                    schema_sheet = st.selectbox("Schema sheet", schema_excel.sheet_names, key="schema_sheet")
+            # Detect substation column for CTs
+            if gdf_ct.empty:
+                st.error("CT equipment layer is empty.")
+                return
 
-                    # Choose equipment/device from schema
-                    equipment_options = list_schema_equipments(schema_path, schema_sheet)
-                    if not equipment_options:
-                        st.error("No equipment entries found in the schema sheet.")
-                    else:
-                        equipment_name = st.selectbox("Equipment/device", equipment_options, key="schema_equipment")
+            sub_col_guess = detect_substation_column(gdf_ct)
+            st.subheader("Substation Selection (CT labelling)")
+            sub_col_ct = st.selectbox(
+                "Select Substation Column in CT layer",
+                gdf_ct.columns,
+                index=(gdf_ct.columns.get_loc(sub_col_guess) if sub_col_guess in gdf_ct.columns else 0),
+                key="ct_sub_col",
+            )
+            if sub_col_ct != sub_col_guess:
+                st.info(f"Using manual selection: **{sub_col_ct}**")
+            else:
+                st.success(f"Detected Substation Column: **{sub_col_ct}**")
 
-                        # Load fields/types/aliases for selected equipment
-                        schema_fields, type_map, alias_map = load_schema_fields(schema_path, schema_sheet, equipment_name)
-
-                        # Show schema preview
-                        preview_rows = [{"Field": f, "Type": type_map.get(f, ""), "Alias": alias_map.get(f, "")} for f in schema_fields]
-                        st.subheader("Selected Equipment Schema")
-                        st.dataframe(pd.DataFrame(preview_rows))
-
-                        # Suggested mapping
-                        suggested = fuzzy_map_columns(list(gdf_map.columns), schema_fields, threshold=0.6)
-
-                        st.subheader("Field Mapping")
-                        mapping = {}
-                        for idx, field in enumerate(schema_fields):
-                            default_src = suggested.get(field)
-                            mapping[field] = st.selectbox(
-                                f"{field}",
-                                options=["(empty)"] + list(gdf_map.columns),
-                                index=(list(gdf_map.columns).index(default_src) + 1) if default_src in gdf_map.columns else 0,
-                                key=f"map_select_{idx}",
-                            )
-
-                        keep_unmatched = st.checkbox("Keep unmatched original columns (prefixed with orig_)", value=True)
-
-                        output_formats = ["GeoPackage (gpkg)"]
-                        if source_type.startswith("FileGDB"):
-                            output_formats.append("FileGDB (zip)")
-                        output_choice = st.selectbox(
-                            "Output format",
-                            output_formats,
-                            index=1 if source_type.startswith("FileGDB") and len(output_formats) > 1 else 0,
-                            key="map_output_format",
-                        )
-
-                        if st.button("Generate Standardized GPKG", key="gen_std_gpkg"):
-                            try:
-                                out_cols = {}
-                                for f in schema_fields:
-                                    src = mapping.get(f)
-                                    if src and src != "(empty)" and src in gdf_map.columns:
-                                        out_cols[f] = gdf_map[src]
-                                    else:
-                                        out_cols[f] = pd.Series([pd.NA] * len(gdf_map), index=gdf_map.index)
-                                    if alias_map.get(f):
-                                        out_cols[f"{f}_alias"] = pd.Series([alias_map[f]] * len(gdf_map), index=gdf_map.index)
-                                if keep_unmatched:
-                                    for col in gdf_map.columns:
-                                        if col not in mapping.values() and col != gdf_map.geometry.name:
-                                            out_cols[f"orig_{col}"] = gdf_map[col]
-
-                                geom_col = gdf_map.geometry.name if hasattr(gdf_map, "geometry") else None
-                                geom_series = None
-                                if geom_col and geom_col in gdf_map.columns:
-                                    geom_series = gdf_map[geom_col]
-                                elif hasattr(gdf_map, "geometry"):
-                                    geom_series = gdf_map.geometry
-
-                                # Apply schema types
-                                for f in schema_fields:
-                                    out_cols[f] = coerce_series_to_type(out_cols[f], type_map.get(f, ""))
-
-                                out_gdf = gpd.GeoDataFrame(out_cols, geometry=geom_series, crs=gdf_map.crs)
-                                out_gdf = sanitize_gdf_for_gpkg(out_gdf)
-
-                                layer_name = derive_layer_name_from_filename(map_file.name)
-                                if output_choice.startswith("GeoPackage"):
-                                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp_out:
-                                        out_path = tmp_out.name
-                                    out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                                    with open(out_path, "rb") as f:
-                                        data_bytes = f.read()
-                                    st.download_button(
-                                        "Download Standardized GeoPackage",
-                                        data=data_bytes,
-                                        file_name=map_file.name,
-                                        mime="application/geopackage+sqlite3",
-                                    )
-                                else:
-                                    tmp_dir = tempfile.mkdtemp()
-                                    out_dir = Path(tmp_dir) / f"{layer_name}.gdb"
-                                    out_gdf.to_file(out_dir, driver="FileGDB", layer=layer_name)
-                                    zip_path = shutil.make_archive(str(out_dir), "zip", root_dir=tmp_dir, base_dir=out_dir.name)
-                                    with open(zip_path, "rb") as f:
-                                        data_bytes = f.read()
-                                    st.download_button(
-                                        "Download Standardized FileGDB (zip)",
-                                        data=data_bytes,
-                                        file_name=f"{out_dir.name}.zip",
-                                        mime="application/zip",
-                                    )
-                                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                            except Exception as exc:
-                                st.error(f"Schema mapping failed: {exc}")
-
-                        # ---------------- BATCH MODE ----------------
-                        st.markdown("---")
-                        st.subheader("Batch Map Multiple Layers")
-                        selected_layers = st.multiselect("Select layers to batch map", layers_map, default=layers_map)
-                        if st.button("Generate Batch Standardized Package", key="gen_batch"):
-                            try:
-                                default_driver = "FileGDB" if source_type.startswith("FileGDB") else "GPKG"
-                                tmp_dir = Path(tempfile.mkdtemp())
-                                out_path = tmp_dir / ("mapped.gdb" if default_driver == "FileGDB" else "mapped.gpkg")
-                                driver = default_driver
-
-                                for lyr in selected_layers:
-                                    gdf_layer = gpd.read_file(temp_map_path, layer=lyr)
-                                    suggested_batch = fuzzy_map_columns(list(gdf_layer.columns), schema_fields, threshold=0.6)
-                                    out_cols_batch = {}
-                                    n = len(gdf_layer)
-                                    def _na_series():
-                                        return pd.Series([pd.NA] * n, index=gdf_layer.index)
-                                    for f in schema_fields:
-                                        src = suggested_batch.get(f)
-                                        if src and src in gdf_layer.columns:
-                                            out_cols_batch[f] = gdf_layer[src]
-                                        else:
-                                            out_cols_batch[f] = _na_series()
-                                    if keep_unmatched:
-                                        for col in gdf_layer.columns:
-                                            if col not in suggested_batch.values() and col != gdf_layer.geometry.name:
-                                                out_cols_batch[f"orig_{col}"] = gdf_layer[col]
-                                    geom_series = gdf_layer.geometry if hasattr(gdf_layer, "geometry") else None
-                                    for f in schema_fields:
-                                        out_cols_batch[f] = coerce_series_to_type(out_cols_batch[f], type_map.get(f, ""))
-                                    out_layer = gpd.GeoDataFrame(out_cols_batch, geometry=geom_series, crs=gdf_layer.crs)
-                                    out_layer = sanitize_gdf_for_gpkg(out_layer)
-                                    layer_name_out = derive_layer_name_from_filename(lyr)
-                                    try:
-                                        out_layer.to_file(out_path, driver=driver, layer=layer_name_out)
-                                    except Exception:
-                                        # fallback to GPKG if FileGDB driver unavailable
-                                        driver = "GPKG"
-                                        # clean any previous gdb remnants
-                                        if out_path.exists():
-                                            if out_path.is_dir():
-                                                shutil.rmtree(out_path, ignore_errors=True)
-                                            else:
-                                                out_path.unlink(missing_ok=True)
-                                        out_path = tmp_dir / "mapped.gpkg"
-                                        out_layer.to_file(out_path, driver=driver, layer=layer_name_out)
-
-                                if driver == "GPKG":
-                                    with open(out_path, "rb") as f:
-                                        data_bytes = f.read()
-                                    st.download_button(
-                                        "Download Batch Standardized GeoPackage",
-                                        data=data_bytes,
-                                        file_name="standardized_layers.gpkg",
-                                        mime="application/geopackage+sqlite3",
-                                        key="dl_batch_gpkg",
-                                    )
-                                    out_path.unlink(missing_ok=True)
-                                else:
-                                    zip_path = shutil.make_archive(str(out_path), "zip", root_dir=out_path.parent, base_dir=out_path.name)
-                                    with open(zip_path, "rb") as f:
-                                        data_bytes = f.read()
-                                    st.download_button(
-                                        "Download Batch Standardized FileGDB (zip)",
-                                        data=data_bytes,
-                                        file_name="standardized_layers.gdb.zip",
-                                        mime="application/zip",
-                                        key="dl_batch_gdb",
-                                    )
-                                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                            except Exception as exc:
-                                st.error(f"Batch mapping failed: {exc}")
-        finally:
-            if temp_gdb_dir:
-                shutil.rmtree(temp_gdb_dir, ignore_errors=True)
-            elif temp_map_path and temp_map_path.exists():
-                # Only unlink files, not folders
+            # Substation selection from reference workbook/sheet
+            st.subheader("Select Substation from Reference Workbook")
+            ref_wbs = list_reference_workbooks()
+            if not ref_wbs:
+                st.error("No reference workbooks found in reference_data.")
+                selected_sub_ct = None
+            else:
+                ref_labels = list(ref_wbs.keys())
+                ref_label = st.selectbox("Reference workbook", ref_labels, index=0, key="ct_ref_wb")
+                ref_path = ref_wbs[ref_label]
                 try:
-                    temp_map_path.unlink()
-                except IsADirectoryError:
-                    shutil.rmtree(temp_map_path, ignore_errors=True)
+                    ref_excel = pd.ExcelFile(ref_path)
+                    ref_sheet = st.selectbox("Reference sheet", ref_excel.sheet_names, key="ct_ref_sheet")
+                    raw_ref = pd.read_excel(ref_path, sheet_name=ref_sheet, dtype=str, header=None)
+                    ref_header_row = _detect_header_row(raw_ref)
+                    ref_header = ensure_unique_columns([_clean_column_name(c) for c in raw_ref.iloc[ref_header_row]])
+                    ref_df = raw_ref.iloc[ref_header_row + 1 :].copy()
+                    ref_df.columns = ref_header
+                    ref_df.reset_index(drop=True, inplace=True)
+                    ref_df = _apply_global_forward_fill(ref_df)
+                    ref_df = clean_empty_rows(ref_df)
+                    ref_sub_col = detect_substation_column(ref_df)
+                    if ref_sub_col is None:
+                        ref_sub_col = st.selectbox(
+                            "Select Substation Column (reference)", ref_df.columns, key="ct_ref_subcol"
+                        )
+                    subs = (
+                        ref_df[ref_sub_col]
+                        .dropna()
+                        .map(lambda x: strip_unicode_spaces(str(x)).strip())
+                        .replace("", pd.NA)
+                        .dropna()
+                        .unique()
+                    )
+                    subs = sorted(subs)
+                    selected_sub_ct = st.selectbox("Choose Substation (CT labelling)", subs, key="ct_ref_sub")
+                except Exception as exc:
+                    st.error(f"Failed to read reference workbook: {exc}")
+                    selected_sub_ct = None
+
+            # CT/transformer markers (no type column required)
+            type_col_ct = "__equipment_kind"
+            ct_kw_default = "ct"
+            transformer_kw_default = "transformer"
+            ct_kw = st.text_input("CT keywords (comma-separated)", ct_kw_default)
+            transformer_kw = st.text_input("Transformer keywords (comma-separated)", transformer_kw_default)
+            ct_keywords = [normalize_value_for_compare(k) for k in ct_kw.split(",") if k.strip()]
+            transformer_keywords = [normalize_value_for_compare(k) for k in transformer_kw.split(",") if k.strip()]
+
+            output_field = st.text_input("Output CT label field", "CT_LABEL")
+
+            if st.button("Assign CT Labels"):
+                try:
+                    if selected_sub_ct is None:
+                        st.error("No substation selected for CT labelling.")
+                    else:
+                        # Filter transformers to selected substation (if possible)
+                        xf_norm_sub = normalize_value_for_compare(selected_sub_ct)
+                        if sub_col_ct in gdf_xf.columns:
+                            xf_norm_col = gdf_xf[sub_col_ct].map(normalize_value_for_compare)
+                            xf_mask = (xf_norm_col == xf_norm_sub).fillna(False)
+                            gdf_xf_sel = gdf_xf.loc[xf_mask]
+                        else:
+                            # If transformer GDF has no matching substation column, fall back to all transformers
+                            gdf_xf_sel = gdf_xf
+
+                        # Temporarily add transformer rows into equipment GDF with a marker to distinguish
+                        xf_copy = gdf_xf_sel.copy()
+                        gdf_ct_copy = gdf_ct.copy()
+
+                        # Align CRS
+                        if gdf_ct_copy.crs and xf_copy.crs and gdf_ct_copy.crs != xf_copy.crs:
+                            try:
+                                xf_copy = xf_copy.to_crs(gdf_ct_copy.crs)
+                            except Exception:
+                                pass
+
+                        gdf_ct_copy[type_col_ct] = "ct"
+                        xf_copy[type_col_ct] = "transformer"
+                        gdf_combined = pd.concat([gdf_ct_copy, xf_copy], ignore_index=True, sort=False)
+                        gdf_combined = gpd.GeoDataFrame(
+                            gdf_combined,
+                            geometry="geometry",
+                            crs=gdf_ct_copy.crs or xf_copy.crs,
+                        )
+
+                        labelled = assign_ct_labels(
+                            gdf_combined,
+                            sub_col=sub_col_ct,
+                            sub_value=selected_sub_ct,
+                            type_col=type_col_ct,
+                            ct_keywords=ct_keywords,
+                            transformer_keywords=transformer_keywords,
+                            output_field=output_field,
+                        )
+
+                        # Extract labelled equipment portion only
+                        labelled_eq = labelled.iloc[: len(gdf_ct)].copy()
+
+                        st.success("CT labels assigned successfully.")
+                        st.dataframe(labelled_eq.head(PREVIEW_ROWS))
+
+                        # Allow download of updated CT GeoPackage
+                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                            temp_ct_out = tmp.name
+                        safe_ct = sanitize_gdf_for_gpkg(labelled_eq)
+                        layer_name_ct = derive_layer_name_from_filename(ct_gpkg.name)
+                        safe_ct.to_file(temp_ct_out, driver="GPKG", layer=layer_name_ct)
+                        with open(temp_ct_out, "rb") as f:
+                            ct_data = f.read()
+                        st.download_button(
+                            "Download CT Layer with Labels",
+                            data=ct_data,
+                            file_name=ct_gpkg.name,
+                            mime="application/geopackage+sqlite3",
+                        )
+
+                except Exception as exc:
+                    st.error(f"CT labelling failed: {exc}")
+
+        finally:
+            # Clean temporary files
+            if temp_ct_path and temp_ct_path.exists():
+                try:
+                    temp_ct_path.unlink()
+                except Exception:
+                    pass
+            if temp_xf_path and temp_xf_path.exists():
+                try:
+                    temp_xf_path.unlink()
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
     run_app()
