@@ -245,14 +245,49 @@ def load_schema_fields(
     schema_path: Path,
     sheet_name: str,
     equipment_name: str | None,
-    header_row: int = 1,
+    header_row: int | None = None,
     device_col: int = 0,
-    field_col: int = 1,
-    type_col: int = 2,
-) -> tuple[list[str], dict[str, str]]:
-    """Load field names and types for a specific equipment/device from a schema sheet.
-    If equipment_name is None, returns all fields in the sheet."""
+    field_col: int | None = None,
+    type_col: int | None = None,
+) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Load field names/types (and aliases if present) for a specific equipment/device from a schema sheet."""
     schema_raw = pd.read_excel(schema_path, sheet_name=sheet_name, dtype=str, header=None)
+
+    alias_col: int | None = None
+
+    # Detect header/type/field columns before filtering
+    if header_row is None or field_col is None or type_col is None:
+        header_row_det = 0
+        field_col_det = None
+        type_col_det = None
+        alias_col_det = None
+        for idx, row in schema_raw.head(5).iterrows():
+            for col_idx, val in row.items():
+                norm = normalize_for_compare(val)
+                if not norm:
+                    continue
+                if "type" in norm or "tpe" in norm:
+                    type_col_det = col_idx
+                if "alias" in norm or "name" in norm or "domain" in norm:
+                    alias_col_det = alias_col_det or col_idx
+                if "field" in norm and norm not in ("device", "equipment"):
+                    if field_col_det is None or "fieldname" in norm:
+                        field_col_det = col_idx
+            if type_col_det is not None and field_col_det is not None:
+                header_row_det = idx
+                break
+        header_row = header_row if header_row is not None else header_row_det
+        field_col = field_col if field_col is not None else (field_col_det if field_col_det is not None else 1)
+        type_col = type_col if type_col is not None else (type_col_det if type_col_det is not None else schema_raw.shape[1] - 1)
+        alias_col = alias_col_det
+
+    # Special-case Hydro PP and Solar PP layouts
+    if sheet_name.lower().strip() in ("hydro pp", "solar pp"):
+        header_row = 0
+        field_col = 1
+        type_col = schema_raw.shape[1] - 1
+        alias_col = 2
+
     schema_df = schema_raw.copy()
     # Fill down device column to apply to blank rows
     schema_df.iloc[:, device_col] = schema_df.iloc[:, device_col].ffill()
@@ -262,6 +297,10 @@ def load_schema_fields(
         mask = schema_df.iloc[:, device_col].fillna("").map(normalize_for_compare) == target_norm
         schema_df = schema_df.loc[mask].copy()
 
+    # Trim header rows if present
+    if header_row is not None and len(schema_df) > header_row:
+        schema_df = schema_df.iloc[header_row + 1 :]
+
     # Ensure columns exist
     while schema_df.shape[1] <= max(field_col, type_col):
         schema_df[schema_df.shape[1]] = None
@@ -269,15 +308,26 @@ def load_schema_fields(
     schema_df.columns = [f"col_{i}" for i in range(schema_df.shape[1])]
     field_series = schema_df.iloc[:, field_col]
     type_series = schema_df.iloc[:, type_col]
+    alias_series = schema_df.iloc[:, alias_col] if alias_col is not None and alias_col < schema_df.shape[1] else None
 
     schema_df = pd.DataFrame({"field": field_series, "type": type_series})
     schema_df["field"] = schema_df["field"].fillna("").map(_clean_column_name)
     schema_df["type"] = schema_df["type"].fillna("").map(str)
     schema_df = schema_df[schema_df["field"] != ""]
-    schema_df = schema_df[schema_df["field"].map(lambda x: normalize_for_compare(x) not in ("field", "fieldname", "datatype", "data type"))]
+    schema_df = schema_df[
+        schema_df["field"].map(
+            lambda x: normalize_for_compare(x) not in ("field", "fieldname", "datatype", "data type")
+        )
+    ]
     fields = schema_df["field"].tolist()
     type_map = dict(zip(schema_df["field"], schema_df["type"]))
-    return fields, type_map
+    alias_map: dict[str, str] = {}
+    if alias_series is not None:
+        alias_clean = alias_series.fillna("").map(_clean_column_name)
+        for f, a in zip(fields, alias_clean):
+            if a:
+                alias_map[f] = a
+    return fields, type_map, alias_map
 
 
 def list_schema_equipments(schema_path: Path, sheet_name: str, device_col: int = 0) -> list[str]:
@@ -1062,11 +1112,11 @@ def run_app() -> None:
                     else:
                         equipment_name = st.selectbox("Equipment/device", equipment_options, key="schema_equipment")
 
-                        # Load fields/types for selected equipment
-                        schema_fields, type_map = load_schema_fields(schema_path, schema_sheet, equipment_name)
+                        # Load fields/types/aliases for selected equipment
+                        schema_fields, type_map, alias_map = load_schema_fields(schema_path, schema_sheet, equipment_name)
 
                         # Show schema preview
-                        preview_rows = [{"Field": f, "Type": type_map.get(f, "")} for f in schema_fields]
+                        preview_rows = [{"Field": f, "Type": type_map.get(f, ""), "Alias": alias_map.get(f, "")} for f in schema_fields]
                         st.subheader("Selected Equipment Schema")
                         st.dataframe(pd.DataFrame(preview_rows))
 
@@ -1104,7 +1154,9 @@ def run_app() -> None:
                                     if src and src != "(empty)" and src in gdf_map.columns:
                                         out_cols[f] = gdf_map[src]
                                     else:
-                                        out_cols[f] = pd.NA
+                                        out_cols[f] = pd.Series([pd.NA] * len(gdf_map), index=gdf_map.index)
+                                    if alias_map.get(f):
+                                        out_cols[f"{f}_alias"] = pd.Series([alias_map[f]] * len(gdf_map), index=gdf_map.index)
                                 if keep_unmatched:
                                     for col in gdf_map.columns:
                                         if col not in mapping.values() and col != gdf_map.geometry.name:
