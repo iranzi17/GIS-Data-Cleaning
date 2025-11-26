@@ -8,6 +8,7 @@ import unicodedata
 import statistics
 import difflib
 import re
+import json
 
 import geopandas as gpd
 import pandas as pd
@@ -21,6 +22,7 @@ REFERENCE_DATA_DIR = BASE_DIR / "reference_data"
 WORKBOOK_NAME = "SUBSTATIONS 2-251025.xlsx"
 WORKBOOK_PATH = REFERENCE_DATA_DIR / WORKBOOK_NAME
 REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
+ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
@@ -150,6 +152,7 @@ def list_gpkg_layers(path: Path) -> list[str]:
 
 
 _REFERENCE_ALIAS_COLUMNS: list[str] | None = None
+_FILE_ALIAS_CACHE: dict[str, list[str]] | None = None
 
 
 def get_reference_columns() -> list[str]:
@@ -170,6 +173,23 @@ def get_reference_columns() -> list[str]:
         pass
     _REFERENCE_ALIAS_COLUMNS = list(cols)
     return _REFERENCE_ALIAS_COLUMNS
+
+
+def load_file_aliases() -> dict[str, list[str]]:
+    """Load persisted aliases from reference_data/alias_map.json if present."""
+    global _FILE_ALIAS_CACHE
+    if _FILE_ALIAS_CACHE is not None:
+        return _FILE_ALIAS_CACHE
+    if ALIAS_FILE.exists():
+        try:
+            data = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _FILE_ALIAS_CACHE = {k: v if isinstance(v, list) else [] for k, v in data.items()}
+                return _FILE_ALIAS_CACHE
+        except Exception:
+            pass
+    _FILE_ALIAS_CACHE = {}
+    return _FILE_ALIAS_CACHE
 
 
 def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshold: float = 0.6) -> dict[str, str]:
@@ -204,6 +224,11 @@ def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshol
             "powerfrequencywithstandvoltageprimary",
         ],
     }
+    # Merge in persisted aliases from file
+    file_aliases = load_file_aliases()
+    for k, vals in file_aliases.items():
+        alias_map.setdefault(k, [])
+        alias_map[k].extend([v for v in vals if v not in alias_map[k]])
 
     def _tokenize(text: str) -> set[str]:
         cleaned = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
