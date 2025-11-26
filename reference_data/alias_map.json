@@ -1,0 +1,136 @@
+{
+  "Manufacturer": [
+    "Manufacturer"
+  ],
+  "Primaryvoltage__kv": [
+    "Primary Voltage (kv)",
+    "Rated primary voltage (kV)"
+  ],
+  "Secondaryvoltage__kv": [
+    "Secondary Voltage (v)"
+  ],
+  "PrimaryCurrent_A": [
+    "Limit continuous primary current (A)",
+    "Rated Primary Current (A)"
+  ],
+  "SecondaryCurrent_A": [
+    "Rated Secondary Current (A)",
+    "Rated secondary current (A)"
+  ],
+  "Phases": [
+    "Number of phases"
+  ],
+  "Notes": [
+    "No"
+  ],
+  "Short_circuit_current_kA": [
+    "Rated Peak Short - Circuit Current (kA)",
+    "Rated peak short-circuit current (kA)"
+  ],
+  "Frequency_Hz": [
+    "Rated frequency (Hz)"
+  ],
+  "Manufacturing_Year": [
+    "Manufacturing Year"
+  ],
+  "Serial_Number": [
+    "Serial Number"
+  ],
+  "Altitude_m": [
+    "Altitude"
+  ],
+  "VoltageTransfomer_ID": [
+    "Voltage transformer ID"
+  ],
+  "RatedOutput_VA": [
+    "Rated Output VA",
+    "Rated output (VA)"
+  ],
+  "MaxThermalOutput": [
+    "Max Themal Output"
+  ],
+  "TemperatureRange": [
+    "Temperature Range"
+  ],
+  "Degree_of_Protection": [
+    "Degree of Protection"
+  ],
+  "NumberofCores": [
+    "Number of Cores",
+    "Number of cores"
+  ],
+  "Burden_VA": [
+    "Burden (VA)"
+  ],
+  "KneePoint_V": [
+    "Kneepoint (V)"
+  ],
+  "SF_ALF": [
+    "SF-ALF"
+  ],
+  "PowerFrequencyTestVoltage_kV": [
+    "Power Frequency Test Voltage (kV)"
+  ],
+  "Class": [
+    "Accuracy Class",
+    "Accuracy class",
+    "Accuracy class (measuring)",
+    "Accuracy class (protection)"
+  ],
+  "Rated_Frequency": [
+    "Rated Frequency"
+  ],
+  "PowerFrequencyWithstandVol": [
+    "Power frequency withstand voltage (1 min) of primary side (kV)"
+  ],
+  "Substation": [
+    "Substation ID"
+  ],
+  "Type": [
+    "Feeder Type",
+    "Type",
+    "Type of voltage transformer"
+  ],
+  "Motor_Type": [
+    "geometry"
+  ],
+  "Model": [
+    "Model",
+    "Model of Voltage Transformer"
+  ],
+  "Insulation": [
+    "Insulation",
+    "Insulation LV"
+  ],
+  "Name": [
+    "Current Transformer Name",
+    "Line Bay Name",
+    "SUBSTATION NAMES",
+    "Substation Name",
+    "Substation Name\ufffd",
+    "Unnamed: 21"
+  ],
+  "Standard": [
+    "Standard",
+    "Standard Code",
+    "Standards"
+  ],
+  "RatedShortTimeWithstandCur": [
+    "Rated short-time withstand current (kA)"
+  ],
+  "Rated_secondary_voltage_winding_1__V_": [
+    "Rated secondary voltage winding 1 (V)"
+  ],
+  "Rated_secondary_voltage_winding_2__V_": [
+    "Rated secondary voltage winding 2 (V)"
+  ],
+  "Bay_ID": [
+    "Line Bay ID"
+  ],
+  "Rated_Voltage": [
+    "Rated voltage (kV)"
+  ],
+  "CompressionRatio_": [
+    "Nr"
+  ]
+}
