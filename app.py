@@ -697,6 +697,22 @@ def sanitize_gdf_for_gpkg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out
 
 
+def st_dataframe_safe(df, rows: int | None = None):
+    """Render dataframes safely in Streamlit by stringifying geometry columns to avoid Arrow errors."""
+    try:
+        preview = df.head(rows) if rows else df
+        if hasattr(preview, "geometry"):
+            preview = preview.copy()
+            geom_col = preview.geometry.name
+            preview[geom_col] = preview[geom_col].apply(lambda g: getattr(g, "wkt", None) if g is not None else None)
+        elif "geometry" in preview.columns:
+            preview = preview.copy()
+            preview["geometry"] = preview["geometry"].apply(lambda g: getattr(g, "wkt", None) if hasattr(g, "wkt") else str(g))
+        st.dataframe(preview)
+    except Exception:
+        st.dataframe(df)
+
+
 # =====================================================================
 # MERGE LOGIC
 # =====================================================================
@@ -819,7 +835,7 @@ def run_app() -> None:
 
     st.subheader("GeoPackage Preview")
     st.write(f"Features: **{len(gdf):,}**")
-    st.dataframe(gdf.head(PREVIEW_ROWS))
+    st_dataframe_safe(gdf, PREVIEW_ROWS)
 
     # Select sheet
     excel_file = pd.ExcelFile(workbook_path)
@@ -883,7 +899,7 @@ def run_app() -> None:
     filtered_df = df.loc[filter_mask].copy()
 
     st.write(f"Filtered rows: **{len(filtered_df)}**")
-    st.dataframe(filtered_df.head(PREVIEW_ROWS))
+    st_dataframe_safe(filtered_df, PREVIEW_ROWS)
 
     # Join fields
     st.subheader("Join Fields")
@@ -895,7 +911,7 @@ def run_app() -> None:
         try:
             merged = merge_without_duplicates(gdf, filtered_df, left_key, right_key)
             st.success("Merge successful!")
-            st.dataframe(merged.head(PREVIEW_ROWS))
+            st_dataframe_safe(merged, PREVIEW_ROWS)
 
             # Save temp file
             layer_name = derive_layer_name_from_filename(gpkg_file.name)
@@ -1247,7 +1263,7 @@ def run_app() -> None:
                         # Show schema preview
                         preview_rows = [{"Field": f, "Type": type_map.get(f, "")} for f in schema_fields]
                         st.subheader("Selected Equipment Schema")
-                        st.dataframe(pd.DataFrame(preview_rows))
+                        st_dataframe_safe(pd.DataFrame(preview_rows))
 
                         # Suggested mapping
                         suggested = fuzzy_map_columns(list(gdf_map.columns), schema_fields, threshold=0.6)
