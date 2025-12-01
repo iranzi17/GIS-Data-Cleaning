@@ -1081,7 +1081,9 @@ def run_app() -> None:
                 excel_file = pd.ExcelFile(workbook_path)
                 for gpkg_path in sorted(gpkg_paths):
                     try:
-                        substation_name = gpkg_path.stem
+                        # Substation name is taken from the top-level folder in the ZIP; fallback to file stem.
+                        rel_parts = gpkg_path.relative_to(tmp_in_dir).parts
+                        substation_name = rel_parts[0] if len(rel_parts) > 1 else gpkg_path.stem
                         layers = list_gpkg_layers(gpkg_path)
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
