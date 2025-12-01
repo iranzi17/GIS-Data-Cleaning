@@ -825,6 +825,33 @@ def merge_without_duplicates(gdf, df, left_key, right_key):
     return gpd.GeoDataFrame(base, geometry=geometry_name, crs=gdf.crs)
 
 
+# Manual mapping of GPKG/file names to exact sheet names.
+GPKG_SHEET_MAP: dict[str, list[str]] = {
+    normalize_for_compare("48VDC BATTERY"): ["48VDC BATTERY"],
+    normalize_for_compare("48VDC CHARGER"): ["48VDC CHARGER"],
+    normalize_for_compare("110VDC BATTERY"): ["110VDC BATTERY"],
+    normalize_for_compare("110VDC CHARGER"): ["110VDC CHARGER"],
+    normalize_for_compare("BUSBAR"): ["BUSBAR"],
+    normalize_for_compare("CABIN"): ["SUBSTATION"],
+    normalize_for_compare("CB INDOR SWITCHGEAR"): ["CB- INDR STCH G- 30,15KV"],
+    normalize_for_compare("CT INDOR SWITCHGEAR"): ["CT INDR STCH G - 30,15KV"],
+    normalize_for_compare("CURRENT TRANSFORMER"): ["CURRENT TRANSFORMER"],
+    normalize_for_compare("DIGITAL FAULT RECORDER"): ["DIGITAL FAULT RECORDER"],
+    normalize_for_compare("DISCONNECTOR SWITCH"): ["DISCONNECTOR SWITCH"],
+    normalize_for_compare("HIGH_VOLTAGE_CIRCUIT_BREAKER"): ["HIGH VOLTAGE CIRCUIT BREAKER"],
+    normalize_for_compare("INDOR SWITCHGEAR TABLE"): ["INDOR SWITCH GEAR TABLE"],
+    normalize_for_compare("LIGHTNING ARRESTOR"): ["LIGHTINING ARRESTERS"],
+    normalize_for_compare("LINE BAY"): ["LINE BAYS"],
+    normalize_for_compare("POWER CABLE TO TRANSFORMER"): ["POWER CABLE TO TRANSFORMER"],
+    normalize_for_compare("TELECOM"): ["TELECOM SDH", "TELECOM ODF"],
+    normalize_for_compare("TRANS_SYSTEM PROT1"): ["TRANS- SYSTEM PROT1"],
+    normalize_for_compare("TRANSFORMERS"): ["TRANSFORMER 2"],
+    normalize_for_compare("UPS"): ["UPS"],
+    normalize_for_compare("VOLTAGE TRANSFORMER"): ["VOLTAGE TRANSFORMER"],
+    normalize_for_compare("VT INDOR SWITCHGEAR"): ["VT INDR STCH G - 30,15KV"],
+}
+
+
 def detect_best_sheet(excel_file: pd.ExcelFile, gdf_columns: list[str]) -> str | None:
     """
     Pick the Excel sheet whose cleaned header best matches the GeoPackage columns.
@@ -849,6 +876,25 @@ def detect_best_sheet(excel_file: pd.ExcelFile, gdf_columns: list[str]) -> str |
         except Exception:
             continue
     return best_sheet
+
+
+def select_sheet_for_gpkg(
+    excel_file: pd.ExcelFile, gpkg_name: str, gdf_columns: list[str], auto_sheet: bool, fallback_sheet: str
+) -> str:
+    """
+    Choose the sheet for a given GeoPackage name using the manual map first,
+    then optional auto-selection, then fallback.
+    """
+    norm = normalize_for_compare(Path(gpkg_name).stem)
+    candidates = GPKG_SHEET_MAP.get(norm, [])
+    for cand in candidates:
+        if cand in excel_file.sheet_names:
+            return cand
+    if auto_sheet:
+        detected = detect_best_sheet(excel_file, gdf_columns)
+        if detected:
+            return detected
+    return fallback_sheet
 
 
 def detect_join_columns(left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_name: str | None = None) -> tuple[str | None, str | None]:
@@ -1088,12 +1134,10 @@ def run_app() -> None:
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
 
-                        # Choose sheet
-                        chosen_sheet = None
-                        if auto_sheet:
-                            chosen_sheet = detect_best_sheet(excel_file, list(gdf_in.columns))
-                        if not chosen_sheet:
-                            chosen_sheet = fallback_sheet
+                        # Choose sheet using mapping -> auto-detect -> fallback
+                        chosen_sheet = select_sheet_for_gpkg(
+                            excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fallback_sheet
+                        )
 
                         df_sheet = load_reference_sheet(workbook_path, chosen_sheet)
                         sub_col_auto = detect_substation_column(df_sheet)
