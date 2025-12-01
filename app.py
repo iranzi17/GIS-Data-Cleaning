@@ -1730,6 +1730,7 @@ def run_app() -> None:
                             list(gdf_map.columns), schema_fields, threshold=mapping_threshold, exclude=exclude_cols
                         )
                         accept_threshold = 0.6
+                        norm_col_lookup = {normalize_for_compare(c): c for c in gdf_map.columns}
 
                         # Confidence hints
                         st.subheader("Field Mapping")
@@ -1741,7 +1742,15 @@ def run_app() -> None:
                         for idx, field in enumerate(schema_fields):
                             best_src = suggested.get(field)
                             score = score_map.get(field, 0.0)
-                            default_src = best_src if score >= accept_threshold and best_src in gdf_map.columns else None
+                            default_src = None
+                            if best_src and score >= accept_threshold:
+                                if best_src in gdf_map.columns:
+                                    default_src = best_src
+                                else:
+                                    # fallback to normalized column match
+                                    resolved = norm_col_lookup.get(normalize_for_compare(best_src))
+                                    if resolved:
+                                        default_src = resolved
                             label = f"{field}"
                             if best_src:
                                 label = f"{field} (suggested: {best_src}, score={score:.2f}{' auto-applied' if default_src else ''})"
@@ -1839,6 +1848,7 @@ def run_app() -> None:
                                     suggested_batch, score_map_batch = fuzzy_map_columns_with_scores(
                                         list(gdf_layer.columns), schema_fields, threshold=mapping_threshold, exclude=exclude_layer_cols
                                     )
+                                    norm_col_lookup_batch = {normalize_for_compare(c): c for c in gdf_layer.columns}
                                     out_cols_batch = {}
                                     n = len(gdf_layer)
                                     def _na_series():
@@ -1846,10 +1856,15 @@ def run_app() -> None:
                                     for f in schema_fields:
                                         src = suggested_batch.get(f)
                                         score = score_map_batch.get(f, 0.0)
-                                        if src and src in gdf_layer.columns and score >= 0.6:
-                                            out_cols_batch[f] = gdf_layer[src]
-                                        else:
-                                            out_cols_batch[f] = _na_series()
+                                        chosen_src = None
+                                        if src and score >= 0.6:
+                                            if src in gdf_layer.columns:
+                                                chosen_src = src
+                                            else:
+                                                resolved = norm_col_lookup_batch.get(normalize_for_compare(src))
+                                                if resolved:
+                                                    chosen_src = resolved
+                                        out_cols_batch[f] = gdf_layer[chosen_src] if chosen_src else _na_series()
                                     if keep_unmatched:
                                         for col in gdf_layer.columns:
                                             if col not in suggested_batch.values() and col != gdf_layer.geometry.name:
