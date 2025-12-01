@@ -889,13 +889,22 @@ def select_sheet_for_gpkg(
 ) -> str:
     """
     Choose the sheet for a given GeoPackage name using the manual map first,
-    then optional auto-selection, then fallback. If a mapping exists, it wins.
+    then optional auto-selection, then fallback. If a mapping exists but is not
+    present in this workbook, returns None to allow trying another workbook.
     """
     norm = normalize_for_compare(Path(gpkg_name).stem)
+
+    # Build normalized lookup for sheet names in this workbook
+    sheet_lookup = {normalize_for_compare(s): s for s in excel_file.sheet_names}
+
     candidates = GPKG_SHEET_MAP.get(norm, [])
-    for cand in candidates:
-        if cand in excel_file.sheet_names:
-            return cand
+    if candidates:
+        for cand in candidates:
+            cand_norm = normalize_for_compare(cand)
+            if cand_norm in sheet_lookup:
+                return sheet_lookup[cand_norm]
+        return None  # mapped sheet not present in this workbook
+
     if auto_sheet:
         detected = detect_best_sheet(excel_file, gdf_columns)
         if detected:
@@ -1159,7 +1168,7 @@ def run_app() -> None:
                                 chosen_sheet = select_sheet_for_gpkg(
                                     excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
                                 )
-                                if chosen_sheet not in excel_file.sheet_names:
+                                if chosen_sheet is None or chosen_sheet not in excel_file.sheet_names:
                                     continue
 
                                 df_sheet = load_reference_sheet(wb_path, chosen_sheet)
