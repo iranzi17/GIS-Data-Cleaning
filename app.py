@@ -199,7 +199,7 @@ def load_file_aliases() -> dict[str, list[str]]:
 
 
 def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshold: float = 0.6) -> dict[str, str]:
-    """Return mapping target_field -> source_col using fuzzy/containment with alias boost."""
+    """Return mapping target_field -> source_col using rich fuzzy/alias logic."""
     alias_map = {
         "countryofmanufacturer": ["manufacturingcountry", "countryofmanufacturing", "countryoforigin", "countryofmanufacture"],
         "countryofmanufacture": ["countryofmanufacturer", "countrymanufacturer"],
@@ -328,6 +328,148 @@ def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshol
                 result[best] = src
                 result_scores[best] = best_score
     return result
+
+
+def fuzzy_map_columns_with_scores(
+    source_cols: list[str], target_fields: list[str], threshold: float = 0.6
+) -> tuple[dict[str, str], dict[str, float]]:
+    """Variant of fuzzy_map_columns that also returns the best score per target."""
+    mapping = {}
+    scores = {}
+    alias_map = fuzzy_map_columns(source_cols, target_fields, threshold)  # reuse alias enrichment side effects
+    # The above call already computed mapping; to get scores, recompute with slight refactor
+    # (keeping logic in sync with fuzzy_map_columns).
+
+    # Rebuild enriched metadata (copied logic)
+    base_alias = {
+        "countryofmanufacturer": ["manufacturingcountry", "countryofmanufacturing", "countryoforigin", "countryofmanufacture"],
+        "countryofmanufacture": ["countryofmanufacturer", "countrymanufacturer"],
+        "manufacturer": ["manufactoringcompany", "manufacturingcompany"],
+        "manufactureryear": ["manufacturingyear", "yearofmanufacturer", "manufacturing_year"],
+        "temperature range": ["temperaturerange", "temperature_range"],
+        "typemodel": ["type_model", "type/model", "type model", "type-model"],
+        "standards": ["standard", "std"],
+        "standard": ["standards", "std"],
+        "light_impulse_withsand_kv": [
+            "impulsewithstandvoltage",
+            "impulsewithstand",
+            "impulsewithstandvoltage1250msfullwavekv",
+            "impulsewithstandvoltage1250msfullwave",
+            "impulsewithstandvoltagepeak",
+        ],
+        "ratedimpulsewithstandvol": [
+            "impulsewithstandvoltage",
+            "ratedimpulsewithstandvoltage",
+            "impulsewithstandvoltage1250msfullwavekv",
+            "impulsewithstandvoltage1250msfullwave",
+        ],
+        "powerfrequencywithstandvol": [
+            "powerfrequencywithstandvoltage",
+            "powerfrequencywithstandvoltage1minprimaryside",
+            "powerfrequencywithstandvoltage1minute",
+            "powerfrequencywithstandvoltage1min",
+            "powerfrequencywithstandvoltageprimary",
+        ],
+    }
+    file_aliases = load_file_aliases()
+    for k, vals in file_aliases.items():
+        base_alias.setdefault(k, [])
+        base_alias[k].extend([v for v in vals if v not in base_alias[k]])
+
+    def _tokenize(text: str) -> set[str]:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
+        return {tok for tok in cleaned.split() if tok}
+
+    def _variants(norm: str) -> set[str]:
+        variants = {norm}
+        if norm.endswith("ies") and len(norm) > 4:
+            variants.add(norm[:-3] + "y")
+        if norm.endswith("s") and len(norm) > 3:
+            variants.add(norm[:-1])
+        elif len(norm) > 3:
+            variants.add(norm + "s")
+        if "manufacturer" in norm:
+            variants.add(norm.replace("manufacturer", "manufacture"))
+        if "manufacture" in norm:
+            variants.add(norm.replace("manufacture", "manufacturer"))
+        return {v for v in variants if v}
+
+    norm_target = {normalize_for_compare(t): t for t in target_fields}
+    alias_norm = {normalize_for_compare(k): [normalize_for_compare(v) for v in vals] for k, vals in base_alias.items()}
+
+    dynamic_alias: dict[str, set[str]] = {nt: set() for nt in norm_target}
+    ref_cols = get_reference_columns()
+    for col in ref_cols:
+        norm_col = normalize_for_compare(col)
+        tokens_col = _tokenize(col)
+        best_nt = None
+        best_score = 0.0
+        for nt in norm_target:
+            score = difflib.SequenceMatcher(None, norm_col, nt).ratio()
+            if norm_col and nt and (norm_col in nt or nt in norm_col):
+                score = max(score, 0.9)
+            if tokens_col and _tokenize(nt):
+                overlap = len(tokens_col & _tokenize(nt)) / max(len(tokens_col | _tokenize(nt)), 1)
+                score = max(score, overlap)
+            if score > best_score:
+                best_score = score
+                best_nt = nt
+        if best_nt and best_score >= 0.8:
+            dynamic_alias.setdefault(best_nt, set()).add(norm_col)
+
+    target_meta = {
+        tname: {
+            "norm": nt,
+            "variants": _variants(nt),
+            "tokens": _tokenize(tname),
+            "aliases": set(alias_norm.get(nt, [])) | dynamic_alias.get(nt, set()),
+        }
+        for nt, tname in norm_target.items()
+    }
+
+    result: dict[str, str] = {}
+    result_scores: dict[str, float] = {}
+    for src in source_cols:
+        norm_src = normalize_for_compare(src)
+        src_variants = _variants(norm_src)
+        src_tokens = _tokenize(src)
+        best = None
+        best_score = threshold
+        for tname, meta in target_meta.items():
+            score = 0.0
+            if meta["aliases"] and any(v in meta["aliases"] for v in src_variants):
+                score = max(score, 0.97)
+            for sv in src_variants:
+                for tv in meta["variants"]:
+                    if not sv and not tv:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, sv, tv).ratio()
+                    if sv and tv and (sv in tv or tv in sv):
+                        ratio = max(ratio, 0.92)
+                    score = max(score, ratio)
+            if src_tokens and meta["tokens"]:
+                overlap = len(src_tokens & meta["tokens"]) / max(len(src_tokens | meta["tokens"]), 1)
+                if overlap:
+                    token_score = overlap + (0.05 if overlap == 1 else 0)
+                    score = max(score, token_score)
+            if score > best_score or (best is None and score >= threshold) or (
+                abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
+            ):
+                best = tname
+                best_score = score
+        if best:
+            prev = result_scores.get(best, -1)
+            if (
+                best not in result
+                or best_score > prev + 1e-6
+                or (abs(best_score - prev) < 1e-6 and len(src) < len(result.get(best, src + "x")))
+            ):
+                result[best] = src
+                result_scores[best] = best_score
+
+    mapping = result
+    scores = result_scores
+    return mapping, scores
 
 
 def assign_ct_labels(
@@ -507,10 +649,12 @@ def _extract_first_number(value: Any) -> float | None:
 
 
 def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
-    """Coerce series to target type based on schema string, with lenient numeric parsing."""
+    """Coerce series to target type based on schema string, with lenient numeric parsing and datetime handling."""
     t = normalize_for_compare(type_str or "")
     if not isinstance(series, pd.Series):
         return series
+    if any(tok in t for tok in ("date", "datetime", "timestamp")):
+        return pd.to_datetime(series, errors="coerce")
     if any(tok in t for tok in ("int", "integer", "long", "short", "bigint", "smallint")):
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="Int64")
@@ -518,7 +662,10 @@ def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="float64")
     if "bool" in t:
-        return series.astype("boolean")
+        try:
+            return series.astype("boolean")
+        except Exception:
+            return series.map(lambda v: str(v).strip().lower() in {"true", "1", "yes"} if pd.notna(v) else pd.NA).astype("boolean")
     # default to string for text-like
     return series.astype("string")
 
@@ -1559,15 +1706,34 @@ def run_app() -> None:
                         st.subheader("Selected Equipment Schema")
                         st_dataframe_safe(pd.DataFrame(preview_rows))
 
-                        # Suggested mapping
-                        suggested = fuzzy_map_columns(list(gdf_map.columns), schema_fields, threshold=0.6)
+                        # Suggested mapping with adjustable sensitivity
+                        mapping_threshold = st.slider(
+                            "Auto-mapping sensitivity (lower = more aggressive suggestions)",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.35,
+                            step=0.05,
+                            key="map_threshold",
+                        )
+                        suggested, score_map = fuzzy_map_columns_with_scores(
+                            list(gdf_map.columns), schema_fields, threshold=mapping_threshold
+                        )
 
+                        # Confidence hints
                         st.subheader("Field Mapping")
+                        st.caption(
+                            "Suggested source columns are preselected; adjust as needed. Score shown when a suggestion exists."
+                        )
+
                         mapping = {}
                         for idx, field in enumerate(schema_fields):
                             default_src = suggested.get(field)
+                            score = score_map.get(field)
+                            label = f"{field}"
+                            if default_src:
+                                label = f"{field} (auto: {default_src}, score={score:.2f})"
                             mapping[field] = st.selectbox(
-                                f"{field}",
+                                label,
                                 options=["(empty)"] + list(gdf_map.columns),
                                 index=(list(gdf_map.columns).index(default_src) + 1) if default_src in gdf_map.columns else 0,
                                 key=f"map_select_{idx}",
@@ -1656,7 +1822,9 @@ def run_app() -> None:
 
                                 for lyr in selected_layers:
                                     gdf_layer = gpd.read_file(temp_map_path, layer=lyr)
-                                    suggested_batch = fuzzy_map_columns(list(gdf_layer.columns), schema_fields, threshold=0.6)
+                                    suggested_batch, score_map_batch = fuzzy_map_columns_with_scores(
+                                        list(gdf_layer.columns), schema_fields, threshold=mapping_threshold
+                                    )
                                     out_cols_batch = {}
                                     n = len(gdf_layer)
                                     def _na_series():
