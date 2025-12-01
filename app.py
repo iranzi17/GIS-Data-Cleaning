@@ -19,7 +19,13 @@ import streamlit as st
 # =====================================================================
 BASE_DIR = Path(__file__).parent
 REFERENCE_DATA_DIR = BASE_DIR / "reference_data"
-WORKBOOK_NAME = "SUBSTATIONS 2-251025.xlsx"
+# Preferred workbook order: newest first; falls back to any available in reference_data.
+WORKBOOK_PRIORITY = [
+    "SUBSTATION 1-25102025.xlsx",
+    "SUBSTATIONS 2-25112025.xlsx",
+    "SUBSTATIONS 2-251025.xlsx",
+]
+WORKBOOK_NAME = WORKBOOK_PRIORITY[0]
 WORKBOOK_PATH = REFERENCE_DATA_DIR / WORKBOOK_NAME
 REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
@@ -967,9 +973,9 @@ def run_app() -> None:
 
     labels = list(workbooks.keys())
     default_idx = 0
-    for i, lbl in enumerate(labels):
-        if Path(lbl).name == WORKBOOK_NAME:
-            default_idx = i
+    for pref in WORKBOOK_PRIORITY:
+        if pref in labels:
+            default_idx = labels.index(pref)
             break
 
     selected_label = st.selectbox("Select Reference Workbook", labels, index=default_idx)
