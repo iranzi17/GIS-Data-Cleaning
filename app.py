@@ -1742,22 +1742,18 @@ def run_app() -> None:
                         for idx, field in enumerate(schema_fields):
                             best_src = suggested.get(field)
                             score = score_map.get(field, 0.0)
-                            default_src = None
+                            resolved_src = None
                             if best_src and score >= accept_threshold:
-                                if best_src in gdf_map.columns:
-                                    default_src = best_src
-                                else:
-                                    # fallback to normalized column match
-                                    resolved = norm_col_lookup.get(normalize_for_compare(best_src))
-                                    if resolved:
-                                        default_src = resolved
+                                resolved_src = norm_col_lookup.get(normalize_for_compare(best_src), best_src)
+                                if resolved_src not in gdf_map.columns:
+                                    resolved_src = None
                             label = f"{field}"
                             if best_src:
-                                label = f"{field} (suggested: {best_src}, score={score:.2f}{' auto-applied' if default_src else ''})"
+                                label = f"{field} (suggested: {best_src}, score={score:.2f}{' auto-applied' if resolved_src else ''})"
                             mapping[field] = st.selectbox(
                                 label,
                                 options=["(empty)"] + list(gdf_map.columns),
-                                index=(list(gdf_map.columns).index(default_src) + 1) if default_src in gdf_map.columns else 0,
+                                index=(list(gdf_map.columns).index(resolved_src) + 1) if resolved_src in gdf_map.columns else 0,
                                 key=f"map_select_{idx}",
                             )
 
@@ -1858,12 +1854,9 @@ def run_app() -> None:
                                         score = score_map_batch.get(f, 0.0)
                                         chosen_src = None
                                         if src and score >= 0.6:
-                                            if src in gdf_layer.columns:
-                                                chosen_src = src
-                                            else:
-                                                resolved = norm_col_lookup_batch.get(normalize_for_compare(src))
-                                                if resolved:
-                                                    chosen_src = resolved
+                                            resolved = norm_col_lookup_batch.get(normalize_for_compare(src), src)
+                                            if resolved in gdf_layer.columns:
+                                                chosen_src = resolved
                                         out_cols_batch[f] = gdf_layer[chosen_src] if chosen_src else _na_series()
                                     if keep_unmatched:
                                         for col in gdf_layer.columns:
