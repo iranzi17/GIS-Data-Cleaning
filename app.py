@@ -889,7 +889,7 @@ def select_sheet_for_gpkg(
 ) -> str:
     """
     Choose the sheet for a given GeoPackage name using the manual map first,
-    then optional auto-selection, then fallback.
+    then optional auto-selection, then fallback. If a mapping exists, it wins.
     """
     norm = normalize_for_compare(Path(gpkg_name).stem)
     candidates = GPKG_SHEET_MAP.get(norm, [])
@@ -1150,6 +1150,7 @@ def run_app() -> None:
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
 
                         merged_ok = False
+
                         for wb_label, wb_path in ordered_refs:
                             try:
                                 excel_file = pd.ExcelFile(wb_path)
