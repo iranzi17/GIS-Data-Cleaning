@@ -30,6 +30,7 @@ WORKBOOK_PATH = REFERENCE_DATA_DIR / WORKBOOK_NAME
 REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
 GPKG_EQUIP_MAP_FILE = REFERENCE_DATA_DIR / "gpkg_equipment_map.json"
+MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
@@ -161,6 +162,7 @@ def list_gpkg_layers(path: Path) -> list[str]:
 _REFERENCE_ALIAS_COLUMNS: list[str] | None = None
 _FILE_ALIAS_CACHE: dict[str, list[str]] | None = None
 _GPKG_EQUIP_MAP: dict[str, str] | None = None
+_MAPPING_CACHE: dict[str, dict[str, str]] | None = None
 
 
 def get_reference_columns() -> list[str]:
@@ -239,6 +241,30 @@ def load_gpkg_equipment_map() -> dict[str, str]:
             pass
     _GPKG_EQUIP_MAP = default_map
     return _GPKG_EQUIP_MAP
+
+
+def load_mapping_cache() -> dict[str, dict[str, str]]:
+    """Load persisted field mapping choices keyed by schema/sheet/equipment."""
+    global _MAPPING_CACHE
+    if _MAPPING_CACHE is not None:
+        return _MAPPING_CACHE
+    if MAPPING_CACHE_FILE.exists():
+        try:
+            data = json.loads(MAPPING_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                _MAPPING_CACHE = {str(k): v if isinstance(v, dict) else {} for k, v in data.items()}
+                return _MAPPING_CACHE
+        except Exception:
+            pass
+    _MAPPING_CACHE = {}
+    return _MAPPING_CACHE
+
+
+def save_mapping_cache(cache: dict[str, dict[str, str]]) -> None:
+    try:
+        MAPPING_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def fuzzy_map_columns(
@@ -1808,10 +1834,17 @@ def run_app() -> None:
                         )
 
                         mapping = {}
+                        cache = load_mapping_cache()
+                        cache_key = f"{schema_label}::{schema_sheet}::{equipment_name}"
+                        cached_map = cache.get(cache_key, {})
                         for idx, field in enumerate(schema_fields):
                             best_src = suggested.get(field)
                             score = score_map.get(field, 0.0)
                             resolved_src = None
+                            # cached choice takes precedence if still present
+                            cached_src = cached_map.get(field)
+                            if cached_src and cached_src in gdf_map.columns:
+                                resolved_src = cached_src
                             if best_src and score >= accept_threshold:
                                 resolved_src = norm_col_lookup.get(normalize_for_compare(best_src), best_src)
                                 if resolved_src not in gdf_map.columns:
@@ -1865,6 +1898,15 @@ def run_app() -> None:
 
                                 out_gdf = gpd.GeoDataFrame(out_cols, geometry=geom_series, crs=gdf_map.crs)
                                 out_gdf = sanitize_gdf_for_gpkg(out_gdf)
+
+                                # persist user mapping choices
+                                chosen_map = {
+                                    f: mapping.get(f)
+                                    for f in schema_fields
+                                    if mapping.get(f) and mapping.get(f) != "(empty)"
+                                }
+                                cache[cache_key] = chosen_map
+                                save_mapping_cache(cache)
 
                                 layer_name = derive_layer_name_from_filename(map_file.name)
                                 if output_choice.startswith("GeoPackage"):
