@@ -457,6 +457,20 @@ def load_schema_fields(
     return fields, type_map
 
 
+def load_reference_sheet(workbook_path: Path, sheet_name: str) -> pd.DataFrame:
+    """Load and clean a sheet from the reference workbook using the same logic as the main loader."""
+    raw_df = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
+    header_row = _detect_header_row(raw_df)
+    header = [_clean_column_name(c) for c in raw_df.iloc[header_row]]
+    header = ensure_unique_columns(header)
+    df = raw_df.iloc[header_row + 1 :].copy()
+    df.columns = header
+    df.reset_index(drop=True, inplace=True)
+    df = _apply_global_forward_fill(df)
+    df = clean_empty_rows(df)
+    return df
+
+
 def list_schema_equipments(schema_path: Path, sheet_name: str, device_col: int = 0) -> list[str]:
     """List unique equipment/device names from a schema sheet."""
     schema_raw = pd.read_excel(schema_path, sheet_name=sheet_name, dtype=str, header=None)
@@ -627,6 +641,16 @@ def _apply_global_forward_fill(df: pd.DataFrame) -> pd.DataFrame:
 
     normalized = df.applymap(_normalize_empty)
     return normalized.ffill()
+
+
+def forward_fill_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Forward-fill a specific column, treating blanks/whitespace as missing."""
+    if df.empty or column not in df.columns:
+        return df
+    series = df[column].apply(strip_unicode_spaces)
+    series = series.replace("", pd.NA)
+    df[column] = series.ffill()
+    return df
 
 
 def clean_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -801,6 +825,76 @@ def merge_without_duplicates(gdf, df, left_key, right_key):
     return gpd.GeoDataFrame(base, geometry=geometry_name, crs=gdf.crs)
 
 
+def detect_best_sheet(excel_file: pd.ExcelFile, gdf_columns: list[str]) -> str | None:
+    """
+    Pick the Excel sheet whose cleaned header best matches the GeoPackage columns.
+    Uses normalized header overlap; returns None if no sheets found.
+    """
+    best_sheet = None
+    best_score = 0.0
+    gdf_norm = {normalize_for_compare(c) for c in gdf_columns}
+    for sheet in excel_file.sheet_names:
+        try:
+            raw_df = pd.read_excel(excel_file, sheet_name=sheet, dtype=str, header=None, nrows=15)
+            header_row = _detect_header_row(raw_df)
+            header = [_clean_column_name(c) for c in raw_df.iloc[header_row]]
+            header = ensure_unique_columns(header)
+            header_norm = {normalize_for_compare(h) for h in header if h}
+            overlap = len(gdf_norm & header_norm)
+            denom = max(len(header_norm), 1)
+            score = overlap / denom
+            if score > best_score:
+                best_score = score
+                best_sheet = sheet
+        except Exception:
+            continue
+    return best_sheet
+
+
+def detect_join_columns(left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_name: str | None = None) -> tuple[str | None, str | None]:
+    """
+    Heuristic to find join columns between GeoPackage dataframe and Excel dataframe.
+    Prefers value overlap, falls back to column-name similarity.
+    """
+    def _norm_series(series: pd.Series) -> pd.Series:
+        return series.dropna().map(normalize_value_for_compare)
+
+    left_candidates = [c for c in left_df.columns if c != geometry_name]
+    right_candidates = list(right_df.columns)
+
+    best = (None, None, 0.0)
+    for lc in left_candidates:
+        left_norm = set(_norm_series(left_df[lc]))
+        if not left_norm:
+            continue
+        for rc in right_candidates:
+            right_norm = set(_norm_series(right_df[rc]))
+            if not right_norm:
+                continue
+            overlap = len(left_norm & right_norm)
+            denom = max(min(len(left_norm), len(right_norm)), 1)
+            score = overlap / denom
+            if score > best[2]:
+                best = (lc, rc, score)
+
+    left_key, right_key, score = best
+    if score >= 0.4:
+        return left_key, right_key
+
+    # fallback: header similarity
+    best = (None, None, 0.0)
+    for lc in left_candidates:
+        norm_l = normalize_for_compare(lc)
+        for rc in right_candidates:
+            norm_r = normalize_for_compare(rc)
+            ratio = difflib.SequenceMatcher(None, norm_l, norm_r).ratio()
+            if ratio > best[2]:
+                best = (lc, rc, ratio)
+    if best[2] >= 0.6:
+        return best[0], best[1]
+    return None, None
+
+
 def derive_layer_name_from_filename(name: str) -> str:
     base = Path(name).stem.strip() or "dataset"
     base = base.replace(" ", "_").lower()
@@ -876,10 +970,12 @@ def run_app() -> None:
 
     if sub_col is None:
         sub_col = st.selectbox("Select Substation Column", df.columns)
-        st.warning("Auto-detection failed—manual selection required.")
+        st.warning("Auto-detection failed - manual selection required.")
     else:
         st.success(f"Detected Substation Column: **{sub_col}**")
 
+    # Ensure merged/blank substation cells propagate to following rows
+    df = forward_fill_column(df, sub_col)
     # Extract substations
     raw_subs = df[sub_col].dropna().map(lambda x: str(x))
     # Remove invisible/bom spaces but keep normal ASCII spaces
@@ -947,6 +1043,105 @@ def run_app() -> None:
 
         except Exception as e:
             st.error(f"Merge failed: {e}")
+
+    # =====================================================================
+    # AUTOMATED BATCH LOADER (ZIP)
+    # =====================================================================
+    st.markdown("---")
+    st.header("Automated Batch Loader")
+    st.caption(
+        "Upload a ZIP containing GeoPackages named by substation. The app will auto-pick the sheet, substation, join fields, and return merged GeoPackages."
+    )
+
+    batch_zip = st.file_uploader("Upload ZIP of GeoPackages", type=["zip"], key="batch_zip")
+    auto_sheet = st.checkbox("Auto-select equipment sheet per GeoPackage", value=True, key="batch_auto_sheet")
+    default_sheet_idx = excel_file.sheet_names.index(sheet) if sheet in excel_file.sheet_names else 0
+    fallback_sheet = st.selectbox(
+        "Fallback sheet (used if auto selection fails)",
+        excel_file.sheet_names,
+        index=default_sheet_idx,
+        key="batch_fallback_sheet",
+    )
+
+    if batch_zip is not None and st.button("Run Automated Batch Merge"):
+        tmp_in_dir = Path(tempfile.mkdtemp())
+        tmp_out_dir = Path(tempfile.mkdtemp())
+        log_lines = []
+        try:
+            zip_path = tmp_in_dir / "input.zip"
+            with open(zip_path, "wb") as f:
+                f.write(batch_zip.getbuffer())
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp_in_dir)
+
+            gpkg_paths = list(tmp_in_dir.rglob("*.gpkg"))
+            if not gpkg_paths:
+                st.error("No GeoPackages found inside the ZIP.")
+            else:
+                excel_file = pd.ExcelFile(workbook_path)
+                for gpkg_path in sorted(gpkg_paths):
+                    try:
+                        substation_name = gpkg_path.stem
+                        layers = list_gpkg_layers(gpkg_path)
+                        layer_name = layers[0] if layers else None
+                        gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
+
+                        # Choose sheet
+                        chosen_sheet = None
+                        if auto_sheet:
+                            chosen_sheet = detect_best_sheet(excel_file, list(gdf_in.columns))
+                        if not chosen_sheet:
+                            chosen_sheet = fallback_sheet
+
+                        df_sheet = load_reference_sheet(workbook_path, chosen_sheet)
+                        sub_col_auto = detect_substation_column(df_sheet)
+                        if sub_col_auto is None:
+                            log_lines.append(f"{gpkg_path.name}: failed (no substation column detected).")
+                            continue
+                        df_sheet = forward_fill_column(df_sheet, sub_col_auto)
+
+                        norm_col = df_sheet[sub_col_auto].map(normalize_value_for_compare)
+                        target_norm = normalize_value_for_compare(substation_name)
+                        filtered_df = df_sheet.loc[(norm_col == target_norm).fillna(False)].copy()
+                        if filtered_df.empty:
+                            log_lines.append(f"{gpkg_path.name}: skipped (no rows found for substation '{substation_name}').")
+                            continue
+
+                        geometry_name = gdf_in.geometry.name if hasattr(gdf_in, "geometry") else None
+                        left_key, right_key = detect_join_columns(gdf_in, filtered_df, geometry_name=geometry_name)
+                        if left_key is None or right_key is None:
+                            # fallback to substation column matching if present in gdf
+                            guess_left = detect_substation_column(gdf_in)
+                            if guess_left and guess_left in gdf_in.columns:
+                                left_key = left_key or guess_left
+                            right_key = right_key or sub_col_auto
+                        if left_key is None or right_key is None:
+                            log_lines.append(f"{gpkg_path.name}: skipped (no join keys found).")
+                            continue
+
+                        merged = merge_without_duplicates(gdf_in, filtered_df, left_key, right_key)
+                        safe = sanitize_gdf_for_gpkg(merged)
+                        out_layer = layer_name or derive_layer_name_from_filename(gpkg_path.name)
+                        out_path = tmp_out_dir / gpkg_path.name
+                        safe.to_file(out_path, driver="GPKG", layer=out_layer)
+                        log_lines.append(f"{gpkg_path.name}: merged using sheet '{chosen_sheet}' on {left_key} -> {right_key}.")
+                    except Exception as exc:
+                        log_lines.append(f"{gpkg_path.name}: failed ({exc}).")
+
+                if list(tmp_out_dir.glob("*.gpkg")):
+                    zip_out = shutil.make_archive(str(tmp_out_dir / "merged"), "zip", root_dir=tmp_out_dir, base_dir=".")
+                    with open(zip_out, "rb") as f:
+                        data = f.read()
+                    st.download_button(
+                        "Download Merged GeoPackages (zip)",
+                        data=data,
+                        file_name="merged_geopackages.zip",
+                        mime="application/zip",
+                    )
+                st.text_area("Batch log", value="\n".join(log_lines) if log_lines else "No logs.", height=200)
+        finally:
+            shutil.rmtree(tmp_in_dir, ignore_errors=True)
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
     # =====================================================================
     # CT PROXIMITY AUTO-LABELLING
