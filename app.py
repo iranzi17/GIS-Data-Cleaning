@@ -1124,7 +1124,13 @@ def run_app() -> None:
             if not gpkg_paths:
                 st.error("No GeoPackages found inside the ZIP.")
             else:
-                excel_file = pd.ExcelFile(workbook_path)
+                ref_wbs = list_reference_workbooks()
+                # Prioritize the user-selected workbook, then others.
+                ordered_refs: list[tuple[str, Path]] = []
+                if selected_label in ref_wbs:
+                    ordered_refs.append((selected_label, ref_wbs.pop(selected_label)))
+                ordered_refs.extend(sorted(ref_wbs.items(), key=lambda x: x[0]))
+
                 for gpkg_path in sorted(gpkg_paths):
                     try:
                         # Substation name is taken from the top-level folder in the ZIP; fallback to file stem.
@@ -1134,43 +1140,56 @@ def run_app() -> None:
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
 
-                        # Choose sheet using mapping -> auto-detect -> fallback
-                        chosen_sheet = select_sheet_for_gpkg(
-                            excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fallback_sheet
-                        )
+                        merged_ok = False
+                        for wb_label, wb_path in ordered_refs:
+                            try:
+                                excel_file = pd.ExcelFile(wb_path)
+                                fb_sheet = fallback_sheet if fallback_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
+                                # Choose sheet using mapping -> auto-detect -> fallback
+                                chosen_sheet = select_sheet_for_gpkg(
+                                    excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
+                                )
+                                if chosen_sheet not in excel_file.sheet_names:
+                                    continue
 
-                        df_sheet = load_reference_sheet(workbook_path, chosen_sheet)
-                        sub_col_auto = detect_substation_column(df_sheet)
-                        if sub_col_auto is None:
-                            log_lines.append(f"{gpkg_path.name}: failed (no substation column detected).")
-                            continue
-                        df_sheet = forward_fill_column(df_sheet, sub_col_auto)
+                                df_sheet = load_reference_sheet(wb_path, chosen_sheet)
+                                sub_col_auto = detect_substation_column(df_sheet)
+                                if sub_col_auto is None:
+                                    continue
+                                df_sheet = forward_fill_column(df_sheet, sub_col_auto)
 
-                        norm_col = df_sheet[sub_col_auto].map(normalize_value_for_compare)
-                        target_norm = normalize_value_for_compare(substation_name)
-                        filtered_df = df_sheet.loc[(norm_col == target_norm).fillna(False)].copy()
-                        if filtered_df.empty:
-                            log_lines.append(f"{gpkg_path.name}: skipped (no rows found for substation '{substation_name}').")
-                            continue
+                                norm_col = df_sheet[sub_col_auto].map(normalize_value_for_compare)
+                                target_norm = normalize_value_for_compare(substation_name)
+                                filtered_df = df_sheet.loc[(norm_col == target_norm).fillna(False)].copy()
+                                if filtered_df.empty:
+                                    continue
 
-                        geometry_name = gdf_in.geometry.name if hasattr(gdf_in, "geometry") else None
-                        left_key, right_key = detect_join_columns(gdf_in, filtered_df, geometry_name=geometry_name)
-                        if left_key is None or right_key is None:
-                            # fallback to substation column matching if present in gdf
-                            guess_left = detect_substation_column(gdf_in)
-                            if guess_left and guess_left in gdf_in.columns:
-                                left_key = left_key or guess_left
-                            right_key = right_key or sub_col_auto
-                        if left_key is None or right_key is None:
-                            log_lines.append(f"{gpkg_path.name}: skipped (no join keys found).")
-                            continue
+                                geometry_name = gdf_in.geometry.name if hasattr(gdf_in, "geometry") else None
+                                left_key, right_key = detect_join_columns(gdf_in, filtered_df, geometry_name=geometry_name)
+                                if left_key is None or right_key is None:
+                                    # fallback to substation column matching if present in gdf
+                                    guess_left = detect_substation_column(gdf_in)
+                                    if guess_left and guess_left in gdf_in.columns:
+                                        left_key = left_key or guess_left
+                                    right_key = right_key or sub_col_auto
+                                if left_key is None or right_key is None:
+                                    continue
 
-                        merged = merge_without_duplicates(gdf_in, filtered_df, left_key, right_key)
-                        safe = sanitize_gdf_for_gpkg(merged)
-                        out_layer = layer_name or derive_layer_name_from_filename(gpkg_path.name)
-                        out_path = tmp_out_dir / gpkg_path.name
-                        safe.to_file(out_path, driver="GPKG", layer=out_layer)
-                        log_lines.append(f"{gpkg_path.name}: merged using sheet '{chosen_sheet}' on {left_key} -> {right_key}.")
+                                merged = merge_without_duplicates(gdf_in, filtered_df, left_key, right_key)
+                                safe = sanitize_gdf_for_gpkg(merged)
+                                out_layer = layer_name or derive_layer_name_from_filename(gpkg_path.name)
+                                out_path = tmp_out_dir / gpkg_path.name
+                                safe.to_file(out_path, driver="GPKG", layer=out_layer)
+                                log_lines.append(
+                                    f"{gpkg_path.name}: merged using workbook '{wb_label}', sheet '{chosen_sheet}' on {left_key} -> {right_key}."
+                                )
+                                merged_ok = True
+                                break
+                            except Exception:
+                                continue
+
+                        if not merged_ok:
+                            log_lines.append(f"{gpkg_path.name}: skipped (no rows found for substation '{substation_name}' in any workbook).")
                     except Exception as exc:
                         log_lines.append(f"{gpkg_path.name}: failed ({exc}).")
 
