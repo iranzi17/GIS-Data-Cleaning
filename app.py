@@ -612,9 +612,21 @@ def detect_substation_column(df: pd.DataFrame) -> str | None:
 # =====================================================================
 
 def _apply_global_forward_fill(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.replace("", pd.NA)
-    df = df.ffill()
-    return df
+    if df.empty:
+        return df
+
+    def _normalize_empty(val: Any):
+        if isinstance(val, str):
+            cleaned = strip_unicode_spaces(val).strip()
+            if cleaned == "" or cleaned.lower() in {"nan", "none", "null"}:
+                return pd.NA
+            return val
+        if pd.isna(val):
+            return pd.NA
+        return val
+
+    normalized = df.applymap(_normalize_empty)
+    return normalized.ffill()
 
 
 def clean_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
