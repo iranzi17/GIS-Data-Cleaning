@@ -232,6 +232,7 @@ def fuzzy_map_columns(
             "powerfrequencywithstandvoltage1min",
             "powerfrequencywithstandvoltageprimary",
         ],
+        "insulationlvkv": ["insulationlv", "insulation lv"],
     }
     # Merge in persisted aliases from file
     file_aliases = load_file_aliases()
@@ -320,7 +321,7 @@ def fuzzy_map_columns(
                     score = max(score, token_score)
             score = min(score, 1.0)
             if score > best_score or (best is None and score >= threshold) or (
-                abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
+                abs(score - best_score) < 1e-6 and best and len(tname) > len(best)
             ):
                 best = tname
                 best_score = score
@@ -463,7 +464,7 @@ def fuzzy_map_columns_with_scores(
                     score = max(score, token_score)
             score = min(score, 1.0)
             if score > best_score or (best is None and score >= threshold) or (
-                abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
+                abs(score - best_score) < 1e-6 and best and len(tname) > len(best)
             ):
                 best = tname
                 best_score = score
