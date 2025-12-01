@@ -897,18 +897,22 @@ def select_sheet_for_gpkg(
     return fallback_sheet
 
 
-def detect_join_columns(left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_name: str | None = None) -> tuple[str | None, str | None]:
+def detect_join_columns(
+    left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_name: str | None = None
+) -> tuple[str | None, str | None, int]:
     """
     Heuristic to find join columns between GeoPackage dataframe and Excel dataframe.
-    Prefers value overlap, falls back to column-name similarity.
+    Prefers value overlap (intersection count), falls back to column-name similarity.
+    Returns left_key, right_key, and the number of matching keys found.
     """
+
     def _norm_series(series: pd.Series) -> pd.Series:
         return series.dropna().map(normalize_value_for_compare)
 
     left_candidates = [c for c in left_df.columns if c != geometry_name]
     right_candidates = list(right_df.columns)
 
-    best = (None, None, 0.0)
+    best = (None, None, 0, 0.0)  # left, right, intersection_count, coverage
     for lc in left_candidates:
         left_norm = set(_norm_series(left_df[lc]))
         if not left_norm:
@@ -917,15 +921,14 @@ def detect_join_columns(left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_
             right_norm = set(_norm_series(right_df[rc]))
             if not right_norm:
                 continue
-            overlap = len(left_norm & right_norm)
-            denom = max(min(len(left_norm), len(right_norm)), 1)
-            score = overlap / denom
-            if score > best[2]:
-                best = (lc, rc, score)
+            inter = len(left_norm & right_norm)
+            coverage = inter / max(len(right_norm), 1)
+            if inter > best[2] or (inter == best[2] and coverage > best[3]):
+                best = (lc, rc, inter, coverage)
 
-    left_key, right_key, score = best
-    if score >= 0.4:
-        return left_key, right_key
+    left_key, right_key, match_count, coverage = best
+    if match_count > 0:
+        return left_key, right_key, match_count
 
     # fallback: header similarity
     best = (None, None, 0.0)
@@ -937,8 +940,8 @@ def detect_join_columns(left_df: pd.DataFrame, right_df: pd.DataFrame, geometry_
             if ratio > best[2]:
                 best = (lc, rc, ratio)
     if best[2] >= 0.6:
-        return best[0], best[1]
-    return None, None
+        return best[0], best[1], 0
+    return None, None, 0
 
 
 def derive_layer_name_from_filename(name: str) -> str:
@@ -1165,13 +1168,16 @@ def run_app() -> None:
                                     continue
 
                                 geometry_name = gdf_in.geometry.name if hasattr(gdf_in, "geometry") else None
-                                left_key, right_key = detect_join_columns(gdf_in, filtered_df, geometry_name=geometry_name)
+                                left_key, right_key, match_count = detect_join_columns(
+                                    gdf_in, filtered_df, geometry_name=geometry_name
+                                )
                                 if left_key is None or right_key is None:
                                     # fallback to substation column matching if present in gdf
                                     guess_left = detect_substation_column(gdf_in)
                                     if guess_left and guess_left in gdf_in.columns:
                                         left_key = left_key or guess_left
                                     right_key = right_key or sub_col_auto
+                                    match_count = 0
                                 if left_key is None or right_key is None:
                                     continue
 
@@ -1181,7 +1187,7 @@ def run_app() -> None:
                                 out_path = tmp_out_dir / gpkg_path.name
                                 safe.to_file(out_path, driver="GPKG", layer=out_layer)
                                 log_lines.append(
-                                    f"{gpkg_path.name}: merged using workbook '{wb_label}', sheet '{chosen_sheet}' on {left_key} -> {right_key}."
+                                    f"{gpkg_path.name}: merged using workbook '{wb_label}', sheet '{chosen_sheet}' on {left_key} -> {right_key} (matches: {match_count})."
                                 )
                                 merged_ok = True
                                 break
