@@ -1,0 +1,23 @@
+{
+  "110vdc battery": "DCSupply110VDCBattery",
+  "110vdc charger": "DCSupply110VDCcharger",
+  "48vdc battery": "DCSupply48VDCBattery",
+  "48vdc charger": "DCSupply48VDCcharger",
+  "busbar": "HighVoltageBusbar/MediumVoltageBusbar",
+  "cabin": "Substation/Cabin",
+  "cb indor switchgear": "IndoorCircuitBreaker/30kv/15kb",
+  "ct indor switchgear": "IndoorCurrentTransformer",
+  "current transformer": "CurrentTransformer",
+  "digital fault recorder": "DIGITALfaultrecorder",
+  "disconnector switch": "HighVoltageSwitch/HighVoltageSwitch",
+  "high voltage circuit breaker": "HighVoltageCircuitBreaker/HighVoltageCircuitBreaker",
+  "indor switchgear table": "MVSwitchgear",
+  "lightning arrestor": "LightningArrester",
+  "line bay": "LineBay",
+  "power cable to transformer": "TransformerBay",
+  "transformers": "PowerTransformer/StepupTransformer",
+  "voltage transformer": "VoltageTransformer",
+  "vt indor switchgear": "IndoorVoltageTransformer",
+  "ups": "Uninterruptablepowersupply(UPS)",
+  "trans_system prot1": "DistanceProtection"
+}

@@ -29,6 +29,7 @@ WORKBOOK_NAME = WORKBOOK_PRIORITY[0]
 WORKBOOK_PATH = REFERENCE_DATA_DIR / WORKBOOK_NAME
 REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
+GPKG_EQUIP_MAP_FILE = REFERENCE_DATA_DIR / "gpkg_equipment_map.json"
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
@@ -159,6 +160,7 @@ def list_gpkg_layers(path: Path) -> list[str]:
 
 _REFERENCE_ALIAS_COLUMNS: list[str] | None = None
 _FILE_ALIAS_CACHE: dict[str, list[str]] | None = None
+_GPKG_EQUIP_MAP: dict[str, str] | None = None
 
 
 def get_reference_columns() -> list[str]:
@@ -196,6 +198,47 @@ def load_file_aliases() -> dict[str, list[str]]:
             pass
     _FILE_ALIAS_CACHE = {}
     return _FILE_ALIAS_CACHE
+
+
+def load_gpkg_equipment_map() -> dict[str, str]:
+    """Load gpkg->equipment mapping from reference_data/gpkg_equipment_map.json, with defaults."""
+    global _GPKG_EQUIP_MAP
+    if _GPKG_EQUIP_MAP is not None:
+        return _GPKG_EQUIP_MAP
+    default_map = {
+        "110vdc battery": "DCSupply110VDCBattery",
+        "110vdc charger": "DCSupply110VDCcharger",
+        "48vdc battery": "DCSupply48VDCBattery",
+        "48vdc charger": "DCSupply48VDCcharger",
+        "busbar": "HighVoltageBusbar/MediumVoltageBusbar",
+        "cabin": "Substation/Cabin",
+        "cb indor switchgear": "IndoorCircuitBreaker/30kv/15kb",
+        "ct indor switchgear": "IndoorCurrentTransformer",
+        "current transformer": "CurrentTransformer",
+        "digital fault recorder": "DIGITALfaultrecorder",
+        "disconnector switch": "HighVoltageSwitch/HighVoltageSwitch",
+        "high voltage circuit breaker": "HighVoltageCircuitBreaker/HighVoltageCircuitBreaker",
+        "indor switchgear table": "MVSwitchgear",
+        "lightning arrestor": "LightningArrester",
+        "line bay": "LineBay",
+        "power cable to transformer": "TransformerBay",
+        "transformers": "PowerTransformer/StepupTransformer",
+        "voltage transformer": "VoltageTransformer",
+        "vt indor switchgear": "IndoorVoltageTransformer",
+        "ups": "Uninterruptablepowersupply(UPS)",
+        "trans_system prot1": "DistanceProtection",
+    }
+    if GPKG_EQUIP_MAP_FILE.exists():
+        try:
+            data = json.loads(GPKG_EQUIP_MAP_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                # normalize keys
+                loaded = {normalize_for_compare(k): str(v) for k, v in data.items()}
+                default_map.update(loaded)
+        except Exception:
+            pass
+    _GPKG_EQUIP_MAP = default_map
+    return _GPKG_EQUIP_MAP
 
 
 def fuzzy_map_columns(
@@ -1707,7 +1750,32 @@ def run_app() -> None:
                     if not equipment_options:
                         st.error("No equipment entries found in the schema sheet.")
                     else:
-                        equipment_name = st.selectbox("Equipment/device", equipment_options, key="schema_equipment")
+                        equip_map = load_gpkg_equipment_map()
+                        norm_gpkg = normalize_for_compare(Path(map_file.name).stem)
+                        mapped_equipment = equip_map.get(norm_gpkg)
+                        # fallback heuristic: choose best similarity if no explicit mapping
+                        default_equip_idx = 0
+                        if mapped_equipment and mapped_equipment in equipment_options:
+                            default_equip_idx = equipment_options.index(mapped_equipment)
+                        else:
+                            try:
+                                import difflib
+
+                                best = difflib.get_close_matches(
+                                    norm_gpkg, [normalize_for_compare(e) for e in equipment_options], n=1, cutoff=0.5
+                                )
+                                if best:
+                                    match_norm = best[0]
+                                    for i, opt in enumerate(equipment_options):
+                                        if normalize_for_compare(opt) == match_norm:
+                                            default_equip_idx = i
+                                            break
+                            except Exception:
+                                pass
+
+                        equipment_name = st.selectbox(
+                            "Equipment/device", equipment_options, index=default_equip_idx, key="schema_equipment"
+                        )
 
                         # Load fields/types for selected equipment
                         schema_fields, type_map = load_schema_fields(schema_path, schema_sheet, equipment_name)
