@@ -198,8 +198,11 @@ def load_file_aliases() -> dict[str, list[str]]:
     return _FILE_ALIAS_CACHE
 
 
-def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshold: float = 0.6) -> dict[str, str]:
+def fuzzy_map_columns(
+    source_cols: list[str], target_fields: list[str], threshold: float = 0.6, exclude: set[str] | None = None
+) -> dict[str, str]:
     """Return mapping target_field -> source_col using rich fuzzy/alias logic."""
+    exclude = exclude or set()
     alias_map = {
         "countryofmanufacturer": ["manufacturingcountry", "countryofmanufacturing", "countryoforigin", "countryofmanufacture"],
         "countryofmanufacture": ["countryofmanufacturer", "countrymanufacturer"],
@@ -291,6 +294,8 @@ def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshol
     result: dict[str, str] = {}
     result_scores: dict[str, float] = {}
     for src in source_cols:
+        if src in exclude:
+            continue
         norm_src = normalize_for_compare(src)
         src_variants = _variants(norm_src)
         src_tokens = _tokenize(src)
@@ -313,6 +318,7 @@ def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshol
                 if overlap:
                     token_score = overlap + (0.05 if overlap == 1 else 0)
                     score = max(score, token_score)
+            score = min(score, 1.0)
             if score > best_score or (best is None and score >= threshold) or (
                 abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
             ):
@@ -331,12 +337,13 @@ def fuzzy_map_columns(source_cols: list[str], target_fields: list[str], threshol
 
 
 def fuzzy_map_columns_with_scores(
-    source_cols: list[str], target_fields: list[str], threshold: float = 0.6
+    source_cols: list[str], target_fields: list[str], threshold: float = 0.6, exclude: set[str] | None = None
 ) -> tuple[dict[str, str], dict[str, float]]:
     """Variant of fuzzy_map_columns that also returns the best score per target."""
     mapping = {}
     scores = {}
-    alias_map = fuzzy_map_columns(source_cols, target_fields, threshold)  # reuse alias enrichment side effects
+    exclude = exclude or set()
+    alias_map = fuzzy_map_columns(source_cols, target_fields, threshold, exclude=exclude)  # reuse alias enrichment side effects
     # The above call already computed mapping; to get scores, recompute with slight refactor
     # (keeping logic in sync with fuzzy_map_columns).
 
@@ -430,6 +437,8 @@ def fuzzy_map_columns_with_scores(
     result: dict[str, str] = {}
     result_scores: dict[str, float] = {}
     for src in source_cols:
+        if src in exclude:
+            continue
         norm_src = normalize_for_compare(src)
         src_variants = _variants(norm_src)
         src_tokens = _tokenize(src)
@@ -452,6 +461,7 @@ def fuzzy_map_columns_with_scores(
                 if overlap:
                     token_score = overlap + (0.05 if overlap == 1 else 0)
                     score = max(score, token_score)
+            score = min(score, 1.0)
             if score > best_score or (best is None and score >= threshold) or (
                 abs(score - best_score) < 1e-6 and best and len(tname) < len(best)
             ):
@@ -1715,9 +1725,11 @@ def run_app() -> None:
                             step=0.05,
                             key="map_threshold",
                         )
+                        exclude_cols = {gdf_map.geometry.name} if hasattr(gdf_map, "geometry") else set()
                         suggested, score_map = fuzzy_map_columns_with_scores(
-                            list(gdf_map.columns), schema_fields, threshold=mapping_threshold
+                            list(gdf_map.columns), schema_fields, threshold=mapping_threshold, exclude=exclude_cols
                         )
+                        accept_threshold = 0.6
 
                         # Confidence hints
                         st.subheader("Field Mapping")
@@ -1727,11 +1739,12 @@ def run_app() -> None:
 
                         mapping = {}
                         for idx, field in enumerate(schema_fields):
-                            default_src = suggested.get(field)
-                            score = score_map.get(field)
+                            best_src = suggested.get(field)
+                            score = score_map.get(field, 0.0)
+                            default_src = best_src if score >= accept_threshold and best_src in gdf_map.columns else None
                             label = f"{field}"
-                            if default_src:
-                                label = f"{field} (auto: {default_src}, score={score:.2f})"
+                            if best_src:
+                                label = f"{field} (suggested: {best_src}, score={score:.2f}{' auto-applied' if default_src else ''})"
                             mapping[field] = st.selectbox(
                                 label,
                                 options=["(empty)"] + list(gdf_map.columns),
@@ -1822,8 +1835,9 @@ def run_app() -> None:
 
                                 for lyr in selected_layers:
                                     gdf_layer = gpd.read_file(temp_map_path, layer=lyr)
+                                    exclude_layer_cols = {gdf_layer.geometry.name} if hasattr(gdf_layer, "geometry") else set()
                                     suggested_batch, score_map_batch = fuzzy_map_columns_with_scores(
-                                        list(gdf_layer.columns), schema_fields, threshold=mapping_threshold
+                                        list(gdf_layer.columns), schema_fields, threshold=mapping_threshold, exclude=exclude_layer_cols
                                     )
                                     out_cols_batch = {}
                                     n = len(gdf_layer)
@@ -1831,7 +1845,8 @@ def run_app() -> None:
                                         return pd.Series([pd.NA] * n, index=gdf_layer.index)
                                     for f in schema_fields:
                                         src = suggested_batch.get(f)
-                                        if src and src in gdf_layer.columns:
+                                        score = score_map_batch.get(f, 0.0)
+                                        if src and src in gdf_layer.columns and score >= 0.6:
                                             out_cols_batch[f] = gdf_layer[src]
                                         else:
                                             out_cols_batch[f] = _na_series()
