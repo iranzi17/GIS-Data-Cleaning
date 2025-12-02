@@ -1907,11 +1907,19 @@ def run_app() -> None:
                             label = f"{field}"
                             if best_src:
                                 label = f"{field} (suggested: {best_src}, score={score:.2f}{' auto-applied' if resolved_src else ''})"
+                            options = ["(empty)"] + list(gdf_map.columns)
+                            default_index = (options.index(resolved_src) if resolved_src in options else 0)
+                            state_key = f"map_select::{schema_label}::{schema_sheet}::{equipment_name}::{idx}"
+                            # Ensure session state honors the latest suggestion; reset if option set disappears.
+                            if state_key not in st.session_state or st.session_state[state_key] not in options:
+                                st.session_state[state_key] = options[default_index]
+                            # If a new suggestion arrives, refresh the default.
+                            elif resolved_src and st.session_state[state_key] == "(empty)" and default_index != 0:
+                                st.session_state[state_key] = options[default_index]
                             mapping[field] = st.selectbox(
                                 label,
-                                options=["(empty)"] + list(gdf_map.columns),
-                                index=(list(gdf_map.columns).index(resolved_src) + 1) if resolved_src in gdf_map.columns else 0,
-                                key=f"map_select_{idx}",
+                                options=options,
+                                key=state_key,
                             )
 
                         keep_unmatched = st.checkbox("Keep unmatched original columns (prefixed with orig_)", value=True)
