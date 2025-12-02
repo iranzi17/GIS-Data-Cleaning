@@ -1436,16 +1436,16 @@ def run_app() -> None:
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
 
-                    merged_ok = False
+                        merged_ok = False
 
-                    for wb_label, wb_path in ordered_refs:
-                        try:
-                            excel_file = get_excel_file(wb_path)
-                            fb_sheet = fallback_sheet if fallback_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
-                            # Choose sheet using mapping -> auto-detect -> fallback
-                            chosen_sheet = select_sheet_for_gpkg(
-                                excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
-                            )
+                        for wb_label, wb_path in ordered_refs:
+                            try:
+                                excel_file = get_excel_file(wb_path)
+                                fb_sheet = fallback_sheet if fallback_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
+                                # Choose sheet using mapping -> auto-detect -> fallback
+                                chosen_sheet = select_sheet_for_gpkg(
+                                    excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
+                                )
                                 if chosen_sheet is None or chosen_sheet not in excel_file.sheet_names:
                                     continue
 
