@@ -163,6 +163,10 @@ _REFERENCE_ALIAS_COLUMNS: list[str] | None = None
 _FILE_ALIAS_CACHE: dict[str, list[str]] | None = None
 _GPKG_EQUIP_MAP: dict[str, str] | None = None
 _MAPPING_CACHE: dict[str, dict[str, str]] | None = None
+_EXCEL_FILE_CACHE: dict[str, pd.ExcelFile] = {}
+_SHEET_HEADER_CACHE: dict[tuple[str, str], list[str]] = {}
+_REFERENCE_SHEET_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+_SUB_COL_CACHE: dict[tuple[str, str], str | None] = {}
 
 
 def get_reference_columns() -> list[str]:
@@ -265,6 +269,50 @@ def save_mapping_cache(cache: dict[str, dict[str, str]]) -> None:
         MAPPING_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def _cache_key_from_path(path: Path | str) -> str:
+    """Stable string key for caching by filesystem path."""
+    try:
+        return str(Path(path).resolve())
+    except Exception:
+        return str(path)
+
+
+def _excel_key_from_file(excel_file: pd.ExcelFile) -> str:
+    if hasattr(excel_file, "_cache_key"):
+        return getattr(excel_file, "_cache_key")
+    try:
+        return _cache_key_from_path(getattr(excel_file, "io", excel_file))
+    except Exception:
+        return str(excel_file)
+
+
+def get_excel_file(workbook_path: Path) -> pd.ExcelFile:
+    """Return cached pd.ExcelFile for a workbook path."""
+    key = _cache_key_from_path(workbook_path)
+    cached = _EXCEL_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    excel_file = pd.ExcelFile(workbook_path)
+    setattr(excel_file, "_cache_key", key)
+    _EXCEL_FILE_CACHE[key] = excel_file
+    return excel_file
+
+
+def _get_sheet_header(excel_file: pd.ExcelFile, sheet: str) -> list[str] | None:
+    """Return cleaned header for a sheet (cached, minimal rows read)."""
+    key = (_excel_key_from_file(excel_file), sheet)
+    if key in _SHEET_HEADER_CACHE:
+        return _SHEET_HEADER_CACHE[key]
+    try:
+        raw_df = pd.read_excel(excel_file, sheet_name=sheet, dtype=str, header=None, nrows=15)
+        header_row = _detect_header_row(raw_df)
+        header = ensure_unique_columns([_clean_column_name(c) for c in raw_df.iloc[header_row]])
+        _SHEET_HEADER_CACHE[key] = header
+        return header
+    except Exception:
+        return None
 
 
 def fuzzy_map_columns(
@@ -687,7 +735,13 @@ def load_schema_fields(
 
 def load_reference_sheet(workbook_path: Path, sheet_name: str) -> pd.DataFrame:
     """Load and clean a sheet from the reference workbook using the same logic as the main loader."""
-    raw_df = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
+    cache_key = (_cache_key_from_path(workbook_path), sheet_name)
+    cached = _REFERENCE_SHEET_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    excel_file = get_excel_file(workbook_path)
+    raw_df = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str, header=None)
     header_row = _detect_header_row(raw_df)
     header = [_clean_column_name(c) for c in raw_df.iloc[header_row]]
     header = ensure_unique_columns(header)
@@ -696,7 +750,8 @@ def load_reference_sheet(workbook_path: Path, sheet_name: str) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     df = _apply_global_forward_fill(df)
     df = clean_empty_rows(df)
-    return df
+    _REFERENCE_SHEET_CACHE[cache_key] = df
+    return df.copy()
 
 
 def list_schema_equipments(schema_path: Path, sheet_name: str, device_col: int = 0) -> list[str]:
@@ -1094,20 +1149,16 @@ def detect_best_sheet(excel_file: pd.ExcelFile, gdf_columns: list[str]) -> str |
     best_score = 0.0
     gdf_norm = {normalize_for_compare(c) for c in gdf_columns}
     for sheet in excel_file.sheet_names:
-        try:
-            raw_df = pd.read_excel(excel_file, sheet_name=sheet, dtype=str, header=None, nrows=15)
-            header_row = _detect_header_row(raw_df)
-            header = [_clean_column_name(c) for c in raw_df.iloc[header_row]]
-            header = ensure_unique_columns(header)
-            header_norm = {normalize_for_compare(h) for h in header if h}
-            overlap = len(gdf_norm & header_norm)
-            denom = max(len(header_norm), 1)
-            score = overlap / denom
-            if score > best_score:
-                best_score = score
-                best_sheet = sheet
-        except Exception:
+        header = _get_sheet_header(excel_file, sheet)
+        if not header:
             continue
+        header_norm = {normalize_for_compare(h) for h in header if h}
+        overlap = len(gdf_norm & header_norm)
+        denom = max(len(header_norm), 1)
+        score = overlap / denom
+        if score > best_score:
+            best_score = score
+            best_sheet = sheet
     return best_sheet
 
 
@@ -1235,13 +1286,13 @@ def run_app() -> None:
     st_dataframe_safe(gdf, PREVIEW_ROWS)
 
     # Select sheet
-    excel_file = pd.ExcelFile(workbook_path)
+    excel_file = get_excel_file(workbook_path)
     sheet = st.selectbox("Select Equipment Type (Excel Sheet)", excel_file.sheet_names)
     if not sheet:
         st.stop()
 
     try:
-        raw_df = pd.read_excel(workbook_path, sheet_name=sheet, dtype=str, header=None)
+        raw_df = pd.read_excel(excel_file, sheet_name=sheet, dtype=str, header=None)
         header_row = _detect_header_row(raw_df)
         header = [_clean_column_name(c) for c in raw_df.iloc[header_row]]
         header = ensure_unique_columns(header)
@@ -1385,21 +1436,25 @@ def run_app() -> None:
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
 
-                        merged_ok = False
+                    merged_ok = False
 
-                        for wb_label, wb_path in ordered_refs:
-                            try:
-                                excel_file = pd.ExcelFile(wb_path)
-                                fb_sheet = fallback_sheet if fallback_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
-                                # Choose sheet using mapping -> auto-detect -> fallback
-                                chosen_sheet = select_sheet_for_gpkg(
-                                    excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
-                                )
+                    for wb_label, wb_path in ordered_refs:
+                        try:
+                            excel_file = get_excel_file(wb_path)
+                            fb_sheet = fallback_sheet if fallback_sheet in excel_file.sheet_names else excel_file.sheet_names[0]
+                            # Choose sheet using mapping -> auto-detect -> fallback
+                            chosen_sheet = select_sheet_for_gpkg(
+                                excel_file, gpkg_path.name, list(gdf_in.columns), auto_sheet, fb_sheet
+                            )
                                 if chosen_sheet is None or chosen_sheet not in excel_file.sheet_names:
                                     continue
 
                                 df_sheet = load_reference_sheet(wb_path, chosen_sheet)
-                                sub_col_auto = detect_substation_column(df_sheet)
+                                cache_sub_key = (_excel_key_from_file(excel_file), chosen_sheet)
+                                sub_col_auto = _SUB_COL_CACHE.get(cache_sub_key)
+                                if sub_col_auto is None:
+                                    sub_col_auto = detect_substation_column(df_sheet)
+                                    _SUB_COL_CACHE[cache_sub_key] = sub_col_auto
                                 if sub_col_auto is None:
                                     continue
                                 df_sheet = forward_fill_column(df_sheet, sub_col_auto)
