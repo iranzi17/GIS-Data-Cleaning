@@ -1842,5 +1842,164 @@ def run_app() -> None:
                 except IsADirectoryError:
                     shutil.rmtree(temp_map_path, ignore_errors=True)
 
+    # =====================================================================
+    # AUTOMATED SCHEMA MAPPING (ZIP)
+    # =====================================================================
+    st.markdown("---")
+    st.header("Automated Schema Mapping (ZIP)")
+    st.caption(
+        "Upload a ZIP containing GeoPackages (or zipped FileGDBs). All layers will be auto-mapped to the selected schema fields and returned as a ZIP."
+    )
+
+    auto_zip = st.file_uploader("Upload ZIP of equipment data", type=["zip"], key="map_auto_zip")
+    if auto_zip is not None:
+        schema_files = list_reference_workbooks()
+        if not schema_files:
+            st.error("No reference workbooks found in reference_data.")
+        else:
+            schema_label_auto = st.selectbox("Schema workbook (auto)", list(schema_files.keys()), index=0, key="schema_wb_auto")
+            schema_path_auto = schema_files[schema_label_auto]
+            schema_excel_auto = pd.ExcelFile(schema_path_auto)
+            schema_sheet_auto = st.selectbox("Schema sheet (auto)", schema_excel_auto.sheet_names, key="schema_sheet_auto")
+
+            equipment_options_auto = list_schema_equipments(schema_path_auto, schema_sheet_auto)
+            if not equipment_options_auto:
+                st.error("No equipment entries found in the schema sheet.")
+            else:
+                default_equip_idx_auto = 0
+                equipment_name_auto = st.selectbox(
+                    "Equipment/device (auto)",
+                    equipment_options_auto,
+                    index=default_equip_idx_auto,
+                    key="schema_equipment_auto",
+                )
+
+                schema_fields_auto, type_map_auto = load_schema_fields(schema_path_auto, schema_sheet_auto, equipment_name_auto)
+                st.subheader("Selected Equipment Schema (auto)")
+                st_dataframe_safe(pd.DataFrame([{"Field": f, "Type": type_map_auto.get(f, "")} for f in schema_fields_auto]))
+
+                mapping_threshold_auto = st.slider(
+                    "Auto-mapping sensitivity (auto mode)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.35,
+                    step=0.05,
+                    key="map_threshold_auto",
+                )
+                keep_unmatched_auto = st.checkbox(
+                    "Keep unmatched original columns (prefixed with orig_) in auto mode", value=True, key="keep_unmatched_auto"
+                )
+
+                if st.button("Run Automated Schema Mapping", key="run_auto_schema"):
+                    tmp_in = Path(tempfile.mkdtemp())
+                    tmp_out = Path(tempfile.mkdtemp())
+                    logs = []
+                    try:
+                        zip_in = tmp_in / "input.zip"
+                        with open(zip_in, "wb") as f:
+                            f.write(auto_zip.getbuffer())
+                        with zipfile.ZipFile(zip_in, "r") as zf:
+                            zf.extractall(tmp_in)
+
+                        gpkg_paths = list(tmp_in.rglob("*.gpkg"))
+                        # Support zipped FileGDBs inside the uploaded ZIP
+                        gdb_zips = [p for p in tmp_in.rglob("*.zip") if p != zip_in]
+                        for z in gdb_zips:
+                            try:
+                                with zipfile.ZipFile(z, "r") as zf:
+                                    zf.extractall(z.parent)
+                            except Exception:
+                                continue
+                        gdb_paths = list(tmp_in.rglob("*.gdb"))
+
+                        if not gpkg_paths and not gdb_paths:
+                            st.error("No GeoPackages or FileGDBs found inside the ZIP.")
+                        else:
+                            accept_threshold = 0.6
+                            norm_field_lookup = None
+                            out_files = []
+
+                            def process_layer(gdf_layer, driver, out_path, layer_name):
+                                exclude_cols = {gdf_layer.geometry.name} if hasattr(gdf_layer, "geometry") else set()
+                                suggested, score_map = fuzzy_map_columns_with_scores(
+                                    list(gdf_layer.columns), schema_fields_auto, threshold=mapping_threshold_auto, exclude=exclude_cols
+                                )
+                                norm_col_lookup = {normalize_for_compare(c): c for c in gdf_layer.columns}
+                                n = len(gdf_layer)
+                                def _na_series():
+                                    return pd.Series([pd.NA] * n, index=gdf_layer.index)
+                                out_cols = {}
+                                for f in schema_fields_auto:
+                                    src = suggested.get(f)
+                                    score = score_map.get(f, 0.0)
+                                    chosen_src = None
+                                    if src and score >= accept_threshold:
+                                        resolved = norm_col_lookup.get(normalize_for_compare(src), src)
+                                        if resolved in gdf_layer.columns:
+                                            chosen_src = resolved
+                                    out_cols[f] = gdf_layer[chosen_src] if chosen_src else _na_series()
+                                if keep_unmatched_auto:
+                                    for col in gdf_layer.columns:
+                                        if col not in suggested.values() and (not hasattr(gdf_layer, "geometry") or col != gdf_layer.geometry.name):
+                                            out_cols[f"orig_{col}"] = gdf_layer[col]
+                                geom_series = gdf_layer.geometry if hasattr(gdf_layer, "geometry") else None
+                                for f in schema_fields_auto:
+                                    out_cols[f] = coerce_series_to_type(out_cols[f], type_map_auto.get(f, ""))
+                                out_layer = gpd.GeoDataFrame(out_cols, geometry=geom_series, crs=gdf_layer.crs)
+                                out_layer = sanitize_gdf_for_gpkg(out_layer)
+                                out_layer.to_file(out_path, driver=driver, layer=layer_name)
+
+                            # Process GPKG files
+                            for gpkg in sorted(gpkg_paths):
+                                try:
+                                    layers = list_gpkg_layers(gpkg)
+                                    if not layers:
+                                        logs.append(f"{gpkg.name}: no layers found.")
+                                        continue
+                                    out_path = tmp_out / gpkg.name
+                                    if out_path.exists():
+                                        out_path.unlink()
+                                    for lyr in layers:
+                                        gdf_layer = gpd.read_file(gpkg, layer=lyr)
+                                        layer_name_out = derive_layer_name_from_filename(lyr)
+                                        process_layer(gdf_layer, "GPKG", out_path, layer_name_out)
+                                    out_files.append(out_path)
+                                    logs.append(f"{gpkg.name}: mapped {len(layers)} layer(s).")
+                                except Exception as exc:
+                                    logs.append(f"{gpkg.name}: failed ({exc}).")
+
+                            # Process FileGDB folders
+                            for gdb in sorted(gdb_paths):
+                                try:
+                                    layers = list_gpkg_layers(gdb)
+                                    if not layers:
+                                        logs.append(f"{gdb.name}: no layers found.")
+                                        continue
+                                    out_path = tmp_out / f"{gdb.name}.gdb"
+                                    for lyr in layers:
+                                        gdf_layer = gpd.read_file(gdb, layer=lyr)
+                                        layer_name_out = derive_layer_name_from_filename(lyr)
+                                        process_layer(gdf_layer, "FileGDB", out_path, layer_name_out)
+                                    out_files.append(out_path)
+                                    logs.append(f"{gdb.name}: mapped {len(layers)} layer(s).")
+                                except Exception as exc:
+                                    logs.append(f"{gdb.name}: failed ({exc}).")
+
+                            if out_files:
+                                zip_out = shutil.make_archive(str(tmp_out / "auto_mapped"), "zip", root_dir=tmp_out, base_dir=".")
+                                with open(zip_out, "rb") as f:
+                                    data = f.read()
+                                st.download_button(
+                                    "Download Auto-Mapped Package (zip)",
+                                    data=data,
+                                    file_name="auto_mapped.zip",
+                                    mime="application/zip",
+                                    key="dl_auto_schema_zip",
+                                )
+                            st.text_area("Auto mapping log", value="\n".join(logs) if logs else "No logs.", height=220)
+                    finally:
+                        shutil.rmtree(tmp_in, ignore_errors=True)
+                        shutil.rmtree(tmp_out, ignore_errors=True)
+
 if __name__ == "__main__":
     run_app()
