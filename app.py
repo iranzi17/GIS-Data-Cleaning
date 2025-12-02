@@ -1912,6 +1912,8 @@ def run_app() -> None:
             schema_sheet_auto = st.selectbox("Schema sheet (auto)", schema_excel_auto.sheet_names, key="schema_sheet_auto")
 
             equipment_options_auto = list_schema_equipments(schema_path_auto, schema_sheet_auto)
+            if normalize_for_compare(schema_sheet_auto) == normalize_for_compare("Electric device"):
+                equipment_options_auto = ELECTRIC_DEVICE_EQUIPMENT
             if not equipment_options_auto:
                 st.error("No equipment entries found in the schema sheet.")
             else:
