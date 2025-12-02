@@ -35,6 +35,37 @@ MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
 
+# Curated equipment names from the "Electric device" schema sheet (hard-coded for stability/order).
+ELECTRIC_DEVICE_EQUIPMENT = [
+    "Power Transformer/ Stepup Transformer",
+    "Earthing Transformer",
+    "High Voltage Busbar/Medium Voltage Busbar",
+    "MV Switch gear",
+    "Line Bay",
+    "Voltage Transformer",
+    "Current Transformer",
+    "High Voltage Circuit Breaker/High Voltage Circuit Breaker",
+    "High Voltage Switch/High Voltage Switch",
+    "Uninterruptable power supply(UPS)",
+    "Substation/Cabin",
+    "Lightning Arrester",
+    "DC Supply 48 VDC Battery",
+    "DC Supply 110 VDC Battery",
+    "DC Supply 48 VDC charger",
+    "DC Supply 110 VDC charger",
+    "DIGITAL fault recorder",
+    "High Voltage Line",
+    "Transformer Bay",
+    "Indoor Circuit Breaker/30kv/15kb",
+    "Indoor Current Transformer",
+    "Indoor Voltage Transformer",
+    "Control and Protection Panels",
+    "Distance Protection",
+    "Transformer Protection",
+    "Line Overcurrent Protection",
+    "Standby Generator",
+]
+
 # =====================================================================
 # HEADER CLEANING UTILITIES
 # =====================================================================
@@ -758,6 +789,8 @@ def load_reference_sheet(workbook_path: Path, sheet_name: str) -> pd.DataFrame:
 
 def list_schema_equipments(schema_path: Path, sheet_name: str, device_col: int = 0) -> list[str]:
     """List unique equipment/device names from a schema sheet."""
+    if normalize_for_compare(sheet_name) == normalize_for_compare("Electric device"):
+        return ELECTRIC_DEVICE_EQUIPMENT
     schema_raw = pd.read_excel(schema_path, sheet_name=sheet_name, dtype=str, header=None)
     devices = schema_raw.iloc[:, device_col].ffill().dropna().map(_clean_column_name).map(str.strip)
     devices = [d for d in devices if d]
