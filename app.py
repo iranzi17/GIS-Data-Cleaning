@@ -320,6 +320,26 @@ def save_mapping_cache(cache: dict[str, dict[str, str]]) -> None:
         pass
 
 
+def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_map: dict[str, str]) -> str:
+    """Pick equipment/device name for a given file using explicit map then similarity."""
+    norm_file = normalize_for_compare(Path(file_name).stem)
+    mapped = equip_map.get(norm_file)
+    if mapped and mapped in equipment_options:
+        return mapped
+    try:
+        import difflib
+
+        best = difflib.get_close_matches(norm_file, [normalize_for_compare(e) for e in equipment_options], n=1, cutoff=0.5)
+        if best:
+            match_norm = best[0]
+            for opt in equipment_options:
+                if normalize_for_compare(opt) == match_norm:
+                    return opt
+    except Exception:
+        pass
+    return equipment_options[0] if equipment_options else ""
+
+
 def _cache_key_from_path(path: Path | str) -> str:
     """Stable string key for caching by filesystem path."""
     try:
@@ -1919,15 +1939,11 @@ def run_app() -> None:
             else:
                 default_equip_idx_auto = 0
                 equipment_name_auto = st.selectbox(
-                    "Equipment/device (auto)",
+                    "Equipment/device (auto; used as fallback when no direct match)",
                     equipment_options_auto,
                     index=default_equip_idx_auto,
                     key="schema_equipment_auto",
                 )
-
-                schema_fields_auto, type_map_auto = load_schema_fields(schema_path_auto, schema_sheet_auto, equipment_name_auto)
-                st.subheader("Selected Equipment Schema (auto)")
-                st_dataframe_safe(pd.DataFrame([{"Field": f, "Type": type_map_auto.get(f, "")} for f in schema_fields_auto]))
 
                 mapping_threshold_auto = st.slider(
                     "Auto-mapping sensitivity (auto mode)",
@@ -1966,21 +1982,21 @@ def run_app() -> None:
                         if not gpkg_paths and not gdb_paths:
                             st.error("No GeoPackages or FileGDBs found inside the ZIP.")
                         else:
+                            equip_map = load_gpkg_equipment_map()
                             accept_threshold = 0.6
-                            norm_field_lookup = None
                             out_files = []
 
-                            def process_layer(gdf_layer, driver, out_path, layer_name):
+                            def process_layer(gdf_layer, driver, out_path, layer_name, schema_fields, type_map):
                                 exclude_cols = {gdf_layer.geometry.name} if hasattr(gdf_layer, "geometry") else set()
                                 suggested, score_map = fuzzy_map_columns_with_scores(
-                                    list(gdf_layer.columns), schema_fields_auto, threshold=mapping_threshold_auto, exclude=exclude_cols
+                                    list(gdf_layer.columns), schema_fields, threshold=mapping_threshold_auto, exclude=exclude_cols
                                 )
                                 norm_col_lookup = {normalize_for_compare(c): c for c in gdf_layer.columns}
                                 n = len(gdf_layer)
                                 def _na_series():
                                     return pd.Series([pd.NA] * n, index=gdf_layer.index)
                                 out_cols = {}
-                                for f in schema_fields_auto:
+                                for f in schema_fields:
                                     src = suggested.get(f)
                                     score = score_map.get(f, 0.0)
                                     chosen_src = None
@@ -1994,8 +2010,8 @@ def run_app() -> None:
                                         if col not in suggested.values() and (not hasattr(gdf_layer, "geometry") or col != gdf_layer.geometry.name):
                                             out_cols[f"orig_{col}"] = gdf_layer[col]
                                 geom_series = gdf_layer.geometry if hasattr(gdf_layer, "geometry") else None
-                                for f in schema_fields_auto:
-                                    out_cols[f] = coerce_series_to_type(out_cols[f], type_map_auto.get(f, ""))
+                                for f in schema_fields:
+                                    out_cols[f] = coerce_series_to_type(out_cols[f], type_map.get(f, ""))
                                 out_layer = gpd.GeoDataFrame(out_cols, geometry=geom_series, crs=gdf_layer.crs)
                                 out_layer = sanitize_gdf_for_gpkg(out_layer)
                                 out_layer.to_file(out_path, driver=driver, layer=layer_name)
@@ -2007,15 +2023,17 @@ def run_app() -> None:
                                     if not layers:
                                         logs.append(f"{gpkg.name}: no layers found.")
                                         continue
+                                    equipment_name = resolve_equipment_name(gpkg.name, equipment_options_auto, equip_map)
+                                    schema_fields_auto, type_map_auto = load_schema_fields(schema_path_auto, schema_sheet_auto, equipment_name)
                                     out_path = tmp_out / gpkg.name
                                     if out_path.exists():
                                         out_path.unlink()
                                     for lyr in layers:
                                         gdf_layer = gpd.read_file(gpkg, layer=lyr)
                                         layer_name_out = derive_layer_name_from_filename(lyr)
-                                        process_layer(gdf_layer, "GPKG", out_path, layer_name_out)
+                                        process_layer(gdf_layer, "GPKG", out_path, layer_name_out, schema_fields_auto, type_map_auto)
                                     out_files.append(out_path)
-                                    logs.append(f"{gpkg.name}: mapped {len(layers)} layer(s).")
+                                    logs.append(f"{gpkg.name}: mapped {len(layers)} layer(s) using equipment '{equipment_name}'.")
                                 except Exception as exc:
                                     logs.append(f"{gpkg.name}: failed ({exc}).")
 
@@ -2026,13 +2044,15 @@ def run_app() -> None:
                                     if not layers:
                                         logs.append(f"{gdb.name}: no layers found.")
                                         continue
+                                    equipment_name = resolve_equipment_name(gdb.name, equipment_options_auto, equip_map)
+                                    schema_fields_auto, type_map_auto = load_schema_fields(schema_path_auto, schema_sheet_auto, equipment_name)
                                     out_path = tmp_out / f"{gdb.name}.gdb"
                                     for lyr in layers:
                                         gdf_layer = gpd.read_file(gdb, layer=lyr)
                                         layer_name_out = derive_layer_name_from_filename(lyr)
-                                        process_layer(gdf_layer, "FileGDB", out_path, layer_name_out)
+                                        process_layer(gdf_layer, "FileGDB", out_path, layer_name_out, schema_fields_auto, type_map_auto)
                                     out_files.append(out_path)
-                                    logs.append(f"{gdb.name}: mapped {len(layers)} layer(s).")
+                                    logs.append(f"{gdb.name}: mapped {len(layers)} layer(s) using equipment '{equipment_name}'.")
                                 except Exception as exc:
                                     logs.append(f"{gdb.name}: failed ({exc}).")
 
