@@ -1983,7 +1983,8 @@ def run_app() -> None:
                             st.error("No GeoPackages or FileGDBs found inside the ZIP.")
                         else:
                             equip_map = load_gpkg_equipment_map()
-                            accept_threshold = 0.6
+                            # More aggressive acceptance for auto mode: use any suggested column (threshold handled by slider)
+                            accept_threshold = 0.5
                             out_files = []
 
                             def process_layer(gdf_layer, driver, out_path, layer_name, schema_fields, type_map):
@@ -2000,9 +2001,10 @@ def run_app() -> None:
                                     src = suggested.get(f)
                                     score = score_map.get(f, 0.0)
                                     chosen_src = None
-                                    if src and score >= accept_threshold:
+                                    if src:
                                         resolved = norm_col_lookup.get(normalize_for_compare(src), src)
                                         if resolved in gdf_layer.columns:
+                                            # Accept any suggested column; score filter already applied in fuzzy step
                                             chosen_src = resolved
                                     out_cols[f] = gdf_layer[chosen_src] if chosen_src else _na_series()
                                 if keep_unmatched_auto:
