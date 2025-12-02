@@ -55,8 +55,8 @@ def _clean_column_name(name: Any) -> str:
     """Clean column names (remove NBSP, collapse spaces, keep punctuation)."""
     text = "" if name is None else str(name)
 
-    # Remove Unicode whitespace (NBSP, thin-space)
-    text = strip_unicode_spaces(text)
+    # Normalize Unicode whitespace: convert non-breaking/thin spaces to regular space, keep ASCII spaces
+    text = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in text)
 
     # Remove invisible BOM-type chars
     for ch in INVISIBLE_HEADER_CHARS:
