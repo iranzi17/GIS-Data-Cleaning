@@ -292,7 +292,29 @@ def load_gpkg_equipment_map() -> dict[str, str]:
                 default_map.update(loaded)
         except Exception:
             pass
-    _GPKG_EQUIP_MAP = default_map
+    # Canonicalize mapped values to closest equipment option (if available)
+    canon_map: dict[str, str] = {}
+    try:
+        import difflib
+    except Exception:
+        difflib = None  # type: ignore
+    for norm_key, val in default_map.items():
+        target = val
+        try:
+            if difflib:
+                best = difflib.get_close_matches(
+                    normalize_for_compare(val), [normalize_for_compare(e) for e in ELECTRIC_DEVICE_EQUIPMENT], n=1, cutoff=0.5
+                )
+                if best:
+                    match_norm = best[0]
+                    for opt in ELECTRIC_DEVICE_EQUIPMENT:
+                        if normalize_for_compare(opt) == match_norm:
+                            target = opt
+                            break
+        except Exception:
+            target = val
+        canon_map[norm_key] = target
+    _GPKG_EQUIP_MAP = canon_map
     return _GPKG_EQUIP_MAP
 
 
