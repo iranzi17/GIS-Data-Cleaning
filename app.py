@@ -2040,6 +2040,7 @@ def run_app() -> None:
                 )
 
                 if st.button("Run Automated Schema Mapping", key="run_auto_schema"):
+                    status_msg = st.empty()
                     tmp_in = Path(tempfile.mkdtemp())
                     tmp_out = Path(tempfile.mkdtemp())
                     logs = []
@@ -2060,6 +2061,8 @@ def run_app() -> None:
                             except Exception:
                                 continue
                         gdb_paths = list(tmp_in.rglob("*.gdb"))
+
+                        status_msg.info(f"Unzipped. Found {len(gpkg_paths)} GPKG and {len(gdb_paths)} GDB paths. Starting mapping...")
 
                         if not gpkg_paths and not gdb_paths:
                             st.error("No GeoPackages or FileGDBs found inside the ZIP.")
@@ -2125,6 +2128,7 @@ def run_app() -> None:
                                     logs.append(log_msg)
                             except Exception as exc:
                                 logs.append(f"Parallel mapping failed, falling back to sequential ({exc}).")
+                                status_msg.warning("Parallel mapping failed; retrying sequentially...")
                                 for args in gpkg_args:
                                     out_path, log_msg = process_single_gpkg(args)
                                     if out_path:
@@ -2161,8 +2165,10 @@ def run_app() -> None:
                                     mime="application/zip",
                                     key="dl_auto_schema_zip",
                                 )
+                            status_msg.success(f"Mapping complete. Generated {len(out_files)} output files.")
                             st.text_area("Auto mapping log", value="\n".join(logs) if logs else "No logs.", height=220)
                     finally:
+                        status_msg.empty()
                         shutil.rmtree(tmp_in, ignore_errors=True)
                         shutil.rmtree(tmp_out, ignore_errors=True)
 
