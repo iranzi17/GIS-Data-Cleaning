@@ -2118,22 +2118,12 @@ def run_app() -> None:
                                 )
                                 for gpkg in sorted(gpkg_paths)
                             ]
-                            try:
-                                max_workers = min(4, len(gpkg_args) or 1)
-                                with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                                    results = list(executor.map(process_single_gpkg, gpkg_args))
-                                for out_path, log_msg in results:
-                                    if out_path:
-                                        out_files.append(out_path)
-                                    logs.append(log_msg)
-                            except Exception as exc:
-                                logs.append(f"Parallel mapping failed, falling back to sequential ({exc}).")
-                                status_msg.warning("Parallel mapping failed; retrying sequentially...")
-                                for args in gpkg_args:
-                                    out_path, log_msg = process_single_gpkg(args)
-                                    if out_path:
-                                        out_files.append(out_path)
-                                    logs.append(log_msg)
+                            # Sequential mapping to avoid pool hangs in some environments
+                            for args in gpkg_args:
+                                out_path, log_msg = process_single_gpkg(args)
+                                if out_path:
+                                    out_files.append(out_path)
+                                logs.append(log_msg)
 
                             # Process FileGDB folders
                             for gdb in sorted(gdb_paths):
