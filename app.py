@@ -1584,7 +1584,10 @@ def run_app() -> None:
                     try:
                         # Substation name is taken from the top-level folder in the ZIP; fallback to file stem.
                         rel_parts = gpkg_path.relative_to(tmp_in_dir).parts
-                        substation_name = rel_parts[0] if len(rel_parts) > 1 else gpkg_path.stem
+                        substation_candidates = []
+                        if len(rel_parts) > 1:
+                            substation_candidates.append(rel_parts[0])
+                        substation_candidates.append(gpkg_path.stem)
                         layers = list_gpkg_layers(gpkg_path)
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
@@ -1613,8 +1616,12 @@ def run_app() -> None:
                                 df_sheet = forward_fill_column(df_sheet, sub_col_auto)
 
                                 norm_col = df_sheet[sub_col_auto].map(normalize_value_for_compare)
-                                target_norm = normalize_value_for_compare(substation_name)
-                                filtered_df = df_sheet.loc[(norm_col == target_norm).fillna(False)].copy()
+                                filtered_df = pd.DataFrame()
+                                for substation_name in substation_candidates:
+                                    target_norm = normalize_value_for_compare(substation_name)
+                                    filtered_df = df_sheet.loc[(norm_col == target_norm).fillna(False)].copy()
+                                    if not filtered_df.empty:
+                                        break
                                 if filtered_df.empty:
                                     continue
 
