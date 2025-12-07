@@ -363,6 +363,32 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
     return equipment_options[0] if equipment_options else ""
 
 
+def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_name: str) -> dict[str, Any]:
+    """
+    Parse a supervisor-provided Electric device sheet where columns are:
+    col0=device, col1=field, col2=type, value in rightmost non-null cell of the row.
+    Returns a dict field -> coerced value.
+    """
+    raw = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
+    raw.iloc[:, 0] = raw.iloc[:, 0].ffill()
+    mask = raw.iloc[:, 0].fillna("").map(normalize_for_compare) == normalize_for_compare(device_name)
+    df = raw.loc[mask].copy()
+    df = df[df.iloc[:, 1].notna()]
+    df_fields = {}
+    for _, row in df.iterrows():
+        field = _clean_column_name(row.iloc[1])
+        type_str = row.iloc[2] if len(row) > 2 else ""
+        val = pd.NA
+        if len(row) > 3:
+            for v in row.iloc[3:]:
+                if pd.notna(v):
+                    val = v
+        series_val = pd.Series([val])
+        coerced = coerce_series_to_type(series_val, type_str).iloc[0]
+        df_fields[field] = coerced
+    return df_fields
+
+
 def process_single_gpkg(args):
     (
         gpkg,
@@ -1686,6 +1712,65 @@ def run_app() -> None:
         map_file = st.file_uploader("Upload Equipment GeoPackage for Schema Mapping", type=["gpkg"], key="map_gpkg")
     else:
         map_file = st.file_uploader("Upload Equipment FileGDB for Schema Mapping (zip the .gdb folder)", type=["gdb", "zip"], key="map_gdb")
+
+    st.markdown("---")
+    st.header("Supervisor Device Sheet Filler")
+    st.caption(
+        "Upload a device GeoPackage and a supervisor Electric-device workbook; choose a device entry and fill its attributes into the GPKG with proper data types."
+    )
+    sup_gpkg = st.file_uploader("Upload device GeoPackage (GPKG)", type=["gpkg"], key="sup_gpkg")
+    sup_wb = st.file_uploader("Upload supervisor workbook (Electric device format)", type=["xlsx", "xlsm"], key="sup_wb")
+    if sup_gpkg and sup_wb:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                tmp.write(sup_gpkg.getbuffer())
+                sup_gpkg_path = Path(tmp.name)
+            with tempfile.NamedTemporaryFile(suffix=Path(sup_wb.name).suffix, delete=False) as tmpw:
+                tmpw.write(sup_wb.getbuffer())
+                sup_wb_path = Path(tmpw.name)
+            sup_layers = list_gpkg_layers(sup_gpkg_path)
+            sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
+            if sup_layers:
+                gdf_sup = gpd.read_file(sup_gpkg_path, layer=sup_layer)
+                sup_excel = pd.ExcelFile(sup_wb_path)
+                sup_sheet = st.selectbox("Supervisor sheet", sup_excel.sheet_names, key="sup_sheet")
+                # device options from col0
+                raw_sup = pd.read_excel(sup_wb_path, sheet_name=sup_sheet, dtype=str, header=None)
+                raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
+                device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
+                device_choice = st.selectbox("Device entry", device_options, key="sup_device")
+                if st.button("Fill attributes from supervisor sheet", key="sup_fill"):
+                    try:
+                        field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
+                        out_cols = dict(gdf_sup)
+                        n = len(gdf_sup)
+                        for f, val in field_map.items():
+                            if f not in out_cols:
+                                out_cols[f] = pd.NA
+                            if isinstance(val, pd.Series):
+                                fill_val = val.iloc[0] if not val.empty else pd.NA
+                            else:
+                                fill_val = val
+                            out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup.index)
+                        out_gdf = gpd.GeoDataFrame(out_cols, geometry=gdf_sup.geometry if hasattr(gdf_sup, "geometry") else None, crs=gdf_sup.crs)
+                        out_gdf = sanitize_gdf_for_gpkg(out_gdf)
+                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                            out_path = tmpout.name
+                        layer_name = sup_layer
+                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                        with open(out_path, "rb") as f:
+                            data_bytes = f.read()
+                        st.download_button(
+                            "Download filled GeoPackage",
+                            data=data_bytes,
+                            file_name=sup_gpkg.name,
+                            mime="application/geopackage+sqlite3",
+                            key="sup_download",
+                        )
+                    except Exception as exc:
+                        st.error(f"Supervisor fill failed: {exc}")
+        finally:
+            pass
 
     if map_file is not None:
         temp_map_path = None
