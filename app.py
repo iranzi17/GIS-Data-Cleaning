@@ -1733,6 +1733,7 @@ def run_app() -> None:
             raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
             device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
             device_choice = st.selectbox("Device entry", device_options, key="sup_device")
+            equip_map_sup = load_gpkg_equipment_map()
 
             def _tokenize(text: str) -> set[str]:
                 return set(
@@ -1762,7 +1763,7 @@ def run_app() -> None:
                     return best_col
                 return field_name
 
-            def fill_one_gpkg(file_obj, layer_override: str | None = None) -> tuple[Path, str]:
+            def fill_one_gpkg(file_obj, device_name: str, layer_override: str | None = None) -> tuple[Path, str]:
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
                     gpkg_path = Path(tmp.name)
@@ -1771,7 +1772,7 @@ def run_app() -> None:
                 if not layer:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
-                field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
+                field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 out_cols: dict[str, Any] = {}
                 if geom_name:
@@ -1813,7 +1814,7 @@ def run_app() -> None:
                 sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
                 if sup_layers and st.button("Fill attributes from supervisor sheet", key="sup_fill"):
                     try:
-                        out_path, layer_name = fill_one_gpkg(sup_gpkg, sup_layer)
+                        out_path, layer_name = fill_one_gpkg(sup_gpkg, device_choice, sup_layer)
                         with open(out_path, "rb") as f:
                             data_bytes = f.read()
                         st.download_button(
@@ -1826,15 +1827,16 @@ def run_app() -> None:
                     except Exception as exc:
                         st.error(f"Supervisor fill failed: {exc}")
             else:
-                st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically.")
+                st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically using a per-file device match.")
                 if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
                     logs: list[str] = []
                     outputs: list[tuple[str, Path]] = []
                     for file_obj in sup_gpkg_files:
                         try:
-                            out_path, used_layer = fill_one_gpkg(file_obj)
+                            device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
+                            out_path, used_layer = fill_one_gpkg(file_obj, device_for_file)
                             outputs.append((file_obj.name, out_path))
-                            logs.append(f"{file_obj.name}: filled using layer '{used_layer}'.")
+                            logs.append(f"{file_obj.name}: filled using device '{device_for_file}' on layer '{used_layer}'.")
                         except Exception as exc:
                             logs.append(f"{file_obj.name}: failed ({exc}).")
 
