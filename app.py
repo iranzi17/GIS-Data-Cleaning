@@ -1772,24 +1772,24 @@ def run_app() -> None:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
                 field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
-                out_cols = dict(gdf_sup_local)
-                norm_cols = {normalize_for_compare(c): c for c in out_cols.keys()}
+                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
+                out_cols: dict[str, Any] = {}
+                if geom_name:
+                    out_cols[geom_name] = gdf_sup_local.geometry
                 n = len(gdf_sup_local)
-                filled_fields: set[str] = set()
+                filled_fields: list[str] = []
                 for f, val in field_map.items():
-                    target_col = choose_target_column(f, list(out_cols.keys()), norm_cols)
+                    target_col = f
                     if target_col not in out_cols:
                         out_cols[target_col] = pd.NA
-                        norm_cols[normalize_for_compare(target_col)] = target_col
                     if isinstance(val, pd.Series):
                         fill_val = val.iloc[0] if not val.empty else pd.NA
                     else:
                         fill_val = val
                     out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
-                    filled_fields.add(target_col)
+                    filled_fields.append(target_col)
 
-                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
-                keep_cols = [c for c in out_cols if c in filled_fields]
+                keep_cols = filled_fields.copy()
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
