@@ -1718,46 +1718,90 @@ def run_app() -> None:
     st.caption(
         "Upload a device GeoPackage and a supervisor Electric-device workbook; choose a device entry and fill its attributes into the GPKG with proper data types."
     )
-    sup_gpkg = st.file_uploader("Upload device GeoPackage (GPKG)", type=["gpkg"], key="sup_gpkg")
+    sup_gpkg_files = st.file_uploader(
+        "Upload device GeoPackage (GPKG)", type=["gpkg"], accept_multiple_files=True, key="sup_gpkg"
+    )
     sup_wb = st.file_uploader("Upload supervisor workbook (Electric device format)", type=["xlsx", "xlsm"], key="sup_wb")
-    if sup_gpkg and sup_wb:
+    if sup_gpkg_files and sup_wb:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                tmp.write(sup_gpkg.getbuffer())
-                sup_gpkg_path = Path(tmp.name)
             with tempfile.NamedTemporaryFile(suffix=Path(sup_wb.name).suffix, delete=False) as tmpw:
                 tmpw.write(sup_wb.getbuffer())
                 sup_wb_path = Path(tmpw.name)
-            sup_layers = list_gpkg_layers(sup_gpkg_path)
-            sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
-            if sup_layers:
-                gdf_sup = gpd.read_file(sup_gpkg_path, layer=sup_layer)
-                sup_excel = pd.ExcelFile(sup_wb_path)
-                sup_sheet = st.selectbox("Supervisor sheet", sup_excel.sheet_names, key="sup_sheet")
-                # device options from col0
-                raw_sup = pd.read_excel(sup_wb_path, sheet_name=sup_sheet, dtype=str, header=None)
-                raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
-                device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
-                device_choice = st.selectbox("Device entry", device_options, key="sup_device")
-                if st.button("Fill attributes from supervisor sheet", key="sup_fill"):
+            sup_excel = pd.ExcelFile(sup_wb_path)
+            sup_sheet = st.selectbox("Supervisor sheet", sup_excel.sheet_names, key="sup_sheet")
+            raw_sup = pd.read_excel(sup_wb_path, sheet_name=sup_sheet, dtype=str, header=None)
+            raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
+            device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
+            device_choice = st.selectbox("Device entry", device_options, key="sup_device")
+
+            def _tokenize(text: str) -> set[str]:
+                return set(
+                    t.lower()
+                    for t in re.findall(r"[A-Za-z][a-z]+|[A-Za-z]+|[0-9]+", text.replace("_", " "))
+                    if t
+                )
+
+            def choose_target_column(field_name: str, existing_columns: list[str], norm_lookup: dict[str, str]) -> str:
+                norm_field = normalize_for_compare(field_name)
+                if norm_field in norm_lookup:
+                    return norm_lookup[norm_field]
+                tokens_field = _tokenize(field_name)
+                best_col = None
+                best_score = 0.0
+                for col in existing_columns:
+                    tokens_col = _tokenize(str(col))
+                    token_overlap = len(tokens_field & tokens_col) / max(len(tokens_field), 1)
+                    sim = difflib.SequenceMatcher(None, norm_field, normalize_for_compare(col)).ratio()
+                    score = 0.6 * token_overlap + 0.4 * sim
+                    if score > best_score:
+                        best_score = score
+                        best_col = col
+                if best_score >= 0.55 and best_col is not None:
+                    return best_col
+                return field_name
+
+            def fill_one_gpkg(file_obj, layer_override: str | None = None) -> tuple[Path, str]:
+                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                    tmp.write(file_obj.getbuffer())
+                    gpkg_path = Path(tmp.name)
+                layers = list_gpkg_layers(gpkg_path)
+                layer = layer_override or (layers[0] if layers else None)
+                if not layer:
+                    raise ValueError("No layers found in the uploaded GeoPackage.")
+                gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
+                field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
+                out_cols = dict(gdf_sup_local)
+                norm_cols = {normalize_for_compare(c): c for c in out_cols.keys()}
+                n = len(gdf_sup_local)
+                for f, val in field_map.items():
+                    target_col = choose_target_column(f, list(out_cols.keys()), norm_cols)
+                    if target_col not in out_cols:
+                        out_cols[target_col] = pd.NA
+                        norm_cols[normalize_for_compare(target_col)] = target_col
+                    if isinstance(val, pd.Series):
+                        fill_val = val.iloc[0] if not val.empty else pd.NA
+                    else:
+                        fill_val = val
+                    out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                out_gdf = gpd.GeoDataFrame(
+                    out_cols, geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None, crs=gdf_sup_local.crs
+                )
+                out_gdf = sanitize_gdf_for_gpkg(out_gdf)
+                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                    out_path = Path(tmpout.name)
+                out_gdf.to_file(out_path, driver="GPKG", layer=layer)
+                return out_path, layer
+
+            if len(sup_gpkg_files) == 1:
+                sup_gpkg = sup_gpkg_files[0]
+                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                    tmp.write(sup_gpkg.getbuffer())
+                    sup_gpkg_path = Path(tmp.name)
+                sup_layers = list_gpkg_layers(sup_gpkg_path)
+                sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
+                if sup_layers and st.button("Fill attributes from supervisor sheet", key="sup_fill"):
                     try:
-                        field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
-                        out_cols = dict(gdf_sup)
-                        n = len(gdf_sup)
-                        for f, val in field_map.items():
-                            if f not in out_cols:
-                                out_cols[f] = pd.NA
-                            if isinstance(val, pd.Series):
-                                fill_val = val.iloc[0] if not val.empty else pd.NA
-                            else:
-                                fill_val = val
-                            out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup.index)
-                        out_gdf = gpd.GeoDataFrame(out_cols, geometry=gdf_sup.geometry if hasattr(gdf_sup, "geometry") else None, crs=gdf_sup.crs)
-                        out_gdf = sanitize_gdf_for_gpkg(out_gdf)
-                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                            out_path = tmpout.name
-                        layer_name = sup_layer
-                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                        out_path, layer_name = fill_one_gpkg(sup_gpkg, sup_layer)
                         with open(out_path, "rb") as f:
                             data_bytes = f.read()
                         st.download_button(
@@ -1769,6 +1813,35 @@ def run_app() -> None:
                         )
                     except Exception as exc:
                         st.error(f"Supervisor fill failed: {exc}")
+            else:
+                st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically.")
+                if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
+                    logs: list[str] = []
+                    outputs: list[tuple[str, Path]] = []
+                    for file_obj in sup_gpkg_files:
+                        try:
+                            out_path, used_layer = fill_one_gpkg(file_obj)
+                            outputs.append((file_obj.name, out_path))
+                            logs.append(f"{file_obj.name}: filled using layer '{used_layer}'.")
+                        except Exception as exc:
+                            logs.append(f"{file_obj.name}: failed ({exc}).")
+
+                    if outputs:
+                        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
+                            zip_path = Path(ztmp.name)
+                        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            for name, out_path in outputs:
+                                zf.write(out_path, arcname=Path(name).name)
+                        with open(zip_path, "rb") as f:
+                            data = f.read()
+                        st.download_button(
+                            "Download filled GeoPackages (zip)",
+                            data=data,
+                            file_name="filled_supervisor_gpkgs.zip",
+                            mime="application/zip",
+                            key="sup_download_zip",
+                        )
+                    st.text_area("Supervisor fill log", value="\n".join(logs) if logs else "No logs.", height=180)
         finally:
             pass
 
