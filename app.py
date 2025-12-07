@@ -1775,6 +1775,7 @@ def run_app() -> None:
                 out_cols = dict(gdf_sup_local)
                 norm_cols = {normalize_for_compare(c): c for c in out_cols.keys()}
                 n = len(gdf_sup_local)
+                filled_fields: set[str] = set()
                 for f, val in field_map.items():
                     target_col = choose_target_column(f, list(out_cols.keys()), norm_cols)
                     if target_col not in out_cols:
@@ -1785,8 +1786,17 @@ def run_app() -> None:
                     else:
                         fill_val = val
                     out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                    filled_fields.add(target_col)
+
+                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
+                keep_cols = [c for c in out_cols if c in filled_fields]
+                if geom_name and geom_name not in keep_cols:
+                    keep_cols.append(geom_name)
+
                 out_gdf = gpd.GeoDataFrame(
-                    out_cols, geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None, crs=gdf_sup_local.crs
+                    {c: out_cols[c] for c in keep_cols},
+                    geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None,
+                    crs=gdf_sup_local.crs,
                 )
                 out_gdf = sanitize_gdf_for_gpkg(out_gdf)
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
