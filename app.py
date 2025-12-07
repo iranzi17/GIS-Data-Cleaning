@@ -1742,6 +1742,8 @@ def run_app() -> None:
                 )
 
             def choose_target_column(field_name: str, existing_columns: list[str], norm_lookup: dict[str, str]) -> str:
+                import difflib
+
                 norm_field = normalize_for_compare(field_name)
                 if norm_field in norm_lookup:
                     return norm_lookup[norm_field]
