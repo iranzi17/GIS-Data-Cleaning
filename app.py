@@ -1185,14 +1185,20 @@ def sanitize_gdf_for_gpkg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             c = c[:MAX_GPKG_NAME_LENGTH]
         new_cols.append(c)
 
-    out.columns = new_cols
+    # Ensure cleaned names stay unique; duplicate labels make pandas return DataFrames
+    # for column selection, which then triggers ambiguous truth-value errors downstream.
+    out.columns = ensure_unique_columns(new_cols)
 
     for col in out.columns:
         if col == geometry_name:
             continue
-        series = ensure_valid_gpkg_dtypes(out[col])
+        series = out[col]
+        # Defensive: if duplicate column names slipped through, take the first match.
+        if isinstance(series, pd.DataFrame):
+            series = series.iloc[:, 0]
+        series = ensure_valid_gpkg_dtypes(series)
         mask = pd.isna(series)
-        if mask.any() and not pd.api.types.is_numeric_dtype(series):
+        if bool(mask.any()) and not pd.api.types.is_numeric_dtype(series):
             series = series.astype(object)
             series[mask] = None
         out[col] = series
