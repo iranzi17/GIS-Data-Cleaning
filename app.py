@@ -382,6 +382,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             for v in row.iloc[3:]:
                 if pd.notna(v):
                     val = v
+        # Treat explicit "Not existing" markers as missing
+        if isinstance(val, str) and val.strip().lower() == "not existing":
+            return pd.NA
         return val
 
     def _get_by_alias(fields: dict[str, Any], aliases: list[str]) -> Any:
@@ -392,7 +395,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 return fields.get(key)
         return None
 
-    def _finalize_instance(fields: dict[str, Any]) -> None:
+    def _finalize_instance(fields: dict[str, Any], order: list[str]) -> None:
         if not fields:
             return
         idx = len(instances) + 1
@@ -446,8 +449,11 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "id_value": id_value,
                 "name_value": name_value,
                 "feeder_value": feeder_value,
+                "order": order.copy(),
             }
         )
+
+    current_order: list[str] = []
 
     for _, row in raw.iterrows():
         dev_cell = row.iloc[0]
@@ -456,19 +462,22 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
 
         if dev_norm == target_norm:
             if current_fields is not None and current_fields:
-                _finalize_instance(current_fields)
+                _finalize_instance(current_fields, current_order)
             current_fields = {}
+            current_order = []
         elif pd.notna(dev_cell):
             if current_fields is not None and current_fields:
-                _finalize_instance(current_fields)
+                _finalize_instance(current_fields, current_order)
             current_fields = None
+            current_order = []
 
         if current_fields is None:
             continue
 
         if row_blank:
-            _finalize_instance(current_fields)
+            _finalize_instance(current_fields, current_order)
             current_fields = None
+            current_order = []
             continue
 
         field = row.iloc[1]
@@ -480,9 +489,11 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
         current_fields[field_clean] = coerced
+        if field_clean not in current_order:
+            current_order.append(field_clean)
 
     if current_fields is not None and current_fields:
-        _finalize_instance(current_fields)
+        _finalize_instance(current_fields, current_order)
 
     return instances
 
@@ -1891,8 +1902,9 @@ def run_app() -> None:
                 layer_override: str | None = None,
                 field_map: dict[str, Any] | None = None,
                 match_column: str | None = None,
-                instance_map: dict[str, dict[str, Any]] | None = None,
+                instance_map: dict[str, tuple[dict[str, Any], list[str]]] | None = None,
                 default_fields: dict[str, Any] | None = None,
+                field_order: list[str] | None = None,
             ) -> tuple[Path, str]:
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
@@ -1903,11 +1915,13 @@ def run_app() -> None:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
                 fm_local = field_map
+                order_local = field_order or []
                 if fm_local is None and match_column is None:
                     parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
                     if not parsed:
                         raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
                     fm_local = parsed[0].get("fields", {})
+                    order_local = parsed[0].get("order", [])
                 if fm_local is None and match_column is None:
                     raise ValueError(f"No field values available for device '{device_name}'.")
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
@@ -1924,21 +1938,34 @@ def run_app() -> None:
                     norm_target = gdf_sup_local[target_col].map(normalize_value_for_compare)
 
                     # initialize output columns for all fields we might fill
-                    all_fields: set[str] = set()
-                    for fields in instance_map.values():
-                        all_fields.update(fields.keys())
+                    all_fields_ordered: list[str] = []
+                    all_fields_seen: set[str] = set()
+                    # honor order from the first instance if available
+                    for _, (fields, order) in instance_map.items():
+                        for f in order:
+                            if f not in all_fields_seen:
+                                all_fields_seen.add(f)
+                                all_fields_ordered.append(f)
+                        for f in fields.keys():
+                            if f not in all_fields_seen:
+                                all_fields_seen.add(f)
+                                all_fields_ordered.append(f)
                     if default_fields:
-                        all_fields.update(default_fields.keys())
+                        for f in default_fields.keys():
+                            if f not in all_fields_seen:
+                                all_fields_seen.add(f)
+                                all_fields_ordered.append(f)
 
-                    for f in sorted(all_fields):
+                    for f in all_fields_ordered:
                         if f == geom_name:
                             continue
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
                     for idx_val, norm_val in norm_target.items():
-                        fields = instance_map.get(norm_val)
-                        if fields is None:
-                            fields = default_fields
+                        payload = instance_map.get(norm_val)
+                        if payload is None:
+                            payload = (default_fields, [])
+                        fields, _order = payload
                         if not fields:
                             continue
                         for f, val in fields.items():
@@ -1950,7 +1977,11 @@ def run_app() -> None:
                             out_cols[f].iat[idx_val] = fill_val
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
-                    for f, val in fm_local.items():
+                    ordered_keys = order_local if order_local else list(fm_local.keys())
+                    for f in ordered_keys:
+                        val = fm_local.get(f)
+                        if val is None:
+                            continue
                         target_col = f
                         if target_col not in out_cols:
                             out_cols[target_col] = pd.NA
@@ -1965,8 +1996,9 @@ def run_app() -> None:
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
+                # preserve column order where possible
                 out_gdf = gpd.GeoDataFrame(
-                    {c: out_cols[c] for c in keep_cols},
+                    {c: out_cols[c] for c in keep_cols if c in out_cols},
                     geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None,
                     crs=gdf_sup_local.crs,
                 )
@@ -2007,7 +2039,11 @@ def run_app() -> None:
                             outputs: list[tuple[str, Path]] = []
                             for inst in device_instances:
                                 out_path, layer_name = fill_one_gpkg(
-                                    sup_gpkg, device_choice, sup_layer, field_map=inst.get("fields")
+                                    sup_gpkg,
+                                    device_choice,
+                                    sup_layer,
+                                    field_map=inst.get("fields"),
+                                    field_order=inst.get("order"),
                                 )
                                 # create a friendly name per instance
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
@@ -2032,9 +2068,10 @@ def run_app() -> None:
                             if not match_column_choice:
                                 raise ValueError("Please select a column to match supervisor instances against.")
                             # build instance map
-                            inst_map: dict[str, dict[str, Any]] = {}
+                            inst_map: dict[str, tuple[dict[str, Any], list[str]]] = {}
                             for inst in device_instances:
                                 fields = inst.get("fields", {})
+                                order = inst.get("order", [])
                                 id_val = inst.get("id_value")
                                 feeder_val = inst.get("feeder_value")
                                 name_val = inst.get("name_value")
@@ -2046,7 +2083,7 @@ def run_app() -> None:
                                 for cand in candidates:
                                     norm = normalize_value_for_compare(cand)
                                     if norm and norm not in inst_map:
-                                        inst_map[norm] = fields
+                                        inst_map[norm] = (fields, order)
                             out_path, layer_name = fill_one_gpkg(
                                 sup_gpkg,
                                 device_choice,
@@ -2054,6 +2091,7 @@ def run_app() -> None:
                                 match_column=match_column_choice,
                                 instance_map=inst_map,
                                 default_fields=selected_instance.get("fields") if selected_instance else None,
+                                field_order=selected_instance.get("order") if selected_instance else None,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -2066,7 +2104,11 @@ def run_app() -> None:
                             )
                         else:
                             out_path, layer_name = fill_one_gpkg(
-                                sup_gpkg, device_choice, sup_layer, field_map=selected_instance.get("fields") if selected_instance else None
+                                sup_gpkg,
+                                device_choice,
+                                sup_layer,
+                                field_map=selected_instance.get("fields") if selected_instance else None,
+                                field_order=selected_instance.get("order") if selected_instance else None,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -2107,7 +2149,10 @@ def run_app() -> None:
                                 )
                             inst = _pick_instance_for_file(file_obj.name, instance_cache.get(device_for_file, []))
                             out_path, used_layer = fill_one_gpkg(
-                                file_obj, device_for_file, field_map=inst.get("fields") if inst else None
+                                file_obj,
+                                device_for_file,
+                                field_map=inst.get("fields") if inst else None,
+                                field_order=inst.get("order") if inst else None,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
