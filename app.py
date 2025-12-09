@@ -420,6 +420,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "arresterid",
                 "lightningarresterid",
                 "lightiningarresterid",
+                "hv_switch_id",
+                "hvswitchid",
+                "composite_id",
             ],
         )
         name_value = _get_by_alias(
@@ -1135,12 +1138,22 @@ def normalize_value_for_compare(value: Any) -> str:
 FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
     normalize_for_compare("TRANSFORMER"): "Power Transformer/ Stepup Transformer",
+    normalize_for_compare("DISCONNECTOR SWITCHES1"): "High Voltage Switch/High Voltage Switch",
 }
 
 # Hard overrides for filename -> preferred match columns.
 FILE_MATCH_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
     normalize_for_compare("Cabin"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
+    normalize_for_compare("DISCONNECTOR SWITCHES1"): [
+        "HV_Switch_ID",
+        "HV Switch ID",
+        "Composite_ID",
+        "Composite ID",
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
     normalize_for_compare("LIGHTNING ARRESTOR"): [
         "Lightining Arrester Name",
         "Lightning Arrester Name",
@@ -1650,6 +1663,13 @@ def preferred_match_columns(device_name: str) -> list[str]:
             "CircuitBreakerID",
             "CircuitBreaker_ID",
         ],
+        normalize_for_compare("High Voltage Switch/High Voltage Switch"): [
+            "HV_Switch_ID",
+            "HV Switch ID",
+            "Composite_ID",
+            "Composite ID",
+            "Composite",
+        ],
         normalize_for_compare("High Voltage Busbar/Medium Voltage Busbar"): [
             "Substation ID",
             "SubstationID",
@@ -2131,6 +2151,15 @@ def run_app() -> None:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[0] = fill_val
+                    # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
+                    if not matched_any and n > 1 and default_fields:
+                        for f, val in default_fields.items():
+                            if f == geom_name:
+                                continue
+                            if f not in out_cols:
+                                out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                            out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
