@@ -407,6 +407,10 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "bay_meter_serial_number",
                 "voltagetransformer_id",
                 "transformer_id",
+                "switchgearid",
+                "switchgear_id",
+                "mv_switchgear_id",
+                "mv switch gear id",
             ],
         )
         name_value = _get_by_alias(
@@ -418,6 +422,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "name",
                 "voltagetransformer_name",
                 "transformer_name",
+                "switchgearname",
+                "switchgear_name",
             ],
         )
         label_parts = [device_name]
@@ -1830,6 +1836,16 @@ def run_app() -> None:
                 selected_instance = next((i for i in device_instances if i["label"] == inst_label), None)
             else:
                 st.warning("No instances found for this device in the supervisor sheet.")
+            fill_mode_options = [
+                "Single layer (apply chosen instance to all rows)",
+                "Match rows to instances (single GPKG)",
+                "One GeoPackage per instance",
+            ]
+            if instance_labels and len(device_instances) > 1:
+                default_mode_idx = 1  # match rows by default when multiple instances exist
+                fill_mode = st.radio("Fill mode", fill_mode_options, index=default_mode_idx, key="sup_fill_mode")
+            else:
+                fill_mode = fill_mode_options[0]
 
             def _tokenize(text: str) -> set[str]:
                 return set(
@@ -1860,7 +1876,13 @@ def run_app() -> None:
                 return field_name
 
             def fill_one_gpkg(
-                file_obj, device_name: str, layer_override: str | None = None, field_map: dict[str, Any] | None = None
+                file_obj,
+                device_name: str,
+                layer_override: str | None = None,
+                field_map: dict[str, Any] | None = None,
+                match_column: str | None = None,
+                instance_map: dict[str, dict[str, Any]] | None = None,
+                default_fields: dict[str, Any] | None = None,
             ) -> tuple[Path, str]:
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
@@ -1871,12 +1893,12 @@ def run_app() -> None:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
                 fm_local = field_map
-                if fm_local is None:
+                if fm_local is None and match_column is None:
                     parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
                     if not parsed:
                         raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
                     fm_local = parsed[0].get("fields", {})
-                if not fm_local:
+                if fm_local is None and match_column is None:
                     raise ValueError(f"No field values available for device '{device_name}'.")
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 out_cols: dict[str, Any] = {}
@@ -1884,16 +1906,50 @@ def run_app() -> None:
                     out_cols[geom_name] = gdf_sup_local.geometry
                 n = len(gdf_sup_local)
                 filled_fields: list[str] = []
-                for f, val in fm_local.items():
-                    target_col = f
-                    if target_col not in out_cols:
-                        out_cols[target_col] = pd.NA
-                    if isinstance(val, pd.Series):
-                        fill_val = val.iloc[0] if not val.empty else pd.NA
-                    else:
-                        fill_val = val
-                    out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
-                    filled_fields.append(target_col)
+
+                if match_column and instance_map:
+                    target_col = match_column if match_column in gdf_sup_local.columns else None
+                    if target_col is None:
+                        raise ValueError(f"Match column '{match_column}' not found in layer '{layer}'.")
+                    norm_target = gdf_sup_local[target_col].map(normalize_value_for_compare)
+
+                    # initialize output columns for all fields we might fill
+                    all_fields: set[str] = set()
+                    for fields in instance_map.values():
+                        all_fields.update(fields.keys())
+                    if default_fields:
+                        all_fields.update(default_fields.keys())
+
+                    for f in sorted(all_fields):
+                        if f == geom_name:
+                            continue
+                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+
+                    for idx_val, norm_val in norm_target.items():
+                        fields = instance_map.get(norm_val)
+                        if fields is None:
+                            fields = default_fields
+                        if not fields:
+                            continue
+                        for f, val in fields.items():
+                            if f == geom_name:
+                                continue
+                            if f not in out_cols:
+                                out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                            out_cols[f].iat[idx_val] = fill_val
+                    filled_fields = [f for f in out_cols.keys() if f != geom_name]
+                else:
+                    for f, val in fm_local.items():
+                        target_col = f
+                        if target_col not in out_cols:
+                            out_cols[target_col] = pd.NA
+                        if isinstance(val, pd.Series):
+                            fill_val = val.iloc[0] if not val.empty else pd.NA
+                        else:
+                            fill_val = val
+                        out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                        filled_fields.append(target_col)
 
                 keep_cols = filled_fields.copy()
                 if geom_name and geom_name not in keep_cols:
@@ -1917,20 +1973,92 @@ def run_app() -> None:
                     sup_gpkg_path = Path(tmp.name)
                 sup_layers = list_gpkg_layers(sup_gpkg_path)
                 sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
+                match_column_choice = None
+                if sup_layers and fill_mode == "Match rows to instances (single GPKG)":
+                    try:
+                        gdf_preview = gpd.read_file(sup_gpkg_path, layer=sup_layer)
+                        candidate_cols = [c for c in gdf_preview.columns if c != gdf_preview.geometry.name] if hasattr(gdf_preview, "geometry") else list(gdf_preview.columns)
+                        def _score_col(col: str) -> int:
+                            norm = normalize_for_compare(col)
+                            score = 0
+                            for kw in ["id", "name", "bay", "switch", "gear", "line"]:
+                                if kw in norm:
+                                    score += 1
+                            return score
+                        if candidate_cols:
+                            scored = sorted(candidate_cols, key=lambda c: (-_score_col(c), len(c)))
+                            default_col = scored[0]
+                            match_column_choice = st.selectbox("Match supervisor instances to this column", candidate_cols, index=candidate_cols.index(default_col))
+                    except Exception:
+                        st.warning("Could not auto-inspect the GeoPackage to suggest a match column.")
                 if sup_layers and st.button("Fill attributes from supervisor sheet", key="sup_fill"):
                     try:
-                        out_path, layer_name = fill_one_gpkg(
-                            sup_gpkg, device_choice, sup_layer, field_map=selected_instance.get("fields") if selected_instance else None
-                        )
-                        with open(out_path, "rb") as f:
-                            data_bytes = f.read()
-                        st.download_button(
-                            "Download filled GeoPackage",
-                            data=data_bytes,
-                            file_name=sup_gpkg.name,
-                            mime="application/geopackage+sqlite3",
-                            key="sup_download",
-                        )
+                        if fill_mode == "One GeoPackage per instance" and instance_labels:
+                            outputs: list[tuple[str, Path]] = []
+                            for inst in device_instances:
+                                out_path, layer_name = fill_one_gpkg(
+                                    sup_gpkg, device_choice, sup_layer, field_map=inst.get("fields")
+                                )
+                                # create a friendly name per instance
+                                label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
+                                fname = f"{Path(sup_gpkg.name).stem}_{label_slug}.gpkg"
+                                outputs.append((fname, out_path))
+
+                            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
+                                zip_path = Path(ztmp.name)
+                            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                for fname, out_path in outputs:
+                                    zf.write(out_path, arcname=fname)
+                            with open(zip_path, "rb") as f:
+                                data = f.read()
+                            st.download_button(
+                                "Download per-instance GeoPackages (zip)",
+                                data=data,
+                                file_name=f"{Path(sup_gpkg.name).stem}_instances.zip",
+                                mime="application/zip",
+                                key="sup_download_instances",
+                            )
+                        elif fill_mode == "Match rows to instances (single GPKG)" and instance_labels:
+                            if not match_column_choice:
+                                raise ValueError("Please select a column to match supervisor instances against.")
+                            # build instance map
+                            inst_map: dict[str, dict[str, Any]] = {}
+                            for inst in device_instances:
+                                fields = inst.get("fields", {})
+                                for cand in (inst.get("id_value"), inst.get("name_value")):
+                                    norm = normalize_value_for_compare(cand)
+                                    if norm and norm not in inst_map:
+                                        inst_map[norm] = fields
+                            out_path, layer_name = fill_one_gpkg(
+                                sup_gpkg,
+                                device_choice,
+                                sup_layer,
+                                match_column=match_column_choice,
+                                instance_map=inst_map,
+                                default_fields=selected_instance.get("fields") if selected_instance else None,
+                            )
+                            with open(out_path, "rb") as f:
+                                data_bytes = f.read()
+                            st.download_button(
+                                "Download filled GeoPackage",
+                                data=data_bytes,
+                                file_name=sup_gpkg.name,
+                                mime="application/geopackage+sqlite3",
+                                key="sup_download_rowmatch",
+                            )
+                        else:
+                            out_path, layer_name = fill_one_gpkg(
+                                sup_gpkg, device_choice, sup_layer, field_map=selected_instance.get("fields") if selected_instance else None
+                            )
+                            with open(out_path, "rb") as f:
+                                data_bytes = f.read()
+                            st.download_button(
+                                "Download filled GeoPackage",
+                                data=data_bytes,
+                                file_name=sup_gpkg.name,
+                                mime="application/geopackage+sqlite3",
+                                key="sup_download",
+                            )
                     except Exception as exc:
                         st.error(f"Supervisor fill failed: {exc}")
             else:
