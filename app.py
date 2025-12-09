@@ -1141,6 +1141,12 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("DISCONNECTOR SWITCHES1"): "High Voltage Switch/High Voltage Switch",
 }
 
+# Columns to drop from output after filling (utility fields used only for matching).
+DROP_OUTPUT_COLUMNS = {
+    normalize_for_compare("Composite_ID"),
+    normalize_for_compare("Composite ID"),
+}
+
 # Hard overrides for filename -> preferred match columns.
 FILE_MATCH_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
@@ -2181,6 +2187,9 @@ def run_app() -> None:
                 keep_cols = filled_fields.copy()
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
+
+                # Drop utility columns (e.g., Composite_ID) from the output.
+                keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
 
                 # preserve column order where possible
                 out_gdf = gpd.GeoDataFrame(
