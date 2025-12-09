@@ -426,17 +426,27 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "switchgear_name",
             ],
         )
+        feeder_value = _get_by_alias(fields, ["feederid", "feeder_id", "feeder", "feeder name", "feedername"])
+
         label_parts = [device_name]
         extra_parts = []
         if pd.notna(id_value):
             extra_parts.append(str(id_value))
+        if pd.notna(feeder_value):
+            extra_parts.append(f"Feeder {feeder_value}")
         if pd.notna(name_value) and normalize_for_compare(name_value) != normalize_for_compare(id_value):
             extra_parts.append(str(name_value))
         if not extra_parts:
             extra_parts.append(f"#{idx}")
         label = f"{device_name} - {', '.join(extra_parts)}"
         instances.append(
-            {"label": label, "fields": fields, "id_value": id_value, "name_value": name_value}
+            {
+                "label": label,
+                "fields": fields,
+                "id_value": id_value,
+                "name_value": name_value,
+                "feeder_value": feeder_value,
+            }
         )
 
     for _, row in raw.iterrows():
@@ -1981,7 +1991,7 @@ def run_app() -> None:
                         def _score_col(col: str) -> int:
                             norm = normalize_for_compare(col)
                             score = 0
-                            for kw in ["id", "name", "bay", "switch", "gear", "line"]:
+                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder"]:
                                 if kw in norm:
                                     score += 1
                             return score
@@ -2025,7 +2035,15 @@ def run_app() -> None:
                             inst_map: dict[str, dict[str, Any]] = {}
                             for inst in device_instances:
                                 fields = inst.get("fields", {})
-                                for cand in (inst.get("id_value"), inst.get("name_value")):
+                                id_val = inst.get("id_value")
+                                feeder_val = inst.get("feeder_value")
+                                name_val = inst.get("name_value")
+                                candidates = [id_val, name_val, feeder_val]
+                                # combined key: id + feeder
+                                if id_val and feeder_val:
+                                    candidates.append(f"{id_val}_{feeder_val}")
+                                    candidates.append(f"{feeder_val}_{id_val}")
+                                for cand in candidates:
                                     norm = normalize_value_for_compare(cand)
                                     if norm and norm not in inst_map:
                                         inst_map[norm] = fields
@@ -2075,7 +2093,7 @@ def run_app() -> None:
                             return instances[0]
                         stem_norm = normalize_for_compare(Path(name).stem)
                         for inst in instances:
-                            for cand in (inst.get("id_value"), inst.get("name_value")):
+                            for cand in (inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")):
                                 if cand and normalize_for_compare(cand) in stem_norm:
                                     return inst
                         return instances[0]
