@@ -36,11 +36,6 @@ MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
 
-# Hard overrides for filename -> device label when heuristics/alias map are insufficient.
-FILE_DEVICE_OVERRIDES = {
-    normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
-}
-
 # Curated equipment names from the "Electric device" schema sheet (hard-coded for stability/order).
 ELECTRIC_DEVICE_EQUIPMENT = [
     "Power Transformer/ Stepup Transformer",
@@ -1135,6 +1130,11 @@ def normalize_value_for_compare(value: Any) -> str:
 
     text = text.lower().replace("_", "").replace("-", "")
     return " ".join(text.split()).strip()
+
+# Hard overrides for filename -> device label when heuristics/alias map are insufficient.
+FILE_DEVICE_OVERRIDES = {
+    normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
+}
 
 
 def detect_substation_column(df: pd.DataFrame) -> str | None:
