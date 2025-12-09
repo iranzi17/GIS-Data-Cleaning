@@ -36,6 +36,11 @@ MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
 
+# Hard overrides for filename -> device label when heuristics/alias map are insufficient.
+FILE_DEVICE_OVERRIDES = {
+    normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
+}
+
 # Curated equipment names from the "Electric device" schema sheet (hard-coded for stability/order).
 ELECTRIC_DEVICE_EQUIPMENT = [
     "Power Transformer/ Stepup Transformer",
@@ -346,6 +351,9 @@ def save_mapping_cache(cache: dict[str, dict[str, str]]) -> None:
 def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_map: dict[str, str]) -> str:
     """Pick equipment/device name for a given file using explicit map then similarity."""
     norm_file = normalize_for_compare(Path(file_name).stem)
+    override = FILE_DEVICE_OVERRIDES.get(norm_file)
+    if override and override in equipment_options:
+        return override
     mapped = equip_map.get(norm_file)
     if mapped and mapped in equipment_options:
         return mapped
@@ -1537,6 +1545,49 @@ def detect_join_columns(
     return None, None, 0
 
 
+def preferred_match_columns(device_name: str) -> list[str]:
+    """Return preferred match columns for specific devices when row-matching supervisor data."""
+    norm = normalize_for_compare(device_name)
+    preferences = {
+        normalize_for_compare("Line Bay"): [
+            "LineBayID",
+            "Line Bay ID",
+            "Line_Bay_ID",
+            "Line Bay Name",
+            "Line_Bay_Name",
+        ],
+        normalize_for_compare("MV Switch gear"): [
+            "FeederID",
+            "Feeder ID",
+            "FeederName",
+            "Feeder Name",
+        ],
+        normalize_for_compare("Lightning Arrester"): [
+            "Lightining Arrester Name",
+            "Lightning Arrester Name",
+            "ArresterID",
+            "Arrester Name",
+            "Arrester ID",
+        ],
+        normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker"): [
+            "Circuit Breaker Name",
+            "CircuitBreakerID",
+            "CircuitBreaker_ID",
+        ],
+        normalize_for_compare("High Voltage Busbar/Medium Voltage Busbar"): [
+            "Substation ID",
+            "SubstationID",
+            "SUBSTATION NAMES",
+        ],
+        normalize_for_compare("Substation/Cabin"): [
+            "Substation ID",
+            "SubstationID",
+            "SUBSTATION NAMES",
+        ],
+    }
+    return preferences.get(norm, [])
+
+
 def derive_layer_name_from_filename(name: str) -> str:
     base = Path(name).stem.strip() or "dataset"
     base = base.replace(" ", "_").lower()
@@ -2026,16 +2077,34 @@ def run_app() -> None:
                     try:
                         gdf_preview = gpd.read_file(sup_gpkg_path, layer=sup_layer)
                         candidate_cols = [c for c in gdf_preview.columns if c != gdf_preview.geometry.name] if hasattr(gdf_preview, "geometry") else list(gdf_preview.columns)
+                        pref_cols = preferred_match_columns(device_choice)
+
                         def _score_col(col: str) -> int:
                             norm = normalize_for_compare(col)
                             score = 0
-                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder", "arrester", "lightning"]:
+                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder", "arrester", "lightning", "substation"]:
                                 if kw in norm:
                                     score += 1
                             return score
+
+                        default_col = None
                         if candidate_cols:
-                            scored = sorted(candidate_cols, key=lambda c: (-_score_col(c), len(c)))
-                            default_col = scored[0]
+                            lookup = {normalize_for_compare(c): c for c in candidate_cols}
+                            for pref in pref_cols:
+                                n = normalize_for_compare(pref)
+                                if n in lookup:
+                                    default_col = lookup[n]
+                                    break
+                            if default_col is None and len(gdf_preview) <= 1:
+                                # single-feature fallback to substation columns if present
+                                for pref in ["Substation ID", "SubstationID", "SUBSTATION NAMES"]:
+                                    n = normalize_for_compare(pref)
+                                    if n in lookup:
+                                        default_col = lookup[n]
+                                        break
+                            if default_col is None:
+                                scored = sorted(candidate_cols, key=lambda c: (-_score_col(c), len(c)))
+                                default_col = scored[0]
                             match_column_choice = st.selectbox("Match supervisor instances to this column", candidate_cols, index=candidate_cols.index(default_col))
                     except Exception:
                         st.warning("Could not auto-inspect the GeoPackage to suggest a match column.")
