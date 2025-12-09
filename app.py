@@ -363,30 +363,112 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
     return equipment_options[0] if equipment_options else ""
 
 
-def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_name: str) -> dict[str, Any]:
+def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_name: str) -> list[dict[str, Any]]:
     """
     Parse a supervisor-provided Electric device sheet where columns are:
     col0=device, col1=field, col2=type, value in rightmost non-null cell of the row.
-    Returns a dict field -> coerced value.
+    Supports multiple instances (e.g., multiple Line Bays) by returning a list of
+    dicts with metadata: {"label": str, "fields": {field: value}, "id_value": Any, "name_value": Any}.
     """
     raw = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
-    raw.iloc[:, 0] = raw.iloc[:, 0].ffill()
-    mask = raw.iloc[:, 0].fillna("").map(normalize_for_compare) == normalize_for_compare(device_name)
-    df = raw.loc[mask].copy()
-    df = df[df.iloc[:, 1].notna()]
-    df_fields = {}
-    for _, row in df.iterrows():
-        field = _clean_column_name(row.iloc[1])
-        type_str = row.iloc[2] if len(row) > 2 else ""
+
+    target_norm = normalize_for_compare(device_name)
+    instances: list[dict[str, Any]] = []
+    current_fields: dict[str, Any] | None = None
+
+    def _extract_value(row: pd.Series) -> Any:
         val = pd.NA
         if len(row) > 3:
             for v in row.iloc[3:]:
                 if pd.notna(v):
                     val = v
+        return val
+
+    def _get_by_alias(fields: dict[str, Any], aliases: list[str]) -> Any:
+        lookup = {normalize_for_compare(k): k for k in fields}
+        for alias in aliases:
+            key = lookup.get(alias)
+            if key is not None:
+                return fields.get(key)
+        return None
+
+    def _finalize_instance(fields: dict[str, Any]) -> None:
+        if not fields:
+            return
+        idx = len(instances) + 1
+        id_value = _get_by_alias(
+            fields,
+            [
+                "linebayid",
+                "line_bay_id",
+                "bayid",
+                "deviceid",
+                "id",
+                "bay_meter_serial_number",
+                "voltagetransformer_id",
+                "transformer_id",
+            ],
+        )
+        name_value = _get_by_alias(
+            fields,
+            [
+                "linebayname",
+                "line_bay_name",
+                "bayname",
+                "name",
+                "voltagetransformer_name",
+                "transformer_name",
+            ],
+        )
+        label_parts = [device_name]
+        extra_parts = []
+        if pd.notna(id_value):
+            extra_parts.append(str(id_value))
+        if pd.notna(name_value) and normalize_for_compare(name_value) != normalize_for_compare(id_value):
+            extra_parts.append(str(name_value))
+        if not extra_parts:
+            extra_parts.append(f"#{idx}")
+        label = f"{device_name} - {', '.join(extra_parts)}"
+        instances.append(
+            {"label": label, "fields": fields, "id_value": id_value, "name_value": name_value}
+        )
+
+    for _, row in raw.iterrows():
+        dev_cell = row.iloc[0]
+        dev_norm = normalize_for_compare(dev_cell) if pd.notna(dev_cell) else ""
+        row_blank = row.iloc[1:].isna().all()
+
+        if dev_norm == target_norm:
+            if current_fields is not None and current_fields:
+                _finalize_instance(current_fields)
+            current_fields = {}
+        elif pd.notna(dev_cell):
+            if current_fields is not None and current_fields:
+                _finalize_instance(current_fields)
+            current_fields = None
+
+        if current_fields is None:
+            continue
+
+        if row_blank:
+            _finalize_instance(current_fields)
+            current_fields = None
+            continue
+
+        field = row.iloc[1]
+        if pd.isna(field):
+            continue
+        field_clean = _clean_column_name(field)
+        type_str = row.iloc[2] if len(row) > 2 else ""
+        val = _extract_value(row)
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
-        df_fields[field] = coerced
-    return df_fields
+        current_fields[field_clean] = coerced
+
+    if current_fields is not None and current_fields:
+        _finalize_instance(current_fields)
+
+    return instances
 
 
 def process_single_gpkg(args):
@@ -1740,6 +1822,14 @@ def run_app() -> None:
             device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
             device_choice = st.selectbox("Device entry", device_options, key="sup_device")
             equip_map_sup = load_gpkg_equipment_map()
+            device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
+            instance_labels = [inst["label"] for inst in device_instances]
+            selected_instance = None
+            if instance_labels:
+                inst_label = st.selectbox("Device instance", instance_labels, key="sup_device_instance")
+                selected_instance = next((i for i in device_instances if i["label"] == inst_label), None)
+            else:
+                st.warning("No instances found for this device in the supervisor sheet.")
 
             def _tokenize(text: str) -> set[str]:
                 return set(
@@ -1769,7 +1859,9 @@ def run_app() -> None:
                     return best_col
                 return field_name
 
-            def fill_one_gpkg(file_obj, device_name: str, layer_override: str | None = None) -> tuple[Path, str]:
+            def fill_one_gpkg(
+                file_obj, device_name: str, layer_override: str | None = None, field_map: dict[str, Any] | None = None
+            ) -> tuple[Path, str]:
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
                     gpkg_path = Path(tmp.name)
@@ -1778,14 +1870,21 @@ def run_app() -> None:
                 if not layer:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
-                field_map = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
+                fm_local = field_map
+                if fm_local is None:
+                    parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
+                    if not parsed:
+                        raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
+                    fm_local = parsed[0].get("fields", {})
+                if not fm_local:
+                    raise ValueError(f"No field values available for device '{device_name}'.")
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 out_cols: dict[str, Any] = {}
                 if geom_name:
                     out_cols[geom_name] = gdf_sup_local.geometry
                 n = len(gdf_sup_local)
                 filled_fields: list[str] = []
-                for f, val in field_map.items():
+                for f, val in fm_local.items():
                     target_col = f
                     if target_col not in out_cols:
                         out_cols[target_col] = pd.NA
@@ -1820,7 +1919,9 @@ def run_app() -> None:
                 sup_layer = st.selectbox("Select layer", sup_layers if sup_layers else [])
                 if sup_layers and st.button("Fill attributes from supervisor sheet", key="sup_fill"):
                     try:
-                        out_path, layer_name = fill_one_gpkg(sup_gpkg, device_choice, sup_layer)
+                        out_path, layer_name = fill_one_gpkg(
+                            sup_gpkg, device_choice, sup_layer, field_map=selected_instance.get("fields") if selected_instance else None
+                        )
                         with open(out_path, "rb") as f:
                             data_bytes = f.read()
                         st.download_button(
@@ -1837,12 +1938,36 @@ def run_app() -> None:
                 if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
                     logs: list[str] = []
                     outputs: list[tuple[str, Path]] = []
+                    instance_cache: dict[str, list[dict[str, Any]]] = {}
+
+                    def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
+                        if not instances:
+                            return None
+                        if len(instances) == 1:
+                            return instances[0]
+                        stem_norm = normalize_for_compare(Path(name).stem)
+                        for inst in instances:
+                            for cand in (inst.get("id_value"), inst.get("name_value")):
+                                if cand and normalize_for_compare(cand) in stem_norm:
+                                    return inst
+                        return instances[0]
+
                     for file_obj in sup_gpkg_files:
                         try:
                             device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
-                            out_path, used_layer = fill_one_gpkg(file_obj, device_for_file)
+                            if device_for_file not in instance_cache:
+                                instance_cache[device_for_file] = parse_supervisor_device_table(
+                                    sup_wb_path, sup_sheet, device_for_file
+                                )
+                            inst = _pick_instance_for_file(file_obj.name, instance_cache.get(device_for_file, []))
+                            out_path, used_layer = fill_one_gpkg(
+                                file_obj, device_for_file, field_map=inst.get("fields") if inst else None
+                            )
                             outputs.append((file_obj.name, out_path))
-                            logs.append(f"{file_obj.name}: filled using device '{device_for_file}' on layer '{used_layer}'.")
+                            chosen_label = inst.get("label") if inst else "default instance"
+                            logs.append(
+                                f"{file_obj.name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
+                            )
                         except Exception as exc:
                             logs.append(f"{file_obj.name}: failed ({exc}).")
 
