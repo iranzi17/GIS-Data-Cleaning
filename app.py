@@ -1136,6 +1136,56 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
 }
 
+# Hard overrides for filename -> preferred match columns.
+FILE_MATCH_OVERRIDES = {
+    normalize_for_compare("BUSBAR1"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
+    normalize_for_compare("Cabin"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
+    normalize_for_compare("LIGHTNING ARRESTOR"): [
+        "Lightining Arrester Name",
+        "Lightning Arrester Name",
+        "ArresterID",
+        "Arrester Name",
+    ],
+    normalize_for_compare("HIGH VOLTAGE CIRCUIT BREAKER"): [
+        "Circuit Breaker Name",
+        "CircuitBreakerID",
+        "CircuitBreaker_ID",
+    ],
+    normalize_for_compare("INDOR CB"): [
+        "Circuit Breaker Name",
+        "CircuitBreakerID",
+        "CircuitBreaker_ID",
+    ],
+    normalize_for_compare("LINE BAY"): [
+        "LineBayID",
+        "Line Bay ID",
+        "Line_Bay_ID",
+    ],
+    normalize_for_compare("SWITCHGEAR"): [
+        "FeederID",
+        "Feeder ID",
+        "FeederName",
+    ],
+    normalize_for_compare("TRANS SYSTEM PROT1"): [
+        "Line Bay ID",
+        "LineBayID",
+    ],
+    normalize_for_compare("TRANS_SYSTEM PROT2"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("TRANSFORMER"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("VOLTAGE TRANSFORMER"): [
+        "Line Bay ID",
+        "LineBayID",
+    ],
+}
+
 
 def detect_substation_column(df: pd.DataFrame) -> str | None:
     """
@@ -1588,6 +1638,11 @@ def preferred_match_columns(device_name: str) -> list[str]:
     return preferences.get(norm, [])
 
 
+def match_overrides_for_file(file_name: str) -> list[str]:
+    norm = normalize_for_compare(Path(file_name).stem)
+    return FILE_MATCH_OVERRIDES.get(norm, [])
+
+
 def derive_layer_name_from_filename(name: str) -> str:
     base = Path(name).stem.strip() or "dataset"
     base = base.replace(" ", "_").lower()
@@ -2018,6 +2073,7 @@ def run_app() -> None:
                             continue
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
+                    matched_any = False
                     for idx_val, norm_val in norm_target.items():
                         payload = instance_map.get(norm_val)
                         if payload is None:
@@ -2025,6 +2081,7 @@ def run_app() -> None:
                         fields, _order = payload
                         if not fields:
                             continue
+                        matched_any = True
                         for f, val in fields.items():
                             if f == geom_name:
                                 continue
@@ -2032,6 +2089,23 @@ def run_app() -> None:
                                 out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                             fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                             out_cols[f].iat[idx_val] = fill_val
+
+                    # If single feature and nothing matched, fill with default or first instance.
+                    if not matched_any and n == 1:
+                        fallback_fields = default_fields
+                        if fallback_fields is None and instance_map:
+                            # take first instance_map entry
+                            first_payload = next(iter(instance_map.values()), (None, []))
+                            fallback_fields = first_payload[0]
+                        if fallback_fields:
+                            for f, val in fallback_fields.items():
+                                if f == geom_name:
+                                    continue
+                                if f not in out_cols:
+                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                                out_cols[f].iat[0] = fill_val
+
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
                     ordered_keys = order_local if order_local else list(fm_local.keys())
@@ -2078,6 +2152,8 @@ def run_app() -> None:
                         gdf_preview = gpd.read_file(sup_gpkg_path, layer=sup_layer)
                         candidate_cols = [c for c in gdf_preview.columns if c != gdf_preview.geometry.name] if hasattr(gdf_preview, "geometry") else list(gdf_preview.columns)
                         pref_cols = preferred_match_columns(device_choice)
+                        file_pref_cols = match_overrides_for_file(sup_gpkg.name)
+                        pref_cols = file_pref_cols + [c for c in pref_cols if c not in file_pref_cols]
 
                         def _score_col(col: str) -> int:
                             norm = normalize_for_compare(col)
