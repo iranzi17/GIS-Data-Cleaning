@@ -1134,6 +1134,7 @@ def normalize_value_for_compare(value: Any) -> str:
 # Hard overrides for filename -> device label when heuristics/alias map are insufficient.
 FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
+    normalize_for_compare("TRANSFORMER"): "Power Transformer/ Stepup Transformer",
 }
 
 # Hard overrides for filename -> preferred match columns.
@@ -1151,6 +1152,11 @@ FILE_MATCH_OVERRIDES = {
         "CircuitBreakerID",
         "CircuitBreaker_ID",
     ],
+    normalize_for_compare("HIGH VOLTAGE CIRCUIT BREAKER.gpkg"): [
+        "Circuit Breaker Name",
+        "CircuitBreakerID",
+        "CircuitBreaker_ID",
+    ],
     normalize_for_compare("INDOR CB"): [
         "Circuit Breaker Name",
         "CircuitBreakerID",
@@ -1160,6 +1166,26 @@ FILE_MATCH_OVERRIDES = {
         "LineBayID",
         "Line Bay ID",
         "Line_Bay_ID",
+    ],
+    normalize_for_compare("CURRENT TRANSFORMER"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("INDOR CT"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("VOLTAGE TRANSFORMER"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("INDOR VT"): [
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
     ],
     normalize_for_compare("SWITCHGEAR"): [
         "FeederID",
