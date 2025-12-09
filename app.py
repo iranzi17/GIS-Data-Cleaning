@@ -414,6 +414,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "switchgear_id",
                 "mv_switchgear_id",
                 "mv switch gear id",
+                "arresterid",
+                "lightningarresterid",
+                "lightiningarresterid",
             ],
         )
         name_value = _get_by_alias(
@@ -427,6 +430,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "transformer_name",
                 "switchgearname",
                 "switchgear_name",
+                "arrestername",
+                "lightningarrestername",
+                "lightiningarrestername",
             ],
         )
         feeder_value = _get_by_alias(fields, ["feederid", "feeder_id", "feeder", "feeder name", "feedername"])
@@ -2023,7 +2029,7 @@ def run_app() -> None:
                         def _score_col(col: str) -> int:
                             norm = normalize_for_compare(col)
                             score = 0
-                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder"]:
+                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder", "arrester", "lightning"]:
                                 if kw in norm:
                                     score += 1
                             return score
