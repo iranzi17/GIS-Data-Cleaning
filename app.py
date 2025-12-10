@@ -1187,6 +1187,9 @@ FILE_MATCH_OVERRIDES = {
         "Line_Bay_ID",
     ],
     normalize_for_compare("CURRENT TRANSFORMER"): [
+        "Current Transformer Name",
+        "CurrentTransformerID",
+        "Current Transformer ID",
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
@@ -1226,6 +1229,9 @@ FILE_MATCH_OVERRIDES = {
         "Substation ID",
     ],
     normalize_for_compare("VOLTAGE TRANSFORMER"): [
+        "Voltage Transformer Name",
+        "VoltageTransfomer_ID",
+        "Voltage Transformer ID",
         "Line Bay ID",
         "LineBayID",
     ],
