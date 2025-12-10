@@ -393,7 +393,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     def _get_by_alias(fields: dict[str, Any], aliases: list[str]) -> Any:
         lookup = {normalize_for_compare(k): k for k in fields}
         for alias in aliases:
-            key = lookup.get(alias)
+            key = lookup.get(normalize_for_compare(alias))
             if key is not None:
                 return fields.get(key)
         return None
@@ -412,7 +412,13 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "id",
                 "bay_meter_serial_number",
                 "voltagetransformer_id",
+                "voltagetransfomer_id",
+                "voltage transformer id",
                 "transformer_id",
+                "currenttransformer_id",
+                "current transformer id",
+                "currenttransformerid",
+                "current transfomer id",
                 "switchgearid",
                 "switchgear_id",
                 "mv_switchgear_id",
@@ -434,6 +440,11 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "name",
                 "voltagetransformer_name",
                 "transformer_name",
+                "voltagetransfomer_name",
+                "voltage transformer name",
+                "currenttransformer_name",
+                "current transformer name",
+                "current transfomer name",
                 "switchgearname",
                 "switchgear_name",
                 "arrestername",
