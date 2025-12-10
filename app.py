@@ -500,9 +500,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             continue
 
         if row_blank:
-            _finalize_instance(current_fields, current_order)
-            current_fields = None
-            current_order = []
+            # Allow sparse blank rows inside a device block; finalize only when we see a new device or end of sheet.
             continue
 
         field = row.iloc[1]
