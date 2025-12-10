@@ -445,6 +445,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "currenttransformer_name",
                 "current transformer name",
                 "current transfomer name",
+                "circuit breaker name",
+                "circuitbreakername",
                 "switchgearname",
                 "switchgear_name",
                 "arrestername",
@@ -1150,12 +1152,22 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): "High Voltage Busbar/Medium Voltage Busbar",
     normalize_for_compare("TRANSFORMER"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("DISCONNECTOR SWITCHES1"): "High Voltage Switch/High Voltage Switch",
+    normalize_for_compare("INDOR CB"): "Indoor Circuit Breaker/30kv/15kb",
+    normalize_for_compare("INDOR CT"): "Indoor Current Transformer",
+    normalize_for_compare("INDOR VT"): "Indoor Voltage Transformer",
 }
 
 # Columns to drop from output after filling (utility fields used only for matching).
 DROP_OUTPUT_COLUMNS = {
     normalize_for_compare("Composite_ID"),
     normalize_for_compare("Composite ID"),
+}
+
+# Devices where, if no matches are found, we distribute sheet instances across rows to keep feature counts.
+SEQUENTIAL_FILL_DEVICES = {
+    normalize_for_compare("Indoor Circuit Breaker/30kv/15kb"),
+    normalize_for_compare("Indoor Current Transformer"),
+    normalize_for_compare("Indoor Voltage Transformer"),
 }
 
 # Hard overrides for filename -> preferred match columns.
@@ -1191,6 +1203,7 @@ FILE_MATCH_OVERRIDES = {
         "Circuit Breaker Name",
         "CircuitBreakerID",
         "CircuitBreaker_ID",
+        "Circuit Breaker - Indoor SG ID",
     ],
     normalize_for_compare("LINE BAY"): [
         "LineBayID",
@@ -1206,16 +1219,25 @@ FILE_MATCH_OVERRIDES = {
         "Substation ID",
     ],
     normalize_for_compare("INDOR CT"): [
+        "Current Transformer Name",
+        "CurrentTransfomerID",
+        "Current Transformer ID",
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
     ],
     normalize_for_compare("VOLTAGE TRANSFORMER"): [
+        "Voltage Transformer Name",
+        "VoltageTransfomer_ID",
+        "Voltage Transformer ID",
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
     ],
     normalize_for_compare("INDOR VT"): [
+        "Voltage Transformer Name",
+        "VoltageTransfomer_ID",
+        "Voltage Transformer ID",
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
@@ -2086,6 +2108,7 @@ def run_app() -> None:
                 instance_map: dict[str, tuple[dict[str, Any], list[str]]] | None = None,
                 default_fields: dict[str, Any] | None = None,
                 field_order: list[str] | None = None,
+                sequential_instances: list[dict[str, Any]] | None = None,
             ) -> tuple[Path, str]:
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
@@ -2142,7 +2165,7 @@ def run_app() -> None:
                             continue
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
-                    matched_any = False
+                    matched_hits = 0
                     for idx_val, norm_val in norm_target.items():
                         payload = instance_map.get(norm_val)
                         if payload is None:
@@ -2150,7 +2173,7 @@ def run_app() -> None:
                         fields, _order = payload
                         if not fields:
                             continue
-                        matched_any = True
+                        matched_hits += 1
                         for f, val in fields.items():
                             if f == geom_name:
                                 continue
@@ -2160,7 +2183,7 @@ def run_app() -> None:
                             out_cols[f].iat[idx_val] = fill_val
 
                     # If single feature and nothing matched, fill with default or first instance.
-                    if not matched_any and n == 1:
+                    if matched_hits == 0 and n == 1:
                         fallback_fields = default_fields
                         if fallback_fields is None and instance_map:
                             # take first instance_map entry
@@ -2175,7 +2198,7 @@ def run_app() -> None:
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[0] = fill_val
                     # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
-                    if not matched_any and n > 1 and default_fields:
+                    if matched_hits == 0 and n > 1 and default_fields:
                         for f, val in default_fields.items():
                             if f == geom_name:
                                 continue
@@ -2183,6 +2206,18 @@ def run_app() -> None:
                                 out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                             fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                             out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                    # If still no matches and sequential instances are provided, distribute them across rows.
+                    if matched_hits == 0 and sequential_instances:
+                        seq = sequential_instances
+                        for idx_row in range(n):
+                            inst_fields = seq[idx_row % len(seq)]
+                            for f, val in inst_fields.items():
+                                if f == geom_name:
+                                    continue
+                                if f not in out_cols:
+                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                                out_cols[f].iat[idx_row] = fill_val
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
@@ -2385,6 +2420,7 @@ def run_app() -> None:
                                 device_for_file,
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
+                                sequential_instances=instance_cache.get(device_for_file, []) if normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES else None,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
