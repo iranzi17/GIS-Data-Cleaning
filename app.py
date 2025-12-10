@@ -2415,6 +2415,18 @@ def run_app() -> None:
                                 if pd.notna(id_val) and pd.notna(feeder_val):
                                     candidates.append(f"{id_val}_{feeder_val}")
                                     candidates.append(f"{feeder_val}_{id_val}")
+                                # feeder-type heuristics for indoor MV devices (MV1 -> transformer feeder, MV3 -> line feeder)
+                                try:
+                                    id_norm = normalize_for_compare(id_val)
+                                except Exception:
+                                    id_norm = ""
+                                if "feeder" in normalize_for_compare(match_column_choice or ""):
+                                    if "mv1" in id_norm or id_norm.endswith("1"):
+                                        candidates.append("transformer feeder")
+                                        candidates.append("transformer_feeder")
+                                    if "mv3" in id_norm or id_norm.endswith("3"):
+                                        candidates.append("line feeder")
+                                        candidates.append("line_feeder")
                                 for cand in candidates:
                                     norm = normalize_value_for_compare(cand)
                                     if norm and norm not in inst_map:
