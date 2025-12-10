@@ -2221,6 +2221,7 @@ def run_app() -> None:
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
                     matched_hits = 0
+                    matched_indices: set[int] = set()
                     for idx_val, norm_val in norm_target.items():
                         payload = instance_map.get(norm_val)
                         if payload is None:
@@ -2229,6 +2230,7 @@ def run_app() -> None:
                         if not fields:
                             continue
                         matched_hits += 1
+                        matched_indices.add(idx_val)
                         for f, val in fields.items():
                             if f == geom_name:
                                 continue
@@ -2273,6 +2275,22 @@ def run_app() -> None:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[idx_row] = fill_val
+
+                    # If some rows remain unmatched, fill those rows using sequential instances (feeder-aware) without overwriting matched rows.
+                    if seq_entries and len(matched_indices) < n:
+                        for idx_row in range(n):
+                            if idx_row in matched_indices:
+                                continue
+                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                            inst_fields = entry.get("fields", {})
+                            for f, val in inst_fields.items():
+                                if f == geom_name:
+                                    continue
+                                if f not in out_cols:
+                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                                if pd.isna(out_cols[f].iat[idx_row]):
+                                    fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                                    out_cols[f].iat[idx_row] = fill_val
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
@@ -2431,6 +2449,11 @@ def run_app() -> None:
                                     norm = normalize_value_for_compare(cand)
                                     if norm and norm not in inst_map:
                                         inst_map[norm] = (fields, order)
+                            seq_arg = None
+                            if len(device_instances) > 1:
+                                seq_arg = device_instances
+                            elif normalize_for_compare(device_choice) in SEQUENTIAL_FILL_DEVICES:
+                                seq_arg = device_instances
                             out_path, layer_name = fill_one_gpkg(
                                 sup_gpkg,
                                 device_choice,
@@ -2439,9 +2462,7 @@ def run_app() -> None:
                                 instance_map=inst_map,
                                 default_fields=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
-                                sequential_instances=device_instances
-                                if normalize_for_compare(device_choice) in SEQUENTIAL_FILL_DEVICES
-                                else None,
+                                sequential_instances=seq_arg,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
