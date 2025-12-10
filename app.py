@@ -1173,8 +1173,18 @@ SEQUENTIAL_FILL_DEVICES = {
 # Hard overrides for filename -> preferred match columns.
 FILE_MATCH_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
+    normalize_for_compare("BUSBAR"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
     normalize_for_compare("Cabin"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
     normalize_for_compare("DISCONNECTOR SWITCHES1"): [
+        "HV_Switch_ID",
+        "HV Switch ID",
+        "Composite_ID",
+        "Composite ID",
+        "Line Bay ID",
+        "LineBayID",
+        "Substation ID",
+    ],
+    normalize_for_compare("DISCONNECTOR SWITCH"): [
         "HV_Switch_ID",
         "HV Switch ID",
         "Composite_ID",
@@ -2110,6 +2120,14 @@ def run_app() -> None:
                 field_order: list[str] | None = None,
                 sequential_instances: list[dict[str, Any]] | None = None,
             ) -> tuple[Path, str]:
+                # normalize sequential_instances to a list of field dictionaries
+                seq_fields: list[dict[str, Any]] = []
+                if sequential_instances:
+                    for inst in sequential_instances:
+                        if isinstance(inst, dict) and "fields" in inst:
+                            seq_fields.append(inst.get("fields", {}))
+                        else:
+                            seq_fields.append(inst if isinstance(inst, dict) else {})
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
                     gpkg_path = Path(tmp.name)
@@ -2207,8 +2225,8 @@ def run_app() -> None:
                             fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                             out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
                     # If still no matches and sequential instances are provided, distribute them across rows.
-                    if matched_hits == 0 and sequential_instances:
-                        seq = sequential_instances
+                    if matched_hits == 0 and seq_fields:
+                        seq = seq_fields
                         for idx_row in range(n):
                             inst_fields = seq[idx_row % len(seq)]
                             for f, val in inst_fields.items():
@@ -2221,20 +2239,33 @@ def run_app() -> None:
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
-                    ordered_keys = order_local if order_local else list(fm_local.keys())
-                    for f in ordered_keys:
-                        val = fm_local.get(f)
-                        if val is None:
-                            continue
-                        target_col = f
-                        if target_col not in out_cols:
-                            out_cols[target_col] = pd.NA
-                        if isinstance(val, pd.Series):
-                            fill_val = val.iloc[0] if not val.empty else pd.NA
-                        else:
-                            fill_val = val
-                        out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
-                        filled_fields.append(target_col)
+                    if seq_fields:
+                        seq = seq_fields
+                        for idx_row in range(n):
+                            inst_fields = seq[idx_row % len(seq)]
+                            for f, val in inst_fields.items():
+                                if f == geom_name:
+                                    continue
+                                if f not in out_cols:
+                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                                out_cols[f].iat[idx_row] = fill_val
+                        filled_fields = [f for f in out_cols.keys() if f != geom_name]
+                    else:
+                        ordered_keys = order_local if order_local else list(fm_local.keys())
+                        for f in ordered_keys:
+                            val = fm_local.get(f)
+                            if val is None:
+                                continue
+                            target_col = f
+                            if target_col not in out_cols:
+                                out_cols[target_col] = pd.NA
+                            if isinstance(val, pd.Series):
+                                fill_val = val.iloc[0] if not val.empty else pd.NA
+                            else:
+                                fill_val = val
+                            out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                            filled_fields.append(target_col)
 
                 keep_cols = filled_fields.copy()
                 if geom_name and geom_name not in keep_cols:
@@ -2344,7 +2375,7 @@ def run_app() -> None:
                                 name_val = inst.get("name_value")
                                 candidates = [id_val, name_val, feeder_val]
                                 # combined key: id + feeder
-                                if id_val and feeder_val:
+                                if pd.notna(id_val) and pd.notna(feeder_val):
                                     candidates.append(f"{id_val}_{feeder_val}")
                                     candidates.append(f"{feeder_val}_{id_val}")
                                 for cand in candidates:
@@ -2359,6 +2390,9 @@ def run_app() -> None:
                                 instance_map=inst_map,
                                 default_fields=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
+                                sequential_instances=[inst.get("fields", {}) for inst in device_instances]
+                                if normalize_for_compare(device_choice) in SEQUENTIAL_FILL_DEVICES
+                                else None,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -2403,7 +2437,7 @@ def run_app() -> None:
                         stem_norm = normalize_for_compare(Path(name).stem)
                         for inst in instances:
                             for cand in (inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")):
-                                if cand and normalize_for_compare(cand) in stem_norm:
+                                if pd.notna(cand) and normalize_for_compare(cand) in stem_norm:
                                     return inst
                         return instances[0]
 
@@ -2420,7 +2454,11 @@ def run_app() -> None:
                                 device_for_file,
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
-                                sequential_instances=instance_cache.get(device_for_file, []) if normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES else None,
+                                sequential_instances=[
+                                    i.get("fields", {}) for i in instance_cache.get(device_for_file, [])
+                                ]
+                                if normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES
+                                else None,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
