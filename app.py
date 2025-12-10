@@ -1212,6 +1212,7 @@ FILE_MATCH_OVERRIDES = {
         "CircuitBreakerID",
         "CircuitBreaker_ID",
         "Circuit Breaker - Indoor SG ID",
+        "Feeder Type",
     ],
     normalize_for_compare("LINE BAY"): [
         "LineBayID",
@@ -1233,6 +1234,7 @@ FILE_MATCH_OVERRIDES = {
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
+        "Feeder Type",
     ],
     normalize_for_compare("VOLTAGE TRANSFORMER"): [
         "Voltage Transformer Name",
@@ -1249,6 +1251,7 @@ FILE_MATCH_OVERRIDES = {
         "Line Bay ID",
         "LineBayID",
         "Substation ID",
+        "Feeder Type",
     ],
     normalize_for_compare("SWITCHGEAR"): [
         "FeederID",
@@ -2118,14 +2121,50 @@ def run_app() -> None:
                 field_order: list[str] | None = None,
                 sequential_instances: list[dict[str, Any]] | None = None,
             ) -> tuple[Path, str]:
-                # normalize sequential_instances to a list of field dictionaries
-                seq_fields: list[dict[str, Any]] = []
+                # normalize sequential_instances to a list of entries with fields + optional ids
+                seq_entries: list[dict[str, Any]] = []
                 if sequential_instances:
                     for inst in sequential_instances:
                         if isinstance(inst, dict) and "fields" in inst:
-                            seq_fields.append(inst.get("fields", {}))
+                            seq_entries.append(
+                                {
+                                    "fields": inst.get("fields", {}) or {},
+                                    "id": inst.get("id_value"),
+                                    "name": inst.get("name_value"),
+                                }
+                            )
                         else:
-                            seq_fields.append(inst if isinstance(inst, dict) else {})
+                            seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
+
+                def _pick_seq_entry_by_feeder(row_idx: int, gdf_local: gpd.GeoDataFrame) -> dict[str, Any]:
+                    """Choose sequential instance based on feeder type if available, else cycle."""
+                    if not seq_entries:
+                        return {}
+                    feeder_col = None
+                    norm_lookup = {normalize_for_compare(c): c for c in gdf_local.columns}
+                    for cand in ["feeder type", "feeder_type", "feeder category"]:
+                        if normalize_for_compare(cand) in norm_lookup:
+                            feeder_col = norm_lookup[normalize_for_compare(cand)]
+                            break
+                    if feeder_col:
+                        val = gdf_local.iloc[row_idx][feeder_col]
+                        norm_val = normalize_value_for_compare(val)
+                        def _match_entry(target: str) -> dict[str, Any] | None:
+                            for ent in seq_entries:
+                                ident = ent.get("id") or ent.get("name")
+                                ident_norm = normalize_for_compare(ident)
+                                if target in ident_norm:
+                                    return ent
+                            return None
+                        if "line" in norm_val:
+                            chosen = _match_entry("mv3") or _match_entry("3")
+                            if chosen:
+                                return chosen
+                        if "transformer" in norm_val:
+                            chosen = _match_entry("mv1") or _match_entry("1")
+                            if chosen:
+                                return chosen
+                    return seq_entries[row_idx % len(seq_entries)]
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
                     gpkg_path = Path(tmp.name)
@@ -2223,10 +2262,10 @@ def run_app() -> None:
                             fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                             out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
                     # If still no matches and sequential instances are provided, distribute them across rows.
-                    if matched_hits == 0 and seq_fields:
-                        seq = seq_fields
+                    if matched_hits == 0 and seq_entries:
                         for idx_row in range(n):
-                            inst_fields = seq[idx_row % len(seq)]
+                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                            inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
                                     continue
@@ -2237,10 +2276,10 @@ def run_app() -> None:
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
-                    if seq_fields:
-                        seq = seq_fields
+                    if seq_entries:
                         for idx_row in range(n):
-                            inst_fields = seq[idx_row % len(seq)]
+                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                            inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
                                     continue
@@ -2388,7 +2427,7 @@ def run_app() -> None:
                                 instance_map=inst_map,
                                 default_fields=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
-                                sequential_instances=[inst.get("fields", {}) for inst in device_instances]
+                                sequential_instances=device_instances
                                 if normalize_for_compare(device_choice) in SEQUENTIAL_FILL_DEVICES
                                 else None,
                             )
@@ -2452,9 +2491,7 @@ def run_app() -> None:
                                 device_for_file,
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
-                                sequential_instances=[
-                                    i.get("fields", {}) for i in instance_cache.get(device_for_file, [])
-                                ]
+                                sequential_instances=instance_cache.get(device_for_file, [])
                                 if normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES
                                 else None,
                             )
