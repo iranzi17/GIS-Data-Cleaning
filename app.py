@@ -2082,6 +2082,13 @@ def run_app() -> None:
             else:
                 fill_mode = fill_mode_options[0]
 
+                # UI flag: whether to distribute parsed supervisor instances across features when no matches found
+                seq_assign_fallback = st.checkbox(
+                    "Distribute parsed supervisor instances across features when no matches are found",
+                    value=True,
+                    key="sup_seq_assign",
+                )
+
             def _tokenize(text: str) -> set[str]:
                 return set(
                     t.lower()
@@ -2179,6 +2186,8 @@ def run_app() -> None:
                     parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
                     if not parsed:
                         raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
+                    # keep parsed instances available for fallback sequential assignment
+                    parsed_instances = parsed
                     fm_local = parsed[0].get("fields", {})
                     order_local = parsed[0].get("order", [])
                 if fm_local is None and match_column is None:
@@ -2277,7 +2286,26 @@ def run_app() -> None:
                                 out_cols[f].iat[idx_row] = fill_val
 
                     # If some rows remain unmatched, fill those rows using sequential instances (feeder-aware) without overwriting matched rows.
-                    if seq_entries and len(matched_indices) < n:
+                    if (seq_entries and len(matched_indices) < n) or (
+                        not seq_entries
+                        and 'parsed_instances' in locals()
+                        and len(parsed_instances) > 1
+                        and len(matched_indices) < n
+                        and seq_assign_fallback
+                    ):
+                        # ensure we have seq_entries list to consume
+                        if not seq_entries and 'parsed_instances' in locals() and len(parsed_instances) > 1:
+                            # build seq_entries from parsed_instances (fields + optional id/name)
+                            for inst in parsed_instances:
+                                if isinstance(inst, dict) and "fields" in inst:
+                                    seq_entries.append({
+                                        "fields": inst.get("fields", {}) or {},
+                                        "id": inst.get("id_value"),
+                                        "name": inst.get("name_value"),
+                                    })
+                                else:
+                                    seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
+
                         for idx_row in range(n):
                             if idx_row in matched_indices:
                                 continue
