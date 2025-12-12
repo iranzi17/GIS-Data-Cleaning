@@ -385,6 +385,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             for v in row.iloc[3:]:
                 if pd.notna(v):
                     val = v
+                    break
         # Treat explicit "Not existing" markers as missing
         if isinstance(val, str) and val.strip().lower() == "not existing":
             return pd.NA
