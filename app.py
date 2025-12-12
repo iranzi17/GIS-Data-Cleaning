@@ -1253,14 +1253,6 @@ FILE_MATCH_OVERRIDES = {
         "Substation ID",
         "Feeder Type",
     ],
-    normalize_for_compare("INDOR SWITCHGEAR TABLE"): [
-        "Feeder_ID",
-        "FeederID",
-        "Feeder_Name",
-        "FeederName",
-        "SwitchGearID",
-        "Switchgear ID",
-    ],
     normalize_for_compare("SWITCHGEAR"): [
         "FeederID",
         "Feeder ID",
