@@ -2551,14 +2551,18 @@ def run_app() -> None:
                                     sup_wb_path, sup_sheet, device_for_file
                                 )
                             inst = _pick_instance_for_file(file_obj.name, instance_cache.get(device_for_file, []))
+                            seq_arg = None
+                            cached_instances = instance_cache.get(device_for_file, [])
+                            if len(cached_instances) > 1:
+                                seq_arg = cached_instances
+                            elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
+                                seq_arg = cached_instances
                             out_path, used_layer = fill_one_gpkg(
                                 file_obj,
                                 device_for_file,
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
-                                sequential_instances=instance_cache.get(device_for_file, [])
-                                if normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES
-                                else None,
+                                sequential_instances=seq_arg,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
