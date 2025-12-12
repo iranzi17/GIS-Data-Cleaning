@@ -2234,7 +2234,11 @@ def run_app() -> None:
                     for idx_val, norm_val in norm_target.items():
                         payload = instance_map.get(norm_val)
                         if payload is None:
-                            payload = (default_fields, [])
+                            # If we have multiple instances to distribute, defer filling to the sequential pass.
+                            if seq_entries:
+                                payload = (None, [])
+                            else:
+                                payload = (default_fields, [])
                         fields, _order = payload
                         if not fields:
                             continue
