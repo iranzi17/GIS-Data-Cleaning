@@ -283,6 +283,10 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "telecom_odf": "Control and Protection Panels",
         "highvoltage_line": "Line Bay",
         "transformer_bay": "Transformer Bay",
+        "power_transformer": "Power Transformer/ Stepup Transformer",
+        "powertransformer": "Power Transformer/ Stepup Transformer",
+        "telecom": "Control and Protection Panels",
+        "telecom_odf": "Control and Protection Panels",
     }
     if GPKG_EQUIP_MAP_FILE.exists():
         try:
@@ -1156,6 +1160,10 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("INDOR CB"): "Indoor Circuit Breaker/30kv/15kb",
     normalize_for_compare("INDOR CT"): "Indoor Current Transformer",
     normalize_for_compare("INDOR VT"): "Indoor Voltage Transformer",
+    normalize_for_compare("POWER_TRANSFORMER"): "Power Transformer/ Stepup Transformer",
+    normalize_for_compare("power_transformer"): "Power Transformer/ Stepup Transformer",
+    normalize_for_compare("TELECOM"): "Control and Protection Panels",
+    normalize_for_compare("TELECOM_ODF"): "Control and Protection Panels",
 }
 
 # Columns to drop from output after filling (utility fields used only for matching).
@@ -1256,6 +1264,12 @@ FILE_MATCH_OVERRIDES = {
         "Substation ID",
         "Feeder Type",
     ],
+    normalize_for_compare("POWER_TRANSFORMER"): [
+        "Transformer ID",
+        "TransfomerID",
+        "Transfomer_ID",
+        "TransformerID",
+    ],
     normalize_for_compare("SWITCHGEAR"): [
         "FeederID",
         "Feeder ID",
@@ -1281,6 +1295,12 @@ FILE_MATCH_OVERRIDES = {
         "Voltage Transformer ID",
         "Line Bay ID",
         "LineBayID",
+    ],
+    normalize_for_compare("POWER_TRANSFORMER"): [
+        "Transformer ID",
+        "TransfomerID",
+        "TransformerID",
+        "Transformer Id",
     ],
 }
 
