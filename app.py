@@ -2392,6 +2392,10 @@ def run_app() -> None:
                             filled_fields.append(target_col)
 
                 keep_cols = filled_fields.copy()
+                if match_column and match_column in out_cols:
+                    norm_keep = {normalize_for_compare(c) for c in keep_cols}
+                    if normalize_for_compare(match_column) not in norm_keep:
+                        keep_cols.append(match_column)
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
