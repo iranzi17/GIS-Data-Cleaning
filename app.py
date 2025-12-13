@@ -415,6 +415,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "voltagetransformer_id",
                 "voltagetransfomer_id",
                 "voltage transformer id",
+                "transfomerid",
+                "transfomer id",
                 "transformer_id",
                 "currenttransformer_id",
                 "current transformer id",
