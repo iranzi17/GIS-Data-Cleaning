@@ -2219,6 +2219,20 @@ def run_app() -> None:
                     except Exception:
                         seq_row_indices = list(range(n))
 
+                def _maybe_fill_match_id(idx_row: int, entry: dict[str, Any]) -> None:
+                    if not match_column:
+                        return
+                    if match_column not in out_cols:
+                        return
+                    try:
+                        current_val = out_cols[match_column].iat[idx_row]
+                    except Exception:
+                        return
+                    if pd.isna(current_val) or (isinstance(current_val, str) and current_val.strip() == ""):
+                        new_id = entry.get("id") or entry.get("name")
+                        if new_id:
+                            out_cols[match_column].iat[idx_row] = new_id
+
                 if match_column and instance_map:
                     target_col = match_column if match_column in gdf_sup_local.columns else None
                     if target_col is None:
