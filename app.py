@@ -1737,6 +1737,12 @@ def preferred_match_columns(device_name: str) -> list[str]:
             "SubstationID",
             "SUBSTATION NAMES",
         ],
+        normalize_for_compare("Earthing Transformer"): [
+            "transfomerID",
+            "TransformerID",
+            "Transformer ID",
+            "transfomer ID",
+        ],
     }
     return preferences.get(norm, [])
 
