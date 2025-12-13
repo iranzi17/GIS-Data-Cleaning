@@ -2207,6 +2207,17 @@ def run_app() -> None:
                     out_cols[geom_name] = gdf_sup_local.geometry
                 n = len(gdf_sup_local)
                 filled_fields: list[str] = []
+                if match_column and match_column in gdf_sup_local.columns:
+                    out_cols[match_column] = gdf_sup_local[match_column].copy()
+
+                seq_row_indices = list(range(n))
+                if seq_entries and hasattr(gdf_sup_local, "geometry"):
+                    try:
+                        centroids = gdf_sup_local.geometry.centroid
+                        coords = centroids.apply(lambda g: (getattr(g, "y", 0), getattr(g, "x", 0)))
+                        seq_row_indices = list(coords.sort_values().index)
+                    except Exception:
+                        seq_row_indices = list(range(n))
 
                 if match_column and instance_map:
                     target_col = match_column if match_column in gdf_sup_local.columns else None
@@ -2287,7 +2298,7 @@ def run_app() -> None:
                             out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
                     # If still no matches and sequential instances are provided, distribute them across rows.
                     if matched_hits == 0 and seq_entries:
-                        for idx_row in range(n):
+                        for idx_row in seq_row_indices:
                             entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
@@ -2297,6 +2308,7 @@ def run_app() -> None:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[idx_row] = fill_val
+                            _maybe_fill_match_id(idx_row, entry)
 
                     # If some rows remain unmatched, fill those rows using sequential instances (feeder-aware) without overwriting matched rows.
                     if (seq_entries and len(matched_indices) < n) or (
@@ -2319,7 +2331,7 @@ def run_app() -> None:
                                 else:
                                     seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
 
-                        for idx_row in range(n):
+                        for idx_row in seq_row_indices:
                             if idx_row in matched_indices:
                                 continue
                             entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
@@ -2332,11 +2344,12 @@ def run_app() -> None:
                                 if pd.isna(out_cols[f].iat[idx_row]):
                                     fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                     out_cols[f].iat[idx_row] = fill_val
+                            _maybe_fill_match_id(idx_row, entry)
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
                     if seq_entries:
-                        for idx_row in range(n):
+                        for idx_row in seq_row_indices:
                             entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
@@ -2346,6 +2359,7 @@ def run_app() -> None:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[idx_row] = fill_val
+                            _maybe_fill_match_id(idx_row, entry)
                         filled_fields = [f for f in out_cols.keys() if f != geom_name]
                     else:
                         ordered_keys = order_local if order_local else list(fm_local.keys())
