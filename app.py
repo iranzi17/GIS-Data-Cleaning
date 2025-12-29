@@ -4,6 +4,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
+import math
 import unicodedata
 import statistics
 import difflib
@@ -975,6 +976,133 @@ def assign_ct_labels(
     return working
 
 
+def order_indices_by_location(geom: gpd.GeoSeries) -> list[int]:
+    """Return geometry indices ordered by location using a dominant-axis sort with band grouping."""
+    if geom is None:
+        return []
+    coords: list[tuple[int, float, float]] = []
+    missing: list[int] = []
+    for idx, g in geom.items():
+        if g is None or getattr(g, "is_empty", True):
+            missing.append(idx)
+            continue
+        try:
+            pt = g if getattr(g, "geom_type", "") == "Point" else g.centroid
+        except Exception:
+            missing.append(idx)
+            continue
+        if pt is None or getattr(pt, "is_empty", True):
+            missing.append(idx)
+            continue
+        try:
+            x = float(pt.x)
+            y = float(pt.y)
+        except Exception:
+            missing.append(idx)
+            continue
+        coords.append((idx, x, y))
+
+    if len(coords) <= 1:
+        return [idx for idx, _, _ in coords] + missing
+
+    xs = [x for _, x, _ in coords]
+    ys = [y for _, _, y in coords]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    dxs = [x - mean_x for x in xs]
+    dys = [y - mean_y for y in ys]
+
+    var_x = sum(d * d for d in dxs) / len(dxs)
+    var_y = sum(d * d for d in dys) / len(dys)
+    cov_xy = sum(dx * dy for dx, dy in zip(dxs, dys)) / len(dxs)
+
+    if var_x < 1e-12 and var_y < 1e-12:
+        ordered = sorted(coords, key=lambda t: (t[2], t[1]))
+        return [idx for idx, _, _ in ordered] + missing
+
+    trace = var_x + var_y
+    det = var_x * var_y - cov_xy * cov_xy
+    disc = max(trace * trace / 4 - det, 0.0)
+    lambda1 = trace / 2 + math.sqrt(disc)
+
+    if abs(cov_xy) > 1e-12:
+        vx = cov_xy
+        vy = lambda1 - var_x
+    else:
+        if var_x >= var_y:
+            vx, vy = 1.0, 0.0
+        else:
+            vx, vy = 0.0, 1.0
+
+    norm = math.hypot(vx, vy)
+    if norm < 1e-12:
+        vx, vy = (1.0, 0.0) if var_x >= var_y else (0.0, 1.0)
+        norm = 1.0
+    ux, uy = vx / norm, vy / norm
+
+    # Orient axis to keep ordering stable (north/east positive).
+    if abs(uy) < 1e-9:
+        if ux < 0:
+            ux, uy = -ux, -uy
+    elif uy < 0:
+        ux, uy = -ux, -uy
+
+    along_perp: list[tuple[int, float, float]] = []
+    for idx, x, y in coords:
+        dx = x - mean_x
+        dy = y - mean_y
+        along = dx * ux + dy * uy
+        perp = -dx * uy + dy * ux
+        along_perp.append((idx, along, perp))
+
+    perp_sorted = sorted(along_perp, key=lambda t: t[2])
+    perps = [p for _, _, p in perp_sorted]
+    if len(perps) < 2:
+        ordered = sorted(along_perp, key=lambda t: t[1])
+        return [idx for idx, _, _ in ordered] + missing
+
+    diffs = [perps[i + 1] - perps[i] for i in range(len(perps) - 1)]
+    diffs_sorted = sorted(diffs)
+    median_diff = diffs_sorted[len(diffs_sorted) // 2]
+    abs_dev = [abs(d - median_diff) for d in diffs_sorted]
+    mad = sorted(abs_dev)[len(abs_dev) // 2] if abs_dev else 0.0
+    # Only split when gaps are clearly larger than the typical spacing.
+    gap_threshold = max(median_diff * 3, median_diff + 3 * mad)
+
+    if gap_threshold <= 0:
+        ordered = sorted(along_perp, key=lambda t: t[1])
+        return [idx for idx, _, _ in ordered] + missing
+
+    groups: list[list[tuple[int, float, float]]] = []
+    current: list[tuple[int, float, float]] = []
+    last_perp: float | None = None
+    for item in perp_sorted:
+        if last_perp is None:
+            current = [item]
+        elif item[2] - last_perp > gap_threshold:
+            groups.append(current)
+            current = [item]
+        else:
+            current.append(item)
+        last_perp = item[2]
+    if current:
+        groups.append(current)
+
+    if len(groups) <= 1:
+        ordered = sorted(along_perp, key=lambda t: t[1])
+        return [idx for idx, _, _ in ordered] + missing
+
+    def _group_median(group: list[tuple[int, float, float]]) -> float:
+        return statistics.median([p[2] for p in group])
+
+    ordered_indices: list[int] = []
+    for group in sorted(groups, key=_group_median):
+        group_sorted = sorted(group, key=lambda t: t[1])
+        ordered_indices.extend([idx for idx, _, _ in group_sorted])
+
+    return ordered_indices + missing
+
+
 def load_schema_fields(
     schema_path: Path,
     sheet_name: str,
@@ -1177,6 +1305,11 @@ SEQUENTIAL_FILL_DEVICES = {
     normalize_for_compare("Indoor Circuit Breaker/30kv/15kb"),
     normalize_for_compare("Indoor Current Transformer"),
     normalize_for_compare("Indoor Voltage Transformer"),
+}
+
+# Devices where sequential assignment should use grouped blocks instead of interleaving.
+BLOCK_ASSIGN_DEVICES = {
+    normalize_for_compare("High Voltage Line"),
 }
 
 # Hard overrides for filename -> preferred match columns.
@@ -2172,8 +2305,32 @@ def run_app() -> None:
                         else:
                             seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
 
-                def _pick_seq_entry_by_feeder(row_idx: int, gdf_local: gpd.GeoDataFrame) -> dict[str, Any]:
-                    """Choose sequential instance based on feeder type if available, else cycle."""
+                block_assign = normalize_for_compare(device_name) in BLOCK_ASSIGN_DEVICES
+
+                def _build_seq_entry_order(total_rows: int, total_entries: int) -> list[int]:
+                    if total_rows <= 0 or total_entries <= 0:
+                        return []
+                    if not block_assign or total_entries == 1:
+                        return [i % total_entries for i in range(total_rows)]
+                    base = total_rows // total_entries
+                    remainder = total_rows % total_entries
+                    order: list[int] = []
+                    for entry_idx in range(total_entries):
+                        size = base + (1 if entry_idx < remainder else 0)
+                        if size <= 0:
+                            continue
+                        order.extend([entry_idx] * size)
+                    if len(order) < total_rows:
+                        order.extend([total_entries - 1] * (total_rows - len(order)))
+                    return order[:total_rows]
+
+                def _pick_seq_entry_by_feeder(
+                    row_idx: int,
+                    row_rank: int,
+                    gdf_local: gpd.GeoDataFrame,
+                    seq_order: list[int],
+                ) -> dict[str, Any]:
+                    """Choose sequential instance based on feeder type if available, else follow ordered groups."""
                     if not seq_entries:
                         return {}
                     feeder_col = None
@@ -2183,7 +2340,10 @@ def run_app() -> None:
                             feeder_col = norm_lookup[normalize_for_compare(cand)]
                             break
                     if feeder_col:
-                        val = gdf_local.iloc[row_idx][feeder_col]
+                        try:
+                            val = gdf_local.loc[row_idx, feeder_col]
+                        except Exception:
+                            val = gdf_local.iloc[row_rank][feeder_col] if row_rank < len(gdf_local) else None
                         norm_val = normalize_value_for_compare(val)
                         def _match_entry(target: str) -> dict[str, Any] | None:
                             for ent in seq_entries:
@@ -2200,7 +2360,9 @@ def run_app() -> None:
                             chosen = _match_entry("mv1") or _match_entry("1")
                             if chosen:
                                 return chosen
-                    return seq_entries[row_idx % len(seq_entries)]
+                    if seq_order and row_rank < len(seq_order):
+                        return seq_entries[seq_order[row_rank]]
+                    return seq_entries[row_rank % len(seq_entries)]
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
                     tmp.write(file_obj.getbuffer())
                     gpkg_path = Path(tmp.name)
@@ -2231,13 +2393,12 @@ def run_app() -> None:
                     out_cols[match_column] = gdf_sup_local[match_column].copy()
 
                 seq_row_indices = list(range(n))
-                if seq_entries and hasattr(gdf_sup_local, "geometry"):
+                if hasattr(gdf_sup_local, "geometry"):
                     try:
-                        centroids = gdf_sup_local.geometry.centroid
-                        coords = centroids.apply(lambda g: (getattr(g, "y", 0), getattr(g, "x", 0)))
-                        seq_row_indices = list(coords.sort_values().index)
+                        seq_row_indices = order_indices_by_location(gdf_sup_local.geometry)
                     except Exception:
                         seq_row_indices = list(range(n))
+                seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
 
                 def _maybe_fill_match_id(idx_row: int, entry: dict[str, Any]) -> None:
                     if not match_column:
@@ -2332,8 +2493,8 @@ def run_app() -> None:
                             out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
                     # If still no matches and sequential instances are provided, distribute them across rows.
                     if matched_hits == 0 and seq_entries:
-                        for idx_row in seq_row_indices:
-                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                        for row_rank, idx_row in enumerate(seq_row_indices):
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2364,11 +2525,12 @@ def run_app() -> None:
                                     })
                                 else:
                                     seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
+                            seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
 
-                        for idx_row in seq_row_indices:
+                        for row_rank, idx_row in enumerate(seq_row_indices):
                             if idx_row in matched_indices:
                                 continue
-                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2383,8 +2545,8 @@ def run_app() -> None:
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
                     if seq_entries:
-                        for idx_row in seq_row_indices:
-                            entry = _pick_seq_entry_by_feeder(idx_row, gdf_sup_local)
+                        for row_rank, idx_row in enumerate(seq_row_indices):
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
