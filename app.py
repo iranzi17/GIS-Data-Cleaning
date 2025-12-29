@@ -21,6 +21,7 @@ import streamlit as st
 # =====================================================================
 BASE_DIR = Path(__file__).parent
 REFERENCE_DATA_DIR = BASE_DIR / "reference_data"
+SUPERVISOR_WORKBOOK_DIR = BASE_DIR / "supervisor_workbooks"
 # Preferred workbook order: newest first; falls back to any available in reference_data.
 WORKBOOK_PRIORITY = [
     "SUBSTATION 1-25102025.xlsx",
@@ -124,6 +125,18 @@ def list_reference_workbooks() -> dict[str, Path]:
         for p in sorted(REFERENCE_DATA_DIR.glob("**/*")):
             if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS:
                 label = p.relative_to(REFERENCE_DATA_DIR).as_posix()
+                workbooks[label] = p
+    return workbooks
+
+
+@st.cache_data(show_spinner=False)
+def list_supervisor_workbooks() -> dict[str, Path]:
+    """Return mapping of display label -> supervisor workbook path."""
+    workbooks = {}
+    if SUPERVISOR_WORKBOOK_DIR.exists():
+        for p in sorted(SUPERVISOR_WORKBOOK_DIR.glob("**/*")):
+            if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS:
+                label = p.relative_to(SUPERVISOR_WORKBOOK_DIR).as_posix()
                 workbooks[label] = p
     return workbooks
 
@@ -2416,12 +2429,17 @@ def run_app() -> None:
     sup_gpkg_files = st.file_uploader(
         "Upload device GeoPackage (GPKG)", type=["gpkg"], accept_multiple_files=True, key="sup_gpkg"
     )
-    sup_wb = st.file_uploader("Upload supervisor workbook (Electric device format)", type=["xlsx", "xlsm"], key="sup_wb")
-    if sup_gpkg_files and sup_wb:
+    sup_wb_files = list_supervisor_workbooks()
+    sup_wb_path = None
+    if sup_wb_files:
+        st.caption(f"Supervisor workbooks folder: {SUPERVISOR_WORKBOOK_DIR}")
+        sup_wb_label = st.selectbox("Supervisor workbook (Electric device format)", list(sup_wb_files.keys()), key="sup_wb_select")
+        sup_wb_path = sup_wb_files[sup_wb_label]
+    else:
+        st.info(f"Add supervisor workbooks to: {SUPERVISOR_WORKBOOK_DIR}")
+
+    if sup_gpkg_files and sup_wb_path:
         try:
-            with tempfile.NamedTemporaryFile(suffix=Path(sup_wb.name).suffix, delete=False) as tmpw:
-                tmpw.write(sup_wb.getbuffer())
-                sup_wb_path = Path(tmpw.name)
             sup_excel = pd.ExcelFile(sup_wb_path)
             sup_sheet = st.selectbox("Supervisor sheet", sup_excel.sheet_names, key="sup_sheet")
             raw_sup = pd.read_excel(sup_wb_path, sheet_name=sup_sheet, dtype=str, header=None)
