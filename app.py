@@ -1103,6 +1103,178 @@ def order_indices_by_location(geom: gpd.GeoSeries) -> list[int]:
     return ordered_indices + missing
 
 
+def group_indices_by_perp_gap(geom: gpd.GeoSeries, group_count: int) -> dict[int, int]:
+    """Group geometry indices into contiguous bands based on perpendicular gaps."""
+    if geom is None or group_count <= 0:
+        return {}
+
+    coords: list[tuple[int, float, float]] = []
+    missing: list[int] = []
+    for idx, g in geom.items():
+        if g is None or getattr(g, "is_empty", True):
+            missing.append(idx)
+            continue
+        try:
+            pt = g if getattr(g, "geom_type", "") == "Point" else g.centroid
+        except Exception:
+            missing.append(idx)
+            continue
+        if pt is None or getattr(pt, "is_empty", True):
+            missing.append(idx)
+            continue
+        try:
+            x = float(pt.x)
+            y = float(pt.y)
+        except Exception:
+            missing.append(idx)
+            continue
+        coords.append((idx, x, y))
+
+    if len(coords) <= 1:
+        mapping = {idx: 0 for idx, _, _ in coords}
+        for idx in missing:
+            mapping[idx] = 0
+        return mapping
+
+    xs = [x for _, x, _ in coords]
+    ys = [y for _, _, y in coords]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    dxs = [x - mean_x for x in xs]
+    dys = [y - mean_y for y in ys]
+
+    var_x = sum(d * d for d in dxs) / len(dxs)
+    var_y = sum(d * d for d in dys) / len(dys)
+    cov_xy = sum(dx * dy for dx, dy in zip(dxs, dys)) / len(dxs)
+
+    if var_x < 1e-12 and var_y < 1e-12:
+        ordered = sorted(coords, key=lambda t: (t[2], t[1]))
+        mapping = {idx: 0 for idx, _, _ in ordered}
+        for idx in missing:
+            mapping[idx] = 0
+        return mapping
+
+    trace = var_x + var_y
+    det = var_x * var_y - cov_xy * cov_xy
+    disc = max(trace * trace / 4 - det, 0.0)
+    lambda1 = trace / 2 + math.sqrt(disc)
+
+    if abs(cov_xy) > 1e-12:
+        vx = cov_xy
+        vy = lambda1 - var_x
+    else:
+        if var_x >= var_y:
+            vx, vy = 1.0, 0.0
+        else:
+            vx, vy = 0.0, 1.0
+
+    norm = math.hypot(vx, vy)
+    if norm < 1e-12:
+        vx, vy = (1.0, 0.0) if var_x >= var_y else (0.0, 1.0)
+        norm = 1.0
+    ux, uy = vx / norm, vy / norm
+
+    if abs(uy) < 1e-9:
+        if ux < 0:
+            ux, uy = -ux, -uy
+    elif uy < 0:
+        ux, uy = -ux, -uy
+
+    items: list[tuple[int, float, float]] = []
+    for idx, x, y in coords:
+        dx = x - mean_x
+        dy = y - mean_y
+        along = dx * ux + dy * uy
+        perp = -dx * uy + dy * ux
+        items.append((idx, along, perp))
+
+    items.sort(key=lambda t: t[2])
+    group_count = max(1, min(group_count, len(items)))
+
+    groups: list[list[tuple[int, float, float]]] = [[item] for item in items]
+    # Merge the closest neighboring bands until we have the requested count.
+    while len(groups) > group_count:
+        gaps = [
+            groups[i + 1][0][2] - groups[i][-1][2]
+            for i in range(len(groups) - 1)
+        ]
+        merge_idx = gaps.index(min(gaps))
+        groups[merge_idx].extend(groups[merge_idx + 1])
+        del groups[merge_idx + 1]
+
+    mapping: dict[int, int] = {}
+    for group_id, group in enumerate(groups):
+        group_sorted = sorted(group, key=lambda t: t[1])
+        for idx, _, _ in group_sorted:
+            mapping[idx] = group_id
+    for idx in missing:
+        mapping[idx] = min(group_count - 1, len(groups) - 1)
+    return mapping
+
+
+def build_spatial_match_targets(
+    line_gdf: gpd.GeoDataFrame,
+    bay_path: Path,
+    bay_layer: str | None,
+    bay_field: str | None,
+) -> pd.Series:
+    """Return normalized match targets for each line feature based on Line Bay polygons."""
+    if line_gdf is None or line_gdf.empty or bay_path is None or bay_layer is None or bay_field is None:
+        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+    try:
+        bay_gdf = gpd.read_file(bay_path, layer=bay_layer)
+    except Exception:
+        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+    if bay_field not in bay_gdf.columns or not hasattr(bay_gdf, "geometry"):
+        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+
+    geom_name = bay_gdf.geometry.name
+    bay = bay_gdf[[bay_field, geom_name]].copy()
+    try:
+        bay = bay[bay[geom_name].notna() & ~bay[geom_name].is_empty]
+    except Exception:
+        pass
+    if line_gdf.crs is not None and bay.crs is not None and line_gdf.crs != bay.crs:
+        try:
+            bay = bay.to_crs(line_gdf.crs)
+        except Exception:
+            pass
+
+    try:
+        joined = gpd.sjoin(line_gdf, bay, how="left", predicate="intersects", rsuffix="bay")
+    except TypeError:
+        joined = gpd.sjoin(line_gdf, bay, how="left", op="intersects", rsuffix="bay")
+    except Exception:
+        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+
+    field_name = bay_field
+    if field_name not in joined.columns:
+        alt = f"{bay_field}_bay"
+        field_name = alt if alt in joined.columns else bay_field
+
+    if joined.index.duplicated().any():
+        try:
+            joined["_left_index"] = joined.index
+            right_geom = bay.geometry
+            def _inter_len(row: pd.Series) -> float:
+                try:
+                    idx_right = row.get("index_right")
+                    if pd.isna(idx_right):
+                        return 0.0
+                    return row.geometry.intersection(right_geom.loc[idx_right]).length
+                except Exception:
+                    return 0.0
+            joined["__inter_len__"] = joined.apply(_inter_len, axis=1)
+            joined = joined.sort_values("__inter_len__", ascending=False).drop_duplicates(subset="_left_index")
+            joined = joined.set_index("_left_index")
+        except Exception:
+            joined = joined[~joined.index.duplicated(keep="first")]
+
+    series = joined[field_name] if field_name in joined.columns else pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+    series = series.reindex(line_gdf.index)
+    return series.map(normalize_value_for_compare)
+
+
 def load_schema_fields(
     schema_path: Path,
     sheet_name: str,
@@ -1309,6 +1481,10 @@ SEQUENTIAL_FILL_DEVICES = {
 
 # Devices where sequential assignment should use grouped blocks instead of interleaving.
 BLOCK_ASSIGN_DEVICES = {
+    normalize_for_compare("High Voltage Line"),
+}
+
+LINE_BAY_SPATIAL_DEVICES = {
     normalize_for_compare("High Voltage Line"),
 }
 
@@ -2224,6 +2400,56 @@ def run_app() -> None:
             raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
             device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
             device_choice = st.selectbox("Device entry", device_options, key="sup_device")
+            line_bay_info = None
+            if normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES:
+                line_bay_gpkg = st.file_uploader(
+                    "Optional Line Bay polygons (GPKG) for spatial matching",
+                    type=["gpkg"],
+                    key="sup_line_bay_gpkg",
+                )
+                if line_bay_gpkg is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmplb:
+                        tmplb.write(line_bay_gpkg.getbuffer())
+                        line_bay_path = Path(tmplb.name)
+                    line_bay_layers = list_gpkg_layers(line_bay_path)
+                    if not line_bay_layers:
+                        st.warning("No layers found in Line Bay GeoPackage.")
+                    else:
+                        line_bay_layer = st.selectbox("Line Bay layer", line_bay_layers, key="sup_line_bay_layer")
+                        try:
+                            gdf_bay_preview = gpd.read_file(line_bay_path, layer=line_bay_layer)
+                            geom_col = gdf_bay_preview.geometry.name if hasattr(gdf_bay_preview, "geometry") else None
+                            candidate_cols = [c for c in gdf_bay_preview.columns if c != geom_col]
+                            if candidate_cols:
+                                def _score_bay_col(col: str) -> int:
+                                    norm = normalize_for_compare(col)
+                                    score = 0
+                                    for kw in ["name", "line", "bay", "id"]:
+                                        if kw in norm:
+                                            score += 1
+                                    return score
+                                default_col = sorted(candidate_cols, key=lambda c: (-_score_bay_col(c), len(c)))[0]
+                                line_bay_field = st.selectbox(
+                                    "Line Bay name field",
+                                    candidate_cols,
+                                    index=candidate_cols.index(default_col),
+                                    key="sup_line_bay_field",
+                                )
+                                use_line_bay_match = st.checkbox(
+                                    "Use Line Bay polygons to assign High Voltage Line attributes",
+                                    value=True,
+                                    key="sup_line_bay_use",
+                                )
+                                if use_line_bay_match:
+                                    line_bay_info = {
+                                        "path": line_bay_path,
+                                        "layer": line_bay_layer,
+                                        "field": line_bay_field,
+                                    }
+                            else:
+                                st.warning("No attribute columns found in Line Bay layer.")
+                        except Exception:
+                            st.warning("Could not read Line Bay layer to select a name field.")
             equip_map_sup = load_gpkg_equipment_map()
             device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
             instance_labels = [inst["label"] for inst in device_instances]
@@ -2289,6 +2515,7 @@ def run_app() -> None:
                 default_fields: dict[str, Any] | None = None,
                 field_order: list[str] | None = None,
                 sequential_instances: list[dict[str, Any]] | None = None,
+                line_bay_info: dict[str, Any] | None = None,
             ) -> tuple[Path, str]:
                 # normalize sequential_instances to a list of entries with fields + optional ids
                 seq_entries: list[dict[str, Any]] = []
@@ -2329,6 +2556,7 @@ def run_app() -> None:
                     row_rank: int,
                     gdf_local: gpd.GeoDataFrame,
                     seq_order: list[int],
+                    group_map: dict[int, int] | None,
                 ) -> dict[str, Any]:
                     """Choose sequential instance based on feeder type if available, else follow ordered groups."""
                     if not seq_entries:
@@ -2360,6 +2588,10 @@ def run_app() -> None:
                             chosen = _match_entry("mv1") or _match_entry("1")
                             if chosen:
                                 return chosen
+                    if group_map and row_idx in group_map:
+                        group_idx = group_map[row_idx]
+                        if 0 <= group_idx < len(seq_entries):
+                            return seq_entries[group_idx]
                     if seq_order and row_rank < len(seq_order):
                         return seq_entries[seq_order[row_rank]]
                     return seq_entries[row_rank % len(seq_entries)]
@@ -2399,6 +2631,28 @@ def run_app() -> None:
                     except Exception:
                         seq_row_indices = list(range(n))
                 seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
+                seq_group_map = None
+                if block_assign and seq_entries and hasattr(gdf_sup_local, "geometry"):
+                    try:
+                        seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
+                    except Exception:
+                        seq_group_map = None
+                spatial_norm_target = None
+                if (
+                    instance_map
+                    and line_bay_info
+                    and normalize_for_compare(device_name) in LINE_BAY_SPATIAL_DEVICES
+                    and hasattr(gdf_sup_local, "geometry")
+                ):
+                    try:
+                        spatial_norm_target = build_spatial_match_targets(
+                            gdf_sup_local,
+                            line_bay_info.get("path"),
+                            line_bay_info.get("layer"),
+                            line_bay_info.get("field"),
+                        )
+                    except Exception:
+                        spatial_norm_target = None
 
                 def _maybe_fill_match_id(idx_row: int, entry: dict[str, Any]) -> None:
                     if not match_column:
@@ -2414,11 +2668,28 @@ def run_app() -> None:
                         if new_id:
                             out_cols[match_column].iat[idx_row] = new_id
 
-                if match_column and instance_map:
-                    target_col = match_column if match_column in gdf_sup_local.columns else None
-                    if target_col is None:
-                        raise ValueError(f"Match column '{match_column}' not found in layer '{layer}'.")
-                    norm_target = gdf_sup_local[target_col].map(normalize_value_for_compare)
+                if instance_map and (match_column or spatial_norm_target is not None):
+                    match_norm_target = None
+                    if match_column:
+                        if match_column in gdf_sup_local.columns:
+                            match_norm_target = gdf_sup_local[match_column].map(normalize_value_for_compare)
+                        elif spatial_norm_target is None:
+                            raise ValueError(f"Match column '{match_column}' not found in layer '{layer}'.")
+                    if match_norm_target is not None:
+                        match_norm_target = match_norm_target.reindex(gdf_sup_local.index)
+                    if spatial_norm_target is not None:
+                        spatial_norm_target = spatial_norm_target.reindex(gdf_sup_local.index)
+
+                    norm_target = match_norm_target
+                    if spatial_norm_target is not None:
+                        if norm_target is None:
+                            norm_target = spatial_norm_target
+                        else:
+                            norm_target = spatial_norm_target.copy()
+                            missing = norm_target.isna() | (norm_target == "")
+                            norm_target.loc[missing] = match_norm_target.loc[missing]
+                    if norm_target is None:
+                        norm_target = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
                     # initialize output columns for all fields we might fill
                     all_fields_ordered: list[str] = []
@@ -2494,7 +2765,7 @@ def run_app() -> None:
                     # If still no matches and sequential instances are provided, distribute them across rows.
                     if matched_hits == 0 and seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2526,11 +2797,16 @@ def run_app() -> None:
                                 else:
                                     seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
                             seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
+                            if block_assign and hasattr(gdf_sup_local, "geometry"):
+                                try:
+                                    seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
+                                except Exception:
+                                    seq_group_map = None
 
                         for row_rank, idx_row in enumerate(seq_row_indices):
                             if idx_row in matched_indices:
                                 continue
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2546,7 +2822,7 @@ def run_app() -> None:
                 else:
                     if seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order)
+                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2652,6 +2928,7 @@ def run_app() -> None:
                                     sup_layer,
                                     field_map=inst.get("fields"),
                                     field_order=inst.get("order"),
+                                    line_bay_info=line_bay_info,
                                 )
                                 # create a friendly name per instance
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
@@ -2673,7 +2950,8 @@ def run_app() -> None:
                                 key="sup_download_instances",
                             )
                         elif fill_mode == "Match rows to instances (single GPKG)" and instance_labels:
-                            if not match_column_choice:
+                            use_line_bay_match = line_bay_info is not None
+                            if not match_column_choice and not use_line_bay_match:
                                 raise ValueError("Please select a column to match supervisor instances against.")
                             # build instance map
                             inst_map: dict[str, tuple[dict[str, Any], list[str]]] = {}
@@ -2718,6 +2996,7 @@ def run_app() -> None:
                                 default_fields=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
                                 sequential_instances=seq_arg,
+                                line_bay_info=line_bay_info,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -2735,6 +3014,7 @@ def run_app() -> None:
                                 sup_layer,
                                 field_map=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
+                                line_bay_info=line_bay_info,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -2786,6 +3066,7 @@ def run_app() -> None:
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
                                 sequential_instances=seq_arg,
+                                line_bay_info=line_bay_info,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
