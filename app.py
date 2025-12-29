@@ -1212,6 +1212,29 @@ def group_indices_by_perp_gap(geom: gpd.GeoSeries, group_count: int) -> dict[int
     return mapping
 
 
+def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
+    """Split an instance label into prefix and numeric suffix (e.g., Q1-3 -> Q1, 3)."""
+    if value is None:
+        return None, None
+    try:
+        if pd.isna(value):
+            return None, None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text:
+        return None, None
+    match = re.match(r"^([A-Za-z]+\d+)[-_ ]+(\d+)$", text)
+    if not match:
+        return None, None
+    prefix = match.group(1).strip()
+    try:
+        suffix = int(match.group(2))
+    except Exception:
+        suffix = None
+    return prefix, suffix
+
+
 def build_spatial_match_targets(
     line_gdf: gpd.GeoDataFrame,
     bay_path: Path,
@@ -1482,10 +1505,15 @@ SEQUENTIAL_FILL_DEVICES = {
 # Devices where sequential assignment should use grouped blocks instead of interleaving.
 BLOCK_ASSIGN_DEVICES = {
     normalize_for_compare("High Voltage Line"),
+    normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker"),
 }
 
 LINE_BAY_SPATIAL_DEVICES = {
     normalize_for_compare("High Voltage Line"),
+}
+
+PREFIX_GROUP_DEVICES = {
+    normalize_for_compare("High Voltage Switch/High Voltage Switch"),
 }
 
 # Hard overrides for filename -> preferred match columns.
@@ -2557,6 +2585,7 @@ def run_app() -> None:
                     gdf_local: gpd.GeoDataFrame,
                     seq_order: list[int],
                     group_map: dict[int, int] | None,
+                    prefix_map: dict[int, dict[str, Any]] | None,
                 ) -> dict[str, Any]:
                     """Choose sequential instance based on feeder type if available, else follow ordered groups."""
                     if not seq_entries:
@@ -2588,6 +2617,8 @@ def run_app() -> None:
                             chosen = _match_entry("mv1") or _match_entry("1")
                             if chosen:
                                 return chosen
+                    if prefix_map and row_idx in prefix_map:
+                        return prefix_map[row_idx]
                     if group_map and row_idx in group_map:
                         group_idx = group_map[row_idx]
                         if 0 <= group_idx < len(seq_entries):
@@ -2637,6 +2668,46 @@ def run_app() -> None:
                         seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
                     except Exception:
                         seq_group_map = None
+                prefix_assignment_map: dict[int, dict[str, Any]] | None = None
+                if (
+                    seq_entries
+                    and hasattr(gdf_sup_local, "geometry")
+                    and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
+                ):
+                    prefix_groups: dict[str, list[tuple[int | None, dict[str, Any]]]] = {}
+                    prefix_order: list[str] = []
+                    for inst in seq_entries:
+                        ident = inst.get("id") or inst.get("name")
+                        prefix, suffix = split_instance_prefix_suffix(ident)
+                        if not prefix:
+                            continue
+                        key = normalize_for_compare(prefix)
+                        if key not in prefix_groups:
+                            prefix_groups[key] = []
+                            prefix_order.append(key)
+                        prefix_groups[key].append((suffix, inst))
+                    if prefix_groups:
+                        for key, items in prefix_groups.items():
+                            prefix_groups[key] = sorted(
+                                items,
+                                key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
+                            )
+                        prefix_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(prefix_groups))
+                        group_ids = sorted(set(prefix_group_map.values()))
+                        prefix_by_group: dict[int, str] = {}
+                        for idx, gid in enumerate(group_ids):
+                            prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
+                        prefix_assignment_map = {}
+                        for gid in group_ids:
+                            pref_key = prefix_by_group.get(gid)
+                            if not pref_key:
+                                continue
+                            entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
+                            if not entries:
+                                continue
+                            row_indices = [idx for idx in seq_row_indices if prefix_group_map.get(idx) == gid]
+                            for j, idx_row in enumerate(row_indices):
+                                prefix_assignment_map[idx_row] = entries[j % len(entries)]
                 spatial_norm_target = None
                 if (
                     instance_map
@@ -2765,7 +2836,14 @@ def run_app() -> None:
                     # If still no matches and sequential instances are provided, distribute them across rows.
                     if matched_hits == 0 and seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
+                            entry = _pick_seq_entry_by_feeder(
+                                idx_row,
+                                row_rank,
+                                gdf_sup_local,
+                                seq_entry_order,
+                                seq_group_map,
+                                prefix_assignment_map,
+                            )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2802,11 +2880,63 @@ def run_app() -> None:
                                     seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
                                 except Exception:
                                     seq_group_map = None
+                            if (
+                                seq_entries
+                                and hasattr(gdf_sup_local, "geometry")
+                                and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
+                            ):
+                                prefix_groups = {}
+                                prefix_order = []
+                                for inst in seq_entries:
+                                    ident = inst.get("id") or inst.get("name")
+                                    prefix, suffix = split_instance_prefix_suffix(ident)
+                                    if not prefix:
+                                        continue
+                                    key = normalize_for_compare(prefix)
+                                    if key not in prefix_groups:
+                                        prefix_groups[key] = []
+                                        prefix_order.append(key)
+                                    prefix_groups[key].append((suffix, inst))
+                                if prefix_groups:
+                                    for key, items in prefix_groups.items():
+                                        prefix_groups[key] = sorted(
+                                            items,
+                                            key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
+                                        )
+                                    prefix_group_map = group_indices_by_perp_gap(
+                                        gdf_sup_local.geometry, len(prefix_groups)
+                                    )
+                                    group_ids = sorted(set(prefix_group_map.values()))
+                                    prefix_by_group = {}
+                                    for idx, gid in enumerate(group_ids):
+                                        prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
+                                    prefix_assignment_map = {}
+                                    for gid in group_ids:
+                                        pref_key = prefix_by_group.get(gid)
+                                        if not pref_key:
+                                            continue
+                                        entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
+                                        if not entries:
+                                            continue
+                                        row_indices = [
+                                            idx
+                                            for idx in seq_row_indices
+                                            if prefix_group_map.get(idx) == gid
+                                        ]
+                                        for j, idx_row in enumerate(row_indices):
+                                            prefix_assignment_map[idx_row] = entries[j % len(entries)]
 
                         for row_rank, idx_row in enumerate(seq_row_indices):
                             if idx_row in matched_indices:
                                 continue
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
+                            entry = _pick_seq_entry_by_feeder(
+                                idx_row,
+                                row_rank,
+                                gdf_sup_local,
+                                seq_entry_order,
+                                seq_group_map,
+                                prefix_assignment_map,
+                            )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
@@ -2822,7 +2952,14 @@ def run_app() -> None:
                 else:
                     if seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(idx_row, row_rank, gdf_sup_local, seq_entry_order, seq_group_map)
+                            entry = _pick_seq_entry_by_feeder(
+                                idx_row,
+                                row_rank,
+                                gdf_sup_local,
+                                seq_entry_order,
+                                seq_group_map,
+                                prefix_assignment_map,
+                            )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
                                 if f == geom_name:
