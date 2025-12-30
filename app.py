@@ -1267,6 +1267,65 @@ def group_indices_by_perp_gap(geom: gpd.GeoSeries, group_count: int) -> dict[int
     return mapping
 
 
+def resolve_ups_anchor_point(ups_path: Path, ups_layer: str | None, target_crs) -> Any:
+    """Return a Point anchor from an UPS GeoPackage layer."""
+    if ups_path is None or ups_layer is None:
+        return None
+    try:
+        ups_gdf = gpd.read_file(ups_path, layer=ups_layer)
+    except Exception:
+        return None
+    if ups_gdf.empty or not hasattr(ups_gdf, "geometry"):
+        return None
+    if target_crs is not None and ups_gdf.crs is not None and ups_gdf.crs != target_crs:
+        try:
+            ups_gdf = ups_gdf.to_crs(target_crs)
+        except Exception:
+            pass
+    for geom in ups_gdf.geometry:
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        try:
+            return geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+        except Exception:
+            continue
+    return None
+
+
+def build_protection_layout_points(anchor: Any, count: int, spacing: float) -> list[Any]:
+    """Build protection points in a 2xN grid below the anchor point."""
+    if anchor is None or count <= 0:
+        return []
+    try:
+        x = float(anchor.x)
+        y = float(anchor.y)
+    except Exception:
+        return []
+    if spacing <= 0:
+        spacing = PROTECTION_LAYOUT_SPACING
+    try:
+        from shapely.geometry import Point
+    except Exception:
+        return []
+
+    points: list[Any] = []
+    if count == 1:
+        points.append(Point(x, y - spacing))
+        return points
+    if count == 2:
+        points.append(Point(x - spacing * 0.5, y - spacing))
+        points.append(Point(x + spacing * 0.5, y - spacing))
+        return points
+
+    for i in range(count):
+        row = i // 2
+        col = i % 2
+        x_off = (-0.5 + col) * spacing
+        y_off = -(row + 1) * spacing
+        points.append(Point(x + x_off, y + y_off))
+    return points
+
+
 def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
     """Split an instance label into prefix and numeric suffix (e.g., Q1-3 -> Q1, 3)."""
     if value is None:
@@ -1600,6 +1659,15 @@ LINE_BAY_SPATIAL_DEVICES = {
 PREFIX_GROUP_DEVICES = {
     normalize_for_compare("High Voltage Switch/High Voltage Switch"),
 }
+
+PROTECTION_LAYOUT_DEVICES = {
+    normalize_for_compare("Distance Protection"),
+    normalize_for_compare("Control and Protection Panels"),
+    normalize_for_compare("Transformer Protection"),
+    normalize_for_compare("Line Overcurrent Protection"),
+}
+
+PROTECTION_LAYOUT_SPACING = 2.0
 
 # Hard overrides for filename -> preferred match columns.
 FILE_MATCH_OVERRIDES = {
@@ -2568,6 +2636,40 @@ def run_app() -> None:
                                 st.warning("No attribute columns found in Line Bay layer.")
                         except Exception:
                             st.warning("Could not read Line Bay layer to select a name field.")
+            ups_anchor_info = None
+            if normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES:
+                ups_gpkg = st.file_uploader(
+                    "Optional UPS GeoPackage (GPKG) for protection layout",
+                    type=["gpkg"],
+                    key="sup_ups_gpkg",
+                )
+                if ups_gpkg is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpups:
+                        tmpups.write(ups_gpkg.getbuffer())
+                        ups_path = Path(tmpups.name)
+                    ups_layers = list_gpkg_layers(ups_path)
+                    if not ups_layers:
+                        st.warning("No layers found in UPS GeoPackage.")
+                    else:
+                        ups_layer = st.selectbox("UPS layer", ups_layers, key="sup_ups_layer")
+                        spacing_val = st.number_input(
+                            "Protection layout spacing (map units)",
+                            min_value=0.1,
+                            value=float(PROTECTION_LAYOUT_SPACING),
+                            step=0.1,
+                            key="sup_protection_spacing",
+                        )
+                        use_layout = st.checkbox(
+                            "Place protection devices below UPS",
+                            value=True,
+                            key="sup_protection_layout",
+                        )
+                        if use_layout:
+                            ups_anchor_info = {
+                                "path": ups_path,
+                                "layer": ups_layer,
+                                "spacing": float(spacing_val),
+                            }
             equip_map_sup = load_gpkg_equipment_map()
             device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
             instance_labels = [inst["label"] for inst in device_instances]
@@ -2634,6 +2736,7 @@ def run_app() -> None:
                 field_order: list[str] | None = None,
                 sequential_instances: list[dict[str, Any]] | None = None,
                 line_bay_info: dict[str, Any] | None = None,
+                ups_anchor_info: dict[str, Any] | None = None,
             ) -> tuple[Path, str]:
                 # normalize sequential_instances to a list of entries with fields + optional ids
                 seq_entries: list[dict[str, Any]] = []
@@ -2724,6 +2827,26 @@ def run_app() -> None:
                 if not layer:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
+                layout_applied = False
+                if (
+                    ups_anchor_info
+                    and normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES
+                    and hasattr(gdf_sup_local, "geometry")
+                ):
+                    anchor = resolve_ups_anchor_point(
+                        ups_anchor_info.get("path"),
+                        ups_anchor_info.get("layer"),
+                        gdf_sup_local.crs,
+                    )
+                    try:
+                        spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
+                    except Exception:
+                        spacing_val = PROTECTION_LAYOUT_SPACING
+                    layout_points = build_protection_layout_points(anchor, len(gdf_sup_local), spacing_val)
+                    if layout_points and len(layout_points) == len(gdf_sup_local):
+                        gdf_sup_local = gdf_sup_local.copy()
+                        gdf_sup_local.geometry = layout_points
+                        layout_applied = True
                 fm_local = field_map
                 order_local = field_order or []
                 if fm_local is None and match_column is None:
@@ -2829,7 +2952,7 @@ def run_app() -> None:
                         if new_id:
                             out_cols[match_column].iat[idx_row] = new_id
 
-                if instance_map and (match_column or spatial_norm_target is not None):
+                if instance_map and (match_column or spatial_norm_target is not None or layout_applied):
                     match_norm_target = None
                     if match_column:
                         if match_column in gdf_sup_local.columns:
@@ -3156,6 +3279,7 @@ def run_app() -> None:
                                     field_map=inst.get("fields"),
                                     field_order=inst.get("order"),
                                     line_bay_info=line_bay_info,
+                                    ups_anchor_info=ups_anchor_info,
                                 )
                                 # create a friendly name per instance
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
@@ -3178,7 +3302,11 @@ def run_app() -> None:
                             )
                         elif fill_mode == "Match rows to instances (single GPKG)" and instance_labels:
                             use_line_bay_match = line_bay_info is not None
-                            if not match_column_choice and not use_line_bay_match:
+                            use_ups_layout = (
+                                ups_anchor_info is not None
+                                and normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES
+                            )
+                            if not match_column_choice and not use_line_bay_match and not use_ups_layout:
                                 raise ValueError("Please select a column to match supervisor instances against.")
                             # build instance map
                             inst_map: dict[str, tuple[dict[str, Any], list[str]]] = {}
@@ -3224,6 +3352,7 @@ def run_app() -> None:
                                 field_order=selected_instance.get("order") if selected_instance else None,
                                 sequential_instances=seq_arg,
                                 line_bay_info=line_bay_info,
+                                ups_anchor_info=ups_anchor_info,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -3242,6 +3371,7 @@ def run_app() -> None:
                                 field_map=selected_instance.get("fields") if selected_instance else None,
                                 field_order=selected_instance.get("order") if selected_instance else None,
                                 line_bay_info=line_bay_info,
+                                ups_anchor_info=ups_anchor_info,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -3294,6 +3424,7 @@ def run_app() -> None:
                                 field_order=inst.get("order") if inst else None,
                                 sequential_instances=seq_arg,
                                 line_bay_info=line_bay_info,
+                                ups_anchor_info=ups_anchor_info,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
