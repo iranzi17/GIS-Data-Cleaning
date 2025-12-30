@@ -395,6 +395,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     raw = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
 
     target_norm = normalize_for_compare(device_name)
+    is_protection = target_norm in PROTECTION_LAYOUT_DEVICES
     domain_code_map: dict[str, Any] = {}
     if raw.shape[1] > 4:
         for _, row in raw.iterrows():
@@ -543,6 +544,16 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
 
     current_order: list[str] = []
 
+    def _get_protection_type_cache() -> dict[str, str]:
+        try:
+            cache = st.session_state.get("protection_type_cache")
+            if not isinstance(cache, dict):
+                cache = {}
+                st.session_state["protection_type_cache"] = cache
+            return cache
+        except Exception:
+            return {}
+
     for _, row in raw.iterrows():
         dev_cell = row.iloc[0]
         dev_norm = normalize_for_compare(dev_cell) if pd.notna(dev_cell) else ""
@@ -571,6 +582,23 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             continue
         field_clean = _clean_column_name(field)
         type_str = row.iloc[2] if len(row) > 2 else ""
+        if pd.isna(type_str):
+            type_str = ""
+        if not isinstance(type_str, str):
+            type_str = str(type_str)
+        type_str = type_str.strip()
+        if is_protection:
+            cache = _get_protection_type_cache()
+            cache_key = normalize_for_compare(field_clean)
+            if type_str:
+                cache[cache_key] = type_str
+            else:
+                cached = cache.get(cache_key)
+                if cached:
+                    type_str = cached
+                else:
+                    type_str = "Double"
+                    cache[cache_key] = type_str
         val = _extract_value(row, type_str)
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
