@@ -430,6 +430,16 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                     return True
             return False
 
+        def _looks_like_unit_value(value: Any) -> bool:
+            if value is None:
+                return False
+            text = str(value)
+            if text.strip() == "":
+                return False
+            has_digit = any(ch.isdigit() for ch in text)
+            has_alpha = any(ch.isalpha() for ch in text)
+            return has_digit and has_alpha
+
         val = row.iloc[3] if len(row) > 3 else pd.NA
         domain_code = row.iloc[4] if len(row) > 4 else pd.NA
 
@@ -439,6 +449,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
         if is_numeric and not _is_blank(domain_code):
             return domain_code
         if is_numeric and not _is_blank(val):
+            if _looks_like_unit_value(val) and _is_blank(domain_code):
+                return val
             dom_norm = normalize_value_for_compare(val)
             mapped = domain_code_map.get(dom_norm)
             if mapped is not None and not _is_blank(mapped):
