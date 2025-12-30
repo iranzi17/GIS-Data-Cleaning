@@ -397,17 +397,39 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     instances: list[dict[str, Any]] = []
     current_fields: dict[str, Any] | None = None
 
-    def _extract_value(row: pd.Series) -> Any:
-        val = pd.NA
+    def _extract_value(row: pd.Series, dtype: str) -> Any:
+        def _is_blank(value: Any) -> bool:
+            try:
+                if pd.isna(value):
+                    return True
+            except Exception:
+                pass
+            if value is None:
+                return True
+            if isinstance(value, str):
+                text = value.strip()
+                if text == "":
+                    return True
+                if text.lower() == "not existing":
+                    return True
+            return False
+
+        val = row.iloc[3] if len(row) > 3 else pd.NA
+        domain_code = row.iloc[4] if len(row) > 4 else pd.NA
+
+        norm_type = normalize_for_compare(dtype or "")
+        is_numeric = any(tok in norm_type for tok in ("int", "integer", "long", "short", "bigint", "smallint", "double", "float", "decimal", "real", "number"))
+
+        if is_numeric and not _is_blank(domain_code):
+            return domain_code
+        if not _is_blank(val):
+            return val
+
         if len(row) > 3:
             for v in row.iloc[3:]:
-                if pd.notna(v):
-                    val = v
-                    break
-        # Treat explicit "Not existing" markers as missing
-        if isinstance(val, str) and val.strip().lower() == "not existing":
-            return pd.NA
-        return val
+                if not _is_blank(v):
+                    return v
+        return pd.NA
 
     def _get_by_alias(fields: dict[str, Any], aliases: list[str]) -> Any:
         lookup = {normalize_for_compare(k): k for k in fields}
@@ -529,7 +551,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             continue
         field_clean = _clean_column_name(field)
         type_str = row.iloc[2] if len(row) > 2 else ""
-        val = _extract_value(row)
+        val = _extract_value(row, type_str)
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
         current_fields[field_clean] = coerced
