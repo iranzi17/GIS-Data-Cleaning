@@ -1292,6 +1292,27 @@ def resolve_ups_anchor_point(ups_path: Path, ups_layer: str | None, target_crs) 
     return None
 
 
+def load_ups_anchor_and_crs(ups_path: Path, ups_layer: str | None) -> tuple[Any, Any]:
+    """Return a Point anchor and CRS from an UPS GeoPackage layer."""
+    if ups_path is None or ups_layer is None:
+        return None, None
+    try:
+        ups_gdf = gpd.read_file(ups_path, layer=ups_layer)
+    except Exception:
+        return None, None
+    if ups_gdf.empty or not hasattr(ups_gdf, "geometry"):
+        return None, ups_gdf.crs
+    for geom in ups_gdf.geometry:
+        if geom is None or getattr(geom, "is_empty", True):
+            continue
+        try:
+            anchor = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+            return anchor, ups_gdf.crs
+        except Exception:
+            continue
+    return None, ups_gdf.crs
+
+
 def build_protection_layout_points(anchor: Any, count: int, spacing: float) -> list[Any]:
     """Build protection points in a 2xN grid below the anchor point."""
     if anchor is None or count <= 0:
@@ -1324,6 +1345,40 @@ def build_protection_layout_points(anchor: Any, count: int, spacing: float) -> l
         y_off = -(row + 1) * spacing
         points.append(Point(x + x_off, y + y_off))
     return points
+
+
+def build_device_gdf_from_instances(
+    instances: list[dict[str, Any]],
+    points: list[Any],
+    crs,
+) -> gpd.GeoDataFrame:
+    """Build a GeoDataFrame with instance fields aligned to generated points."""
+    count = len(points)
+    if count <= 0:
+        return gpd.GeoDataFrame(geometry=[])
+    fields_ordered: list[str] = []
+    fields_seen: set[str] = set()
+    for inst in instances:
+        for f in inst.get("order", []) or []:
+            if f not in fields_seen:
+                fields_seen.add(f)
+                fields_ordered.append(f)
+        for f in (inst.get("fields", {}) or {}).keys():
+            if f not in fields_seen:
+                fields_seen.add(f)
+                fields_ordered.append(f)
+    data: dict[str, list[Any]] = {f: [pd.NA] * count for f in fields_ordered}
+    for idx, inst in enumerate(instances):
+        if idx >= count:
+            break
+        fields = inst.get("fields", {}) or {}
+        for f, val in fields.items():
+            if f not in data:
+                data[f] = [pd.NA] * count
+            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+            data[f][idx] = fill_val
+    out_gdf = gpd.GeoDataFrame(data, geometry=points, crs=crs)
+    return sanitize_gdf_for_gpkg(out_gdf)
 
 
 def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
@@ -2588,6 +2643,7 @@ def run_app() -> None:
             device_choice = st.selectbox("Device entry", device_options, key="sup_device")
             equip_map_sup = load_gpkg_equipment_map()
             protection_in_uploads = False
+            ups_upload_candidate = None
             if sup_gpkg_files:
                 for file_obj in sup_gpkg_files:
                     try:
@@ -2596,7 +2652,16 @@ def run_app() -> None:
                         continue
                     if normalize_for_compare(dev_name) in PROTECTION_LAYOUT_DEVICES:
                         protection_in_uploads = True
-                        break
+                    if (
+                        ups_upload_candidate is None
+                        and normalize_for_compare(dev_name) == normalize_for_compare("Uninterruptable power supply(UPS)")
+                    ):
+                        ups_upload_candidate = file_obj
+                if ups_upload_candidate is None:
+                    for file_obj in sup_gpkg_files:
+                        if "ups" in normalize_for_compare(Path(file_obj.name).stem):
+                            ups_upload_candidate = file_obj
+                            break
             line_bay_info = None
             if normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES:
                 line_bay_gpkg = st.file_uploader(
@@ -2649,9 +2714,14 @@ def run_app() -> None:
                             st.warning("Could not read Line Bay layer to select a name field.")
             ups_anchor_info = None
             needs_protection_layout = (
-                normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES or protection_in_uploads
+                normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES
+                or protection_in_uploads
+                or ups_upload_candidate is not None
             )
             if needs_protection_layout:
+                ups_path = None
+                ups_layer = None
+                ups_label = None
                 ups_gpkg = st.file_uploader(
                     "Optional UPS GeoPackage (GPKG) for protection layout",
                     type=["gpkg"],
@@ -2661,29 +2731,47 @@ def run_app() -> None:
                     with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpups:
                         tmpups.write(ups_gpkg.getbuffer())
                         ups_path = Path(tmpups.name)
+                    ups_label = ups_gpkg.name
                     ups_layers = list_gpkg_layers(ups_path)
                     if not ups_layers:
                         st.warning("No layers found in UPS GeoPackage.")
                     else:
                         ups_layer = st.selectbox("UPS layer", ups_layers, key="sup_ups_layer")
-                        spacing_val = st.number_input(
-                            "Protection layout spacing (map units)",
-                            min_value=0.1,
-                            value=float(PROTECTION_LAYOUT_SPACING),
-                            step=0.1,
-                            key="sup_protection_spacing",
+                elif ups_upload_candidate is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpups:
+                        tmpups.write(ups_upload_candidate.getbuffer())
+                        ups_path = Path(tmpups.name)
+                    ups_label = ups_upload_candidate.name
+                    ups_layers = list_gpkg_layers(ups_path)
+                    if not ups_layers:
+                        st.warning("No layers found in UPS GeoPackage from uploads.")
+                    else:
+                        ups_layer = st.selectbox(
+                            "UPS layer (from uploaded GPKGs)", ups_layers, key="sup_ups_layer_auto"
                         )
-                        use_layout = st.checkbox(
-                            "Place protection devices below UPS",
-                            value=True,
-                            key="sup_protection_layout",
-                        )
-                        if use_layout:
-                            ups_anchor_info = {
-                                "path": ups_path,
-                                "layer": ups_layer,
-                                "spacing": float(spacing_val),
-                            }
+                if ups_path and ups_layer:
+                    if ups_label:
+                        st.caption(f"Using UPS source: {ups_label}")
+                    spacing_val = st.number_input(
+                        "Protection layout spacing (map units)",
+                        min_value=0.1,
+                        value=float(PROTECTION_LAYOUT_SPACING),
+                        step=0.1,
+                        key="sup_protection_spacing",
+                    )
+                    use_layout = st.checkbox(
+                        "Place protection devices below UPS",
+                        value=True,
+                        key="sup_protection_layout",
+                    )
+                    if use_layout:
+                        ups_anchor_info = {
+                            "path": ups_path,
+                            "layer": ups_layer,
+                            "spacing": float(spacing_val),
+                        }
+                elif ups_upload_candidate is None:
+                    st.info("Upload an UPS GeoPackage or include UPS among uploads to place protection devices.")
             device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
             instance_labels = [inst["label"] for inst in device_instances]
             selected_instance = None
@@ -3422,6 +3510,7 @@ def run_app() -> None:
                     logs: list[str] = []
                     outputs: list[tuple[str, Path]] = []
                     instance_cache: dict[str, list[dict[str, Any]]] = {}
+                    uploaded_device_norms: set[str] = set()
 
                     def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
                         if not instances:
@@ -3438,6 +3527,7 @@ def run_app() -> None:
                     for file_obj in sup_gpkg_files:
                         try:
                             device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
+                            uploaded_device_norms.add(normalize_for_compare(device_for_file))
                             if device_for_file not in instance_cache:
                                 instance_cache[device_for_file] = parse_supervisor_device_table(
                                     sup_wb_path, sup_sheet, device_for_file
@@ -3489,6 +3579,42 @@ def run_app() -> None:
                             )
                         except Exception as exc:
                             logs.append(f"{file_obj.name}: failed ({exc}).")
+
+                    if ups_anchor_info:
+                        protection_devices = [
+                            dev
+                            for dev in device_options
+                            if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
+                        ]
+                        anchor, anchor_crs = load_ups_anchor_and_crs(
+                            ups_anchor_info.get("path"),
+                            ups_anchor_info.get("layer"),
+                        )
+                        try:
+                            spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
+                        except Exception:
+                            spacing_val = PROTECTION_LAYOUT_SPACING
+                        if anchor is None:
+                            logs.append("Protection auto-create skipped: UPS anchor could not be resolved.")
+                        else:
+                            for dev_name in protection_devices:
+                                if normalize_for_compare(dev_name) in uploaded_device_norms:
+                                    continue
+                                instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                                if not instances:
+                                    continue
+                                points = build_protection_layout_points(anchor, len(instances), spacing_val)
+                                if not points or len(points) != len(instances):
+                                    logs.append(f"{dev_name}: protection layout failed (no points).")
+                                    continue
+                                out_gdf = build_device_gdf_from_instances(instances, points, anchor_crs)
+                                layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
+                                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                    out_path = Path(tmpout.name)
+                                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                                file_name = f"{layer_name}.gpkg"
+                                outputs.append((file_name, out_path))
+                                logs.append(f"{dev_name}: auto-created protection points ({len(points)}).")
 
                     if outputs:
                         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
