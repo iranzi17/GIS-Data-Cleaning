@@ -2713,12 +2713,12 @@ def run_app() -> None:
                         except Exception:
                             st.warning("Could not read Line Bay layer to select a name field.")
             ups_anchor_info = None
-            needs_protection_layout = (
+            show_protection_layout = (
                 normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES
                 or protection_in_uploads
                 or ups_upload_candidate is not None
             )
-            if needs_protection_layout:
+            with st.expander("Protection auto-create from UPS", expanded=show_protection_layout):
                 ups_path = None
                 ups_layer = None
                 ups_label = None
