@@ -2827,12 +2827,17 @@ def run_app() -> None:
                 if not layer:
                     raise ValueError("No layers found in the uploaded GeoPackage.")
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
+                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
+                geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
                 layout_applied = False
                 if (
                     ups_anchor_info
                     and normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES
                     and hasattr(gdf_sup_local, "geometry")
                 ):
+                    desired_count = len(gdf_sup_local)
+                    if seq_entries and len(seq_entries) > desired_count:
+                        desired_count = len(seq_entries)
                     anchor = resolve_ups_anchor_point(
                         ups_anchor_info.get("path"),
                         ups_anchor_info.get("layer"),
@@ -2842,8 +2847,23 @@ def run_app() -> None:
                         spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
                     except Exception:
                         spacing_val = PROTECTION_LAYOUT_SPACING
-                    layout_points = build_protection_layout_points(anchor, len(gdf_sup_local), spacing_val)
-                    if layout_points and len(layout_points) == len(gdf_sup_local):
+                    layout_points = build_protection_layout_points(anchor, desired_count, spacing_val)
+                    if layout_points and len(layout_points) == desired_count:
+                        if desired_count > len(gdf_sup_local):
+                            extra = desired_count - len(gdf_sup_local)
+                            extra_rows = pd.DataFrame(
+                                {col: [pd.NA] * extra for col in gdf_sup_local.columns}
+                            )
+                            gdf_sup_local = pd.concat(
+                                [gdf_sup_local, extra_rows],
+                                ignore_index=True,
+                            )
+                            if geom_name:
+                                gdf_sup_local = gpd.GeoDataFrame(
+                                    gdf_sup_local,
+                                    geometry=geom_name,
+                                    crs=geom_crs,
+                                )
                         gdf_sup_local = gdf_sup_local.copy()
                         gdf_sup_local.geometry = layout_points
                         layout_applied = True
@@ -2859,7 +2879,6 @@ def run_app() -> None:
                     order_local = parsed[0].get("order", [])
                 if fm_local is None and match_column is None:
                     raise ValueError(f"No field values available for device '{device_name}'.")
-                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 out_cols: dict[str, Any] = {}
                 if geom_name:
                     out_cols[geom_name] = gdf_sup_local.geometry
