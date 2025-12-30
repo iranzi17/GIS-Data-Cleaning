@@ -2586,6 +2586,17 @@ def run_app() -> None:
             raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
             device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str))) if not raw_sup.empty else []
             device_choice = st.selectbox("Device entry", device_options, key="sup_device")
+            equip_map_sup = load_gpkg_equipment_map()
+            protection_in_uploads = False
+            if sup_gpkg_files:
+                for file_obj in sup_gpkg_files:
+                    try:
+                        dev_name = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
+                    except Exception:
+                        continue
+                    if normalize_for_compare(dev_name) in PROTECTION_LAYOUT_DEVICES:
+                        protection_in_uploads = True
+                        break
             line_bay_info = None
             if normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES:
                 line_bay_gpkg = st.file_uploader(
@@ -2637,7 +2648,10 @@ def run_app() -> None:
                         except Exception:
                             st.warning("Could not read Line Bay layer to select a name field.")
             ups_anchor_info = None
-            if normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES:
+            needs_protection_layout = (
+                normalize_for_compare(device_choice) in PROTECTION_LAYOUT_DEVICES or protection_in_uploads
+            )
+            if needs_protection_layout:
                 ups_gpkg = st.file_uploader(
                     "Optional UPS GeoPackage (GPKG) for protection layout",
                     type=["gpkg"],
@@ -2670,7 +2684,6 @@ def run_app() -> None:
                                 "layer": ups_layer,
                                 "spacing": float(spacing_val),
                             }
-            equip_map_sup = load_gpkg_equipment_map()
             device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
             instance_labels = [inst["label"] for inst in device_instances]
             selected_instance = None
@@ -3436,11 +3449,35 @@ def run_app() -> None:
                                 seq_arg = cached_instances
                             elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
                                 seq_arg = cached_instances
+                            inst_map = None
+                            default_fields = inst.get("fields") if inst else None
+                            if (
+                                cached_instances
+                                and ups_anchor_info is not None
+                                and normalize_for_compare(device_for_file) in PROTECTION_LAYOUT_DEVICES
+                            ):
+                                inst_map = {}
+                                for inst_item in cached_instances:
+                                    fields = inst_item.get("fields", {})
+                                    order = inst_item.get("order", [])
+                                    id_val = inst_item.get("id_value")
+                                    feeder_val = inst_item.get("feeder_value")
+                                    name_val = inst_item.get("name_value")
+                                    candidates = [id_val, name_val, feeder_val]
+                                    if pd.notna(id_val) and pd.notna(feeder_val):
+                                        candidates.append(f"{id_val}_{feeder_val}")
+                                        candidates.append(f"{feeder_val}_{id_val}")
+                                    for cand in candidates:
+                                        norm = normalize_value_for_compare(cand)
+                                        if norm and norm not in inst_map:
+                                            inst_map[norm] = (fields, order)
                             out_path, used_layer = fill_one_gpkg(
                                 file_obj,
                                 device_for_file,
                                 field_map=inst.get("fields") if inst else None,
                                 field_order=inst.get("order") if inst else None,
+                                instance_map=inst_map,
+                                default_fields=default_fields,
                                 sequential_instances=seq_arg,
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
