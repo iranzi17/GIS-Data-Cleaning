@@ -215,6 +215,7 @@ _EXCEL_FILE_CACHE: dict[str, pd.ExcelFile] = {}
 _SHEET_HEADER_CACHE: dict[tuple[str, str], list[str]] = {}
 _REFERENCE_SHEET_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 _SUB_COL_CACHE: dict[tuple[str, str], str | None] = {}
+_DOMAIN_CODE_LOOKUP: dict[str, Any] | None = None
 
 
 def get_reference_columns() -> list[str]:
@@ -394,6 +395,20 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     raw = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
 
     target_norm = normalize_for_compare(device_name)
+    domain_code_map: dict[str, Any] = {}
+    if raw.shape[1] > 4:
+        for _, row in raw.iterrows():
+            dom_val = row.iloc[3]
+            code_val = row.iloc[4]
+            if pd.isna(dom_val) or pd.isna(code_val):
+                continue
+            dom_norm = normalize_value_for_compare(dom_val)
+            if dom_norm and dom_norm not in domain_code_map:
+                domain_code_map[dom_norm] = code_val
+    global_domain_map = load_domain_code_lookup()
+    for key, val in global_domain_map.items():
+        if key not in domain_code_map:
+            domain_code_map[key] = val
     instances: list[dict[str, Any]] = []
     current_fields: dict[str, Any] | None = None
 
@@ -422,6 +437,11 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
 
         if is_numeric and not _is_blank(domain_code):
             return domain_code
+        if is_numeric and not _is_blank(val):
+            dom_norm = normalize_value_for_compare(val)
+            mapped = domain_code_map.get(dom_norm)
+            if mapped is not None and not _is_blank(mapped):
+                return mapped
         if not _is_blank(val):
             return val
 
@@ -1256,6 +1276,36 @@ def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
             return None, None
     except Exception:
         pass
+
+
+@st.cache_data(show_spinner=False)
+def load_domain_code_lookup() -> dict[str, Any]:
+    """Build a global mapping of domain text -> domain code from supervisor workbooks."""
+    lookup: dict[str, Any] = {}
+    if not SUPERVISOR_WORKBOOK_DIR.exists():
+        return lookup
+    workbooks = [p for p in SUPERVISOR_WORKBOOK_DIR.glob("**/*") if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS]
+    for wb_path in sorted(workbooks):
+        try:
+            xl = pd.ExcelFile(wb_path)
+        except Exception:
+            continue
+        for sheet in xl.sheet_names:
+            try:
+                raw = pd.read_excel(wb_path, sheet_name=sheet, dtype=str, header=None)
+            except Exception:
+                continue
+            if raw.empty or raw.shape[1] < 5:
+                continue
+            for _, row in raw.iterrows():
+                dom_val = row.iloc[3]
+                code_val = row.iloc[4]
+                if pd.isna(dom_val) or pd.isna(code_val):
+                    continue
+                dom_norm = normalize_value_for_compare(dom_val)
+                if dom_norm and dom_norm not in lookup:
+                    lookup[dom_norm] = code_val
+    return lookup
     text = str(value).strip()
     if not text:
         return None, None
