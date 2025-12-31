@@ -34,6 +34,9 @@ REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
 GPKG_EQUIP_MAP_FILE = REFERENCE_DATA_DIR / "gpkg_equipment_map.json"
 MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
+TEMPLATE_DIR = BASE_DIR / "For High Voltage Line"
+HV_LINE_TEMPLATE_PATH = TEMPLATE_DIR / "High Voltage Lines.gpkg"
+EARTHING_TRANSFORMER_TEMPLATE_PATH = TEMPLATE_DIR / "EARTHING TRANSFORMER.gpkg"
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
@@ -1419,6 +1422,38 @@ def build_device_gdf_from_instances(
             data[f][idx] = fill_val
     out_gdf = gpd.GeoDataFrame(data, geometry=points, crs=crs)
     return sanitize_gdf_for_gpkg(out_gdf)
+
+
+@st.cache_data(show_spinner=False)
+def load_template_layer(path: Path) -> tuple[gpd.GeoDataFrame, str] | None:
+    """Load the first layer from a template GeoPackage for geometry placement."""
+    if path is None or not path.exists():
+        return None
+    layers = list_gpkg_layers(path)
+    if not layers:
+        return None
+    layer = layers[0]
+    try:
+        gdf = gpd.read_file(path, layer=layer)
+    except Exception:
+        return None
+    if gdf.empty or not hasattr(gdf, "geometry"):
+        return None
+    return gdf[[gdf.geometry.name]].copy(), layer
+
+
+def expand_geometries(geoms: list[Any], target_count: int) -> list[Any]:
+    """Expand or trim geometry list to match the target count (repeat if needed)."""
+    if target_count <= 0 or not geoms:
+        return []
+    if len(geoms) >= target_count:
+        return geoms[:target_count]
+    expanded: list[Any] = []
+    idx = 0
+    while len(expanded) < target_count:
+        expanded.append(geoms[idx % len(geoms)])
+        idx += 1
+    return expanded
 
 
 def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
@@ -3685,6 +3720,41 @@ def run_app() -> None:
                                 file_name = f"{layer_name}.gpkg"
                                 outputs.append((file_name, out_path))
                                 logs.append(f"{dev_name}: auto-created protection points ({len(points)}).")
+
+                    template_devices = [
+                        ("High Voltage Line", HV_LINE_TEMPLATE_PATH),
+                        ("Earthing Transformer", EARTHING_TRANSFORMER_TEMPLATE_PATH),
+                    ]
+                    for dev_name, tpl_path in template_devices:
+                        dev_norm = normalize_for_compare(dev_name)
+                        if dev_norm in uploaded_device_norms:
+                            continue
+                        instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                        if not instances:
+                            logs.append(f"{dev_name}: skipped (no instances in sheet).")
+                            continue
+                        tpl = load_template_layer(tpl_path)
+                        if tpl is None:
+                            logs.append(f"{dev_name}: template not found at {tpl_path}.")
+                            continue
+                        tpl_gdf, _tpl_layer = tpl
+                        geoms = list(tpl_gdf.geometry)
+                        target_count = len(instances)
+                        if target_count <= 0:
+                            logs.append(f"{dev_name}: skipped (no instances to fill).")
+                            continue
+                        geoms = expand_geometries(geoms, target_count)
+                        if not geoms:
+                            logs.append(f"{dev_name}: template has no geometry.")
+                            continue
+                        out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
+                        layer_name = derive_layer_name_from_filename(dev_name)
+                        file_name = f"{dev_name}.gpkg"
+                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                            out_path = Path(tmpout.name)
+                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                        outputs.append((file_name, out_path))
+                        logs.append(f"{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
 
                     if outputs:
                         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
