@@ -1430,6 +1430,18 @@ def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
             return None, None
     except Exception:
         pass
+    text = str(value).strip()
+    if not text:
+        return None, None
+    match = re.match(r"^([A-Za-z]+\d+)[-_ ]+(\d+)$", text)
+    if not match:
+        return None, None
+    prefix = match.group(1).strip()
+    try:
+        suffix = int(match.group(2))
+    except Exception:
+        suffix = None
+    return prefix, suffix
 
 
 @st.cache_data(show_spinner=False)
@@ -1460,18 +1472,6 @@ def load_domain_code_lookup() -> dict[str, Any]:
                 if dom_norm and dom_norm not in lookup:
                     lookup[dom_norm] = code_val
     return lookup
-    text = str(value).strip()
-    if not text:
-        return None, None
-    match = re.match(r"^([A-Za-z]+\d+)[-_ ]+(\d+)$", text)
-    if not match:
-        return None, None
-    prefix = match.group(1).strip()
-    try:
-        suffix = int(match.group(2))
-    except Exception:
-        suffix = None
-    return prefix, suffix
 
 
 def build_spatial_match_targets(
@@ -1770,6 +1770,8 @@ SKIP_BATCH_FILL_STEMS = {
     normalize_for_compare("connection_point"),
     normalize_for_compare("connection_points"),
     normalize_for_compare("connectionpoints"),
+    normalize_for_compare("point connection"),
+    normalize_for_compare("point connections"),
 }
 
 # Hard overrides for filename -> preferred match columns.
