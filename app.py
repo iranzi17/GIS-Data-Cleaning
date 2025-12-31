@@ -3062,7 +3062,10 @@ def run_app() -> None:
                     prefix_order: list[str] = []
                     for inst in seq_entries:
                         ident = inst.get("id") or inst.get("name")
-                        prefix, suffix = split_instance_prefix_suffix(ident)
+                        res = split_instance_prefix_suffix(ident)
+                        if not isinstance(res, tuple) or len(res) != 2:
+                            continue
+                        prefix, suffix = res
                         if not prefix:
                             continue
                         key = normalize_for_compare(prefix)
@@ -3273,7 +3276,10 @@ def run_app() -> None:
                                 prefix_order = []
                                 for inst in seq_entries:
                                     ident = inst.get("id") or inst.get("name")
-                                    prefix, suffix = split_instance_prefix_suffix(ident)
+                                    res = split_instance_prefix_suffix(ident)
+                                    if not isinstance(res, tuple) or len(res) != 2:
+                                        continue
+                                    prefix, suffix = res
                                     if not prefix:
                                         continue
                                     key = normalize_for_compare(prefix)
