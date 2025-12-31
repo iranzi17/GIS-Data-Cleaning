@@ -1764,6 +1764,14 @@ PROTECTION_LAYOUT_DEVICES = {
 
 PROTECTION_LAYOUT_SPACING = 2.0
 
+# Files that should be passed through without protection auto-layout or fill.
+SKIP_BATCH_FILL_STEMS = {
+    normalize_for_compare("connection points"),
+    normalize_for_compare("connection_point"),
+    normalize_for_compare("connection_points"),
+    normalize_for_compare("connectionpoints"),
+}
+
 # Hard overrides for filename -> preferred match columns.
 FILE_MATCH_OVERRIDES = {
     normalize_for_compare("BUSBAR1"): ["Substation ID", "SubstationID", "SUBSTATION NAMES"],
@@ -2988,26 +2996,27 @@ def run_app() -> None:
                         spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
                     except Exception:
                         spacing_val = PROTECTION_LAYOUT_SPACING
-                    layout_points = build_protection_layout_points(anchor, desired_count, spacing_val)
-                    if layout_points and len(layout_points) == desired_count:
+                    if anchor is not None:
+                        layout_applied = True
                         if desired_count > len(gdf_sup_local):
                             extra = desired_count - len(gdf_sup_local)
-                            extra_rows = pd.DataFrame(
-                                {col: [pd.NA] * extra for col in gdf_sup_local.columns}
-                            )
-                            gdf_sup_local = pd.concat(
-                                [gdf_sup_local, extra_rows],
-                                ignore_index=True,
-                            )
-                            if geom_name:
-                                gdf_sup_local = gpd.GeoDataFrame(
-                                    gdf_sup_local,
-                                    geometry=geom_name,
-                                    crs=geom_crs,
+                            extra_points = build_protection_layout_points(anchor, extra, spacing_val)
+                            if extra_points and len(extra_points) == extra:
+                                extra_rows = pd.DataFrame(
+                                    {col: [pd.NA] * extra for col in gdf_sup_local.columns}
                                 )
-                        gdf_sup_local = gdf_sup_local.copy()
-                        gdf_sup_local.geometry = layout_points
-                        layout_applied = True
+                                gdf_sup_local = pd.concat(
+                                    [gdf_sup_local, extra_rows],
+                                    ignore_index=True,
+                                )
+                                if geom_name:
+                                    gdf_sup_local = gpd.GeoDataFrame(
+                                        gdf_sup_local,
+                                        geometry=geom_name,
+                                        crs=geom_crs,
+                                    )
+                                gdf_sup_local = gdf_sup_local.copy()
+                                gdf_sup_local.geometry.iloc[-extra:] = extra_points
                 fm_local = field_map
                 order_local = field_order or []
                 if fm_local is None and match_column is None:
@@ -3552,6 +3561,11 @@ def run_app() -> None:
                     instance_cache: dict[str, list[dict[str, Any]]] = {}
                     uploaded_device_norms: set[str] = set()
 
+                    def _write_original_file(file_obj):
+                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                            tmp.write(file_obj.getbuffer())
+                            return Path(tmp.name)
+
                     def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
                         if not instances:
                             return None
@@ -3566,6 +3580,12 @@ def run_app() -> None:
 
                     for file_obj in sup_gpkg_files:
                         try:
+                            stem_norm = normalize_for_compare(Path(file_obj.name).stem)
+                            if stem_norm in SKIP_BATCH_FILL_STEMS:
+                                out_path = _write_original_file(file_obj)
+                                outputs.append((file_obj.name, out_path))
+                                logs.append(f"{file_obj.name}: skipped fill (kept original geometry).")
+                                continue
                             device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
                             uploaded_device_norms.add(normalize_for_compare(device_for_file))
                             if device_for_file not in instance_cache:
@@ -3618,7 +3638,9 @@ def run_app() -> None:
                                 f"{file_obj.name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
                             )
                         except Exception as exc:
-                            logs.append(f"{file_obj.name}: failed ({exc}).")
+                            out_path = _write_original_file(file_obj)
+                            outputs.append((file_obj.name, out_path))
+                            logs.append(f"{file_obj.name}: failed ({exc}); kept original file.")
 
                     if ups_anchor_info:
                         protection_devices = [
