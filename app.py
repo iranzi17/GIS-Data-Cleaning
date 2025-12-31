@@ -1424,6 +1424,116 @@ def build_device_gdf_from_instances(
     return sanitize_gdf_for_gpkg(out_gdf)
 
 
+def repeat_instances(instances: list[dict[str, Any]], repeat_count: int) -> list[dict[str, Any]]:
+    """Repeat each instance in order to match a target count per instance."""
+    if repeat_count <= 0:
+        return []
+    expanded: list[dict[str, Any]] = []
+    for inst in instances:
+        for _ in range(repeat_count):
+            expanded.append(inst)
+    return expanded
+
+
+def _get_polygon_coords(geom: Any) -> list[tuple[float, float]]:
+    if geom is None or getattr(geom, "is_empty", True):
+        return []
+    try:
+        geom_type = getattr(geom, "geom_type", "")
+        if geom_type == "Polygon":
+            return [(float(x), float(y)) for x, y in geom.exterior.coords]
+        if geom_type == "MultiPolygon":
+            poly = max(list(geom.geoms), key=lambda g: g.area, default=None)
+            if poly is None:
+                return []
+            return [(float(x), float(y)) for x, y in poly.exterior.coords]
+    except Exception:
+        return []
+    return []
+
+
+def _dominant_axis_from_coords(coords: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    xs = [x for x, _ in coords]
+    ys = [y for _, y in coords]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    dxs = [x - mean_x for x in xs]
+    dys = [y - mean_y for y in ys]
+    var_x = sum(d * d for d in dxs) / len(dxs)
+    var_y = sum(d * d for d in dys) / len(dys)
+    cov_xy = sum(dx * dy for dx, dy in zip(dxs, dys)) / len(dxs)
+    if var_x + var_y < 1e-12:
+        return 1.0, 0.0, mean_x, mean_y
+    trace = var_x + var_y
+    det = var_x * var_y - cov_xy * cov_xy
+    disc = max(trace * trace / 4 - det, 0.0)
+    lambda1 = trace / 2 + math.sqrt(disc)
+    if abs(cov_xy) > 1e-12:
+        vx = cov_xy
+        vy = lambda1 - var_x
+    else:
+        if var_x >= var_y:
+            vx, vy = 1.0, 0.0
+        else:
+            vx, vy = 0.0, 1.0
+    norm = math.hypot(vx, vy)
+    if norm < 1e-12:
+        vx, vy = (1.0, 0.0) if var_x >= var_y else (0.0, 1.0)
+        norm = 1.0
+    ux, uy = vx / norm, vy / norm
+    if abs(uy) < 1e-9:
+        if ux < 0:
+            ux, uy = -ux, -uy
+    elif uy < 0:
+        ux, uy = -ux, -uy
+    return ux, uy, mean_x, mean_y
+
+
+def build_parallel_lines_for_polygon(geom: Any, count: int) -> list[Any]:
+    """Create parallel lines that cross a polygon along its dominant axis."""
+    if count <= 0:
+        return []
+    coords = _get_polygon_coords(geom)
+    if not coords:
+        return []
+    try:
+        from shapely.geometry import LineString
+    except Exception:
+        return []
+    ux, uy, cx, cy = _dominant_axis_from_coords(coords)
+    px, py = -uy, ux
+    alongs: list[float] = []
+    perps: list[float] = []
+    for x, y in coords:
+        dx = x - cx
+        dy = y - cy
+        alongs.append(dx * ux + dy * uy)
+        perps.append(-dx * uy + dy * ux)
+    min_along = min(alongs)
+    max_along = max(alongs)
+    min_perp = min(perps)
+    max_perp = max(perps)
+    length = max_along - min_along
+    if length <= 0:
+        return []
+    margin = length * 0.05
+    span = max_perp - min_perp
+    if span <= 0:
+        offsets = [min_perp] * count
+    else:
+        offsets = [min_perp + (i + 1) * span / (count + 1) for i in range(count)]
+    lines: list[Any] = []
+    for off in offsets:
+        a0 = min_along - margin
+        a1 = max_along + margin
+        x0 = cx + a0 * ux + off * px
+        y0 = cy + a0 * uy + off * py
+        x1 = cx + a1 * ux + off * px
+        y1 = cy + a1 * uy + off * py
+        lines.append(LineString([(x0, y0), (x1, y1)]))
+    return lines
+
+
 @st.cache_data(show_spinner=False)
 def load_template_layer(path: Path) -> tuple[gpd.GeoDataFrame, str] | None:
     """Load the first layer from a template GeoPackage for geometry placement."""
@@ -1454,6 +1564,29 @@ def expand_geometries(geoms: list[Any], target_count: int) -> list[Any]:
         expanded.append(geoms[idx % len(geoms)])
         idx += 1
     return expanded
+
+
+@st.cache_data(show_spinner=False)
+def load_line_bay_layer(path: Path, layer: str | None, field: str | None) -> gpd.GeoDataFrame | None:
+    """Load line bay polygons with the selected name field."""
+    if path is None or layer is None or field is None:
+        return None
+    try:
+        gdf = gpd.read_file(path, layer=layer)
+    except Exception:
+        return None
+    if gdf.empty or not hasattr(gdf, "geometry"):
+        return None
+    if field not in gdf.columns:
+        return None
+    geom_col = gdf.geometry.name
+    try:
+        gdf = gdf[gdf[geom_col].notna() & ~gdf[geom_col].is_empty]
+    except Exception:
+        pass
+    if gdf.empty:
+        return None
+    return gdf[[field, geom_col]].copy().reset_index(drop=True)
 
 
 def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
@@ -2729,6 +2862,7 @@ def run_app() -> None:
             equip_map_sup = load_gpkg_equipment_map()
             protection_in_uploads = False
             ups_upload_candidate = None
+            line_bay_upload_candidate = None
             if sup_gpkg_files:
                 for file_obj in sup_gpkg_files:
                     try:
@@ -2742,15 +2876,33 @@ def run_app() -> None:
                         and normalize_for_compare(dev_name) == normalize_for_compare("Uninterruptable power supply(UPS)")
                     ):
                         ups_upload_candidate = file_obj
+                    if (
+                        line_bay_upload_candidate is None
+                        and normalize_for_compare(dev_name) == normalize_for_compare("Line Bay")
+                    ):
+                        line_bay_upload_candidate = file_obj
                 if ups_upload_candidate is None:
                     for file_obj in sup_gpkg_files:
                         if "ups" in normalize_for_compare(Path(file_obj.name).stem):
                             ups_upload_candidate = file_obj
                             break
+                if line_bay_upload_candidate is None:
+                    for file_obj in sup_gpkg_files:
+                        stem_norm = normalize_for_compare(Path(file_obj.name).stem)
+                        if "linebay" in stem_norm or "line bay" in stem_norm or "line_bay" in stem_norm:
+                            line_bay_upload_candidate = file_obj
+                            break
             line_bay_info = None
-            if normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES:
+            show_line_bay = (
+                normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES
+                or line_bay_upload_candidate is not None
+            )
+            with st.expander("Line Bay polygons for High Voltage Line snapping", expanded=show_line_bay):
+                line_bay_path = None
+                line_bay_layer = None
+                line_bay_label = None
                 line_bay_gpkg = st.file_uploader(
-                    "Optional Line Bay polygons (GPKG) for spatial matching",
+                    "Optional Line Bay polygons (GPKG)",
                     type=["gpkg"],
                     key="sup_line_bay_gpkg",
                 )
@@ -2758,11 +2910,21 @@ def run_app() -> None:
                     with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmplb:
                         tmplb.write(line_bay_gpkg.getbuffer())
                         line_bay_path = Path(tmplb.name)
+                    line_bay_label = line_bay_gpkg.name
+                elif line_bay_upload_candidate is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmplb:
+                        tmplb.write(line_bay_upload_candidate.getbuffer())
+                        line_bay_path = Path(tmplb.name)
+                    line_bay_label = line_bay_upload_candidate.name
+                if line_bay_path is not None:
                     line_bay_layers = list_gpkg_layers(line_bay_path)
                     if not line_bay_layers:
                         st.warning("No layers found in Line Bay GeoPackage.")
                     else:
-                        line_bay_layer = st.selectbox("Line Bay layer", line_bay_layers, key="sup_line_bay_layer")
+                        layer_label = "Line Bay layer"
+                        if line_bay_label:
+                            st.caption(f"Using Line Bay source: {line_bay_label}")
+                        line_bay_layer = st.selectbox(layer_label, line_bay_layers, key="sup_line_bay_layer")
                         try:
                             gdf_bay_preview = gpd.read_file(line_bay_path, layer=line_bay_layer)
                             geom_col = gdf_bay_preview.geometry.name if hasattr(gdf_bay_preview, "geometry") else None
@@ -2783,7 +2945,7 @@ def run_app() -> None:
                                     key="sup_line_bay_field",
                                 )
                                 use_line_bay_match = st.checkbox(
-                                    "Use Line Bay polygons to assign High Voltage Line attributes",
+                                    "Use Line Bay polygons for High Voltage Line snapping/matching",
                                     value=True,
                                     key="sup_line_bay_use",
                                 )
@@ -3733,12 +3895,82 @@ def run_app() -> None:
                         if not instances:
                             logs.append(f"{dev_name}: skipped (no instances in sheet).")
                             continue
+                        if dev_norm == normalize_for_compare("High Voltage Line") and line_bay_info:
+                            bay_gdf = load_line_bay_layer(
+                                line_bay_info.get("path"),
+                                line_bay_info.get("layer"),
+                                line_bay_info.get("field"),
+                            )
+                            if bay_gdf is not None and not bay_gdf.empty:
+                                bay_field = line_bay_info.get("field")
+                                geom_col = bay_gdf.geometry.name
+                                geoms_all = list(bay_gdf[geom_col])
+                                by_norm: dict[str, list[int]] = {}
+                                for idx, row in bay_gdf.iterrows():
+                                    name_val = row.get(bay_field)
+                                    norm = normalize_value_for_compare(name_val)
+                                    if not norm:
+                                        continue
+                                    by_norm.setdefault(norm, []).append(idx)
+                                unused_ids = list(range(len(bay_gdf)))
+                                unused_set = set(unused_ids)
+
+                                def _take_unused() -> int | None:
+                                    while unused_ids:
+                                        idx = unused_ids.pop(0)
+                                        if idx in unused_set:
+                                            unused_set.remove(idx)
+                                            return idx
+                                    return None
+
+                                expanded_instances: list[dict[str, Any]] = []
+                                expanded_geoms: list[Any] = []
+                                for inst in instances:
+                                    candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
+                                    chosen_idx = None
+                                    for cand in candidates:
+                                        norm = normalize_value_for_compare(cand)
+                                        if norm and norm in by_norm and by_norm[norm]:
+                                            chosen_idx = by_norm[norm].pop(0)
+                                            if chosen_idx in unused_set:
+                                                unused_set.remove(chosen_idx)
+                                            break
+                                    if chosen_idx is None:
+                                        chosen_idx = _take_unused()
+                                    if chosen_idx is None and geoms_all:
+                                        chosen_idx = 0
+                                    if chosen_idx is None:
+                                        continue
+                                    poly = geoms_all[chosen_idx]
+                                    lines = build_parallel_lines_for_polygon(poly, 3)
+                                    lines = expand_geometries(lines, 3)
+                                    if not lines:
+                                        continue
+                                    for ln in lines:
+                                        expanded_instances.append(inst)
+                                        expanded_geoms.append(ln)
+                                if expanded_geoms:
+                                    out_gdf = build_device_gdf_from_instances(
+                                        expanded_instances, expanded_geoms, bay_gdf.crs
+                                    )
+                                    layer_name = derive_layer_name_from_filename(dev_name)
+                                    file_name = f"{dev_name}.gpkg"
+                                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                        out_path = Path(tmpout.name)
+                                    out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                                    outputs.append((file_name, out_path))
+                                    logs.append(
+                                        f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
+                                    )
+                                    continue
                         tpl = load_template_layer(tpl_path)
                         if tpl is None:
                             logs.append(f"{dev_name}: template not found at {tpl_path}.")
                             continue
                         tpl_gdf, _tpl_layer = tpl
                         geoms = list(tpl_gdf.geometry)
+                        if dev_norm == normalize_for_compare("High Voltage Line"):
+                            instances = repeat_instances(instances, 3)
                         target_count = len(instances)
                         if target_count <= 0:
                             logs.append(f"{dev_name}: skipped (no instances to fill).")
