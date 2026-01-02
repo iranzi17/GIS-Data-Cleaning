@@ -1589,6 +1589,202 @@ def load_line_bay_layer(path: Path, layer: str | None, field: str | None) -> gpd
     return gdf[[field, geom_col]].copy().reset_index(drop=True)
 
 
+def collect_point_geometries_from_uploads(
+    files: list[Any] | None,
+    target_crs,
+) -> gpd.GeoDataFrame | None:
+    """Collect point geometries from uploaded GeoPackages."""
+    if not files:
+        return None
+    frames: list[gpd.GeoDataFrame] = []
+    for file_obj in files:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                tmp.write(file_obj.getbuffer())
+                gpkg_path = Path(tmp.name)
+            layers = list_gpkg_layers(gpkg_path)
+            if not layers:
+                continue
+            for layer in layers:
+                try:
+                    gdf = gpd.read_file(gpkg_path, layer=layer)
+                except Exception:
+                    continue
+                if gdf.empty or not hasattr(gdf, "geometry"):
+                    continue
+                geom_series = gdf.geometry
+                try:
+                    geom_types = geom_series.geom_type
+                except Exception:
+                    continue
+                point_mask = geom_types.isin(["Point", "MultiPoint"])
+                if not bool(point_mask.any()):
+                    continue
+                gdf_pts = gdf.loc[point_mask].copy()
+                try:
+                    if (gdf_pts.geometry.geom_type == "MultiPoint").any():
+                        gdf_pts = gdf_pts.explode(index_parts=False)
+                except Exception:
+                    pass
+                if target_crs is not None and gdf_pts.crs is not None and gdf_pts.crs != target_crs:
+                    try:
+                        gdf_pts = gdf_pts.to_crs(target_crs)
+                    except Exception:
+                        pass
+                frames.append(gpd.GeoDataFrame(geometry=gdf_pts.geometry, crs=target_crs or gdf_pts.crs))
+        except Exception:
+            continue
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
+
+
+def map_points_to_bays(
+    points_gdf: gpd.GeoDataFrame | None,
+    bay_gdf: gpd.GeoDataFrame,
+) -> dict[int, list[Any]]:
+    """Map points to line bay polygon indices."""
+    if points_gdf is None or points_gdf.empty:
+        return {}
+    if points_gdf.crs is not None and bay_gdf.crs is not None and points_gdf.crs != bay_gdf.crs:
+        try:
+            points_gdf = points_gdf.to_crs(bay_gdf.crs)
+        except Exception:
+            pass
+    joined = None
+    try:
+        joined = gpd.sjoin(points_gdf, bay_gdf, how="left", predicate="intersects")
+    except TypeError:
+        try:
+            joined = gpd.sjoin(points_gdf, bay_gdf, how="left", op="intersects")
+        except Exception:
+            joined = None
+    except Exception:
+        joined = None
+    if joined is None or "index_right" not in joined.columns:
+        out: dict[int, list[Any]] = {}
+        try:
+            bay_items = list(bay_gdf.geometry.items())
+        except Exception:
+            bay_items = []
+        for pt in points_gdf.geometry:
+            if pt is None or getattr(pt, "is_empty", True):
+                continue
+            for idx, poly in bay_items:
+                if poly is None or getattr(poly, "is_empty", True):
+                    continue
+                try:
+                    if poly.intersects(pt):
+                        try:
+                            key = int(idx)
+                        except Exception:
+                            key = idx
+                        out.setdefault(key, []).append(pt)
+                        break
+                except Exception:
+                    continue
+        return out
+    out: dict[int, list[Any]] = {}
+    for _, row in joined.iterrows():
+        bay_idx = row.get("index_right")
+        if pd.isna(bay_idx):
+            continue
+        try:
+            bay_key = int(bay_idx)
+        except Exception:
+            continue
+        out.setdefault(bay_key, []).append(row.geometry)
+    return out
+
+
+def group_points_by_perp_gap(
+    items: list[tuple[Any, float, float]],
+    group_count: int,
+) -> list[list[tuple[Any, float, float]]]:
+    """Group items by closest gaps along perpendicular coordinate."""
+    if not items or group_count <= 0:
+        return []
+    group_count = min(group_count, len(items))
+    items_sorted = sorted(items, key=lambda t: t[2])
+    groups: list[list[tuple[Any, float, float]]] = [[item] for item in items_sorted]
+    while len(groups) > group_count:
+        gaps = [
+            groups[i + 1][0][2] - groups[i][-1][2]
+            for i in range(len(groups) - 1)
+        ]
+        merge_idx = gaps.index(min(gaps))
+        groups[merge_idx].extend(groups[merge_idx + 1])
+        del groups[merge_idx + 1]
+    return groups
+
+
+def build_lines_from_points_in_polygon(
+    polygon: Any,
+    points: list[Any],
+    count: int,
+) -> list[Any]:
+    """Build line strings for a polygon using internal points, fallback to parallel lines."""
+    if count <= 0:
+        return []
+    coords = _get_polygon_coords(polygon)
+    if not coords:
+        return []
+    if not points:
+        return build_parallel_lines_for_polygon(polygon, count)
+    try:
+        from shapely.geometry import LineString, Point
+    except Exception:
+        return []
+    ux, uy, cx, cy = _dominant_axis_from_coords(coords)
+    alongs: list[float] = []
+    for x, y in coords:
+        dx = x - cx
+        dy = y - cy
+        alongs.append(dx * ux + dy * uy)
+    if not alongs:
+        return []
+    min_along = min(alongs)
+    max_along = max(alongs)
+    items: list[tuple[Any, float, float]] = []
+    for pt in points:
+        if pt is None or getattr(pt, "is_empty", True):
+            continue
+        try:
+            p = pt if getattr(pt, "geom_type", "") == "Point" else pt.centroid
+            x = float(p.x)
+            y = float(p.y)
+        except Exception:
+            continue
+        dx = x - cx
+        dy = y - cy
+        along = dx * ux + dy * uy
+        perp = -dx * uy + dy * ux
+        items.append((p, along, perp))
+    if len(items) < count:
+        return build_parallel_lines_for_polygon(polygon, count)
+    groups = group_points_by_perp_gap(items, count)
+    if len(groups) < count:
+        return build_parallel_lines_for_polygon(polygon, count)
+    margin = (max_along - min_along) * 0.05
+    px, py = -uy, ux
+    lines: list[Any] = []
+    for group in groups:
+        group_sorted = sorted(group, key=lambda t: t[1])
+        if not group_sorted:
+            continue
+        avg_perp = sum(item[2] for item in group_sorted) / len(group_sorted)
+        start_along = min_along - margin
+        end_along = max_along + margin
+        start_pt = Point(cx + start_along * ux + avg_perp * px, cy + start_along * uy + avg_perp * py)
+        end_pt = Point(cx + end_along * ux + avg_perp * px, cy + end_along * uy + avg_perp * py)
+        path = [start_pt] + [item[0] for item in group_sorted] + [end_pt]
+        lines.append(LineString([(p.x, p.y) for p in path]))
+    if len(lines) != count:
+        return build_parallel_lines_for_polygon(polygon, count)
+    return lines
+
+
 def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
     """Split an instance label into prefix and numeric suffix (e.g., Q1-3 -> Q1, 3)."""
     if value is None:
@@ -3923,6 +4119,9 @@ def run_app() -> None:
                                             return idx
                                     return None
 
+                                points_gdf = collect_point_geometries_from_uploads(sup_gpkg_files, bay_gdf.crs)
+                                points_by_bay = map_points_to_bays(points_gdf, bay_gdf) if points_gdf is not None else {}
+
                                 expanded_instances: list[dict[str, Any]] = []
                                 expanded_geoms: list[Any] = []
                                 for inst in instances:
@@ -3942,7 +4141,8 @@ def run_app() -> None:
                                     if chosen_idx is None:
                                         continue
                                     poly = geoms_all[chosen_idx]
-                                    lines = build_parallel_lines_for_polygon(poly, 3)
+                                    points_in_bay = points_by_bay.get(chosen_idx, [])
+                                    lines = build_lines_from_points_in_polygon(poly, points_in_bay, 3)
                                     lines = expand_geometries(lines, 3)
                                     if not lines:
                                         continue
