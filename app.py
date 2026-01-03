@@ -1704,7 +1704,7 @@ def map_points_to_bays(
     points_gdf: gpd.GeoDataFrame | None,
     bay_gdf: gpd.GeoDataFrame,
 ) -> dict[int, list[Any]]:
-    """Map points to line bay polygon indices (intersects or near-touch)."""
+    """Map points to line bay polygon indices (intersects or near-touch, ordered shallowest points first)."""
     if points_gdf is None or points_gdf.empty:
         return {}
     if points_gdf.crs is not None and bay_gdf.crs is not None and points_gdf.crs != bay_gdf.crs:
@@ -1756,7 +1756,7 @@ def map_points_to_bays(
                 bay_key = int(bay_idx)
             except Exception:
                 continue
-            out.setdefault(bay_key, []).append(row.geometry)
+            out.setdefault(bay_key, []).append((idx, row.geometry))
             used_point_idx.add(idx)
 
     bay_geoms: list[tuple[int, Any, float]] = []
@@ -1796,8 +1796,13 @@ def map_points_to_bays(
                     bay_key = int(best_idx)
                 except Exception:
                     bay_key = best_idx
-                out.setdefault(bay_key, []).append(pt)
-    return out
+                out.setdefault(bay_key, []).append((idx_pt, pt))
+
+    ordered_out: dict[int, list[Any]] = {}
+    for bay_idx, items in out.items():
+        sorted_items = sorted(items, key=lambda t: t[0])
+        ordered_out[bay_idx] = [geom for _, geom in sorted_items]
+    return ordered_out
 
 
 def group_points_by_perp_gap(
@@ -1808,7 +1813,7 @@ def group_points_by_perp_gap(
     if not items or group_count <= 0:
         return []
     group_count = min(group_count, len(items))
-    items_sorted = sorted(items, key=lambda t: t[2])
+    items_sorted = sorted(items, key=lambda t: (t[2], t[1]))
     groups: list[list[tuple[Any, float, float]]] = [[item] for item in items_sorted]
     while len(groups) > group_count:
         gaps = [
