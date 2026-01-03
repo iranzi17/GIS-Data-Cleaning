@@ -1878,9 +1878,10 @@ def build_lines_from_points_in_polygon(
         if len(group_sorted) > 2:
             group_sorted = [group_sorted[0], group_sorted[-1]]
         avg_perp = sum(item[2] for item in group_sorted) / len(group_sorted)
-        center_along = (min_along + max_along) / 2
         group_mean_along = sum(item[1] for item in group_sorted) / len(group_sorted)
-        extend_min_side = group_mean_along <= center_along
+        dist_to_min = abs(group_mean_along - min_along)
+        dist_to_max = abs(max_along - group_mean_along)
+        extend_min_side = dist_to_min <= dist_to_max
         if not extend_min_side:
             group_sorted = list(reversed(group_sorted))
         extend_along = (min_along - margin * 2) if extend_min_side else (max_along + margin * 2)
