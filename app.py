@@ -1704,7 +1704,7 @@ def map_points_to_bays(
     points_gdf: gpd.GeoDataFrame | None,
     bay_gdf: gpd.GeoDataFrame,
 ) -> dict[int, list[Any]]:
-    """Map points to line bay polygon indices."""
+    """Map points to line bay polygon indices (intersects or near-touch)."""
     if points_gdf is None or points_gdf.empty:
         return {}
     if points_gdf.crs is not None and bay_gdf.crs is not None and points_gdf.crs != bay_gdf.crs:
@@ -1746,15 +1746,57 @@ def map_points_to_bays(
                     continue
         return out
     out: dict[int, list[Any]] = {}
-    for _, row in joined.iterrows():
-        bay_idx = row.get("index_right")
-        if pd.isna(bay_idx):
-            continue
-        try:
-            bay_key = int(bay_idx)
-        except Exception:
-            continue
-        out.setdefault(bay_key, []).append(row.geometry)
+    used_point_idx: set[int] = set()
+    if joined is not None:
+        for idx, row in joined.iterrows():
+            bay_idx = row.get("index_right")
+            if pd.isna(bay_idx):
+                continue
+            try:
+                bay_key = int(bay_idx)
+            except Exception:
+                continue
+            out.setdefault(bay_key, []).append(row.geometry)
+            used_point_idx.add(idx)
+
+    bay_geoms: list[tuple[int, Any, float]] = []
+    try:
+        for idx, geom in bay_gdf.geometry.items():
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            try:
+                width = geom.bounds[2] - geom.bounds[0]
+                height = geom.bounds[3] - geom.bounds[1]
+                min_dim = min(width, height)
+            except Exception:
+                min_dim = 0.0
+            tol = max(0.1, min_dim * 0.15)
+            bay_geoms.append((idx, geom, tol))
+    except Exception:
+        bay_geoms = []
+
+    if bay_geoms:
+        for idx_pt, pt in enumerate(points_gdf.geometry):
+            if idx_pt in used_point_idx:
+                continue
+            if pt is None or getattr(pt, "is_empty", True):
+                continue
+            best_idx = None
+            best_dist = None
+            for bay_idx, bay_geom, tol in bay_geoms:
+                try:
+                    dist = bay_geom.distance(pt)
+                except Exception:
+                    continue
+                if dist <= tol and (best_dist is None or dist < best_dist):
+                    best_dist = dist
+                    best_idx = bay_idx
+            if best_idx is not None:
+                try:
+                    bay_key = int(best_idx)
+                except Exception:
+                    bay_key = best_idx
+                out.setdefault(bay_key, []).append(pt)
     return out
 
 
