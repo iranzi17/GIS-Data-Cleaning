@@ -1640,6 +1640,66 @@ def collect_point_geometries_from_uploads(
     return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
 
 
+def collect_device_points_from_uploads(
+    files: list[Any] | None,
+    target_crs,
+    device_options: list[str],
+    equip_map: dict[str, str],
+    target_device_norms: set[str],
+) -> gpd.GeoDataFrame | None:
+    """Collect point geometries from uploads for specific devices (e.g., Lightning Arrestor)."""
+    if not files or not target_device_norms:
+        return None
+    frames: list[gpd.GeoDataFrame] = []
+    for file_obj in files:
+        try:
+            dev_name = resolve_equipment_name(file_obj.name, device_options, equip_map)
+        except Exception:
+            dev_name = None
+        if normalize_for_compare(dev_name) not in target_device_norms:
+            continue
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                tmp.write(file_obj.getbuffer())
+                gpkg_path = Path(tmp.name)
+            layers = list_gpkg_layers(gpkg_path)
+            if not layers:
+                continue
+            for layer in layers:
+                try:
+                    gdf = gpd.read_file(gpkg_path, layer=layer)
+                except Exception:
+                    continue
+                if gdf.empty or not hasattr(gdf, "geometry"):
+                    continue
+                geom_series = gdf.geometry
+                try:
+                    geom_types = geom_series.geom_type
+                except Exception:
+                    continue
+                point_mask = geom_types.isin(["Point", "MultiPoint"])
+                if not bool(point_mask.any()):
+                    continue
+                gdf_pts = gdf.loc[point_mask].copy()
+                try:
+                    if (gdf_pts.geometry.geom_type == "MultiPoint").any():
+                        gdf_pts = gdf_pts.explode(index_parts=False)
+                except Exception:
+                    pass
+                if target_crs is not None and gdf_pts.crs is not None and gdf_pts.crs != target_crs:
+                    try:
+                        gdf_pts = gdf_pts.to_crs(target_crs)
+                    except Exception:
+                        pass
+                frames.append(gpd.GeoDataFrame(geometry=gdf_pts.geometry, crs=target_crs or gdf_pts.crs))
+        except Exception:
+            continue
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
+
+
 def map_points_to_bays(
     points_gdf: gpd.GeoDataFrame | None,
     bay_gdf: gpd.GeoDataFrame,
@@ -1773,6 +1833,8 @@ def build_lines_from_points_in_polygon(
         group_sorted = sorted(group, key=lambda t: t[1])
         if not group_sorted:
             continue
+        if len(group_sorted) > 2:
+            group_sorted = [group_sorted[0], group_sorted[-1]]
         avg_perp = sum(item[2] for item in group_sorted) / len(group_sorted)
         start_along = min_along - margin
         end_along = max_along + margin
@@ -4119,8 +4181,13 @@ def run_app() -> None:
                                             return idx
                                     return None
 
-                                points_gdf = collect_point_geometries_from_uploads(sup_gpkg_files, bay_gdf.crs)
-                                points_by_bay = map_points_to_bays(points_gdf, bay_gdf) if points_gdf is not None else {}
+                                lightning_norms = {normalize_for_compare("Lightning Arrester")}
+                                preferred_points = collect_device_points_from_uploads(
+                                    sup_gpkg_files, bay_gdf.crs, device_options, equip_map_sup, lightning_norms
+                                )
+                                all_points = collect_point_geometries_from_uploads(sup_gpkg_files, bay_gdf.crs)
+                                points_source = preferred_points if preferred_points is not None and not preferred_points.empty else all_points
+                                points_by_bay = map_points_to_bays(points_source, bay_gdf) if points_source is not None else {}
 
                                 expanded_instances: list[dict[str, Any]] = []
                                 expanded_geoms: list[Any] = []
