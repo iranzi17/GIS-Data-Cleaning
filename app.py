@@ -1700,6 +1700,61 @@ def collect_device_points_from_uploads(
     return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
 
 
+def collect_device_polygons_from_uploads(
+    files: list[Any] | None,
+    target_crs,
+    device_options: list[str],
+    equip_map: dict[str, str],
+    target_device_norms: set[str],
+) -> gpd.GeoDataFrame | None:
+    """Collect polygon geometries from uploads for specific devices (e.g., Cabins)."""
+    if not files or not target_device_norms:
+        return None
+    frames: list[gpd.GeoDataFrame] = []
+    for file_obj in files:
+        try:
+            dev_name = resolve_equipment_name(file_obj.name, device_options, equip_map)
+        except Exception:
+            dev_name = None
+        if normalize_for_compare(dev_name) not in target_device_norms:
+            continue
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+                tmp.write(file_obj.getbuffer())
+                gpkg_path = Path(tmp.name)
+            layers = list_gpkg_layers(gpkg_path)
+            if not layers:
+                continue
+            for layer in layers:
+                try:
+                    gdf = gpd.read_file(gpkg_path, layer=layer)
+                except Exception:
+                    continue
+                if gdf.empty or not hasattr(gdf, "geometry"):
+                    continue
+                geom_series = gdf.geometry
+                try:
+                    geom_types = geom_series.geom_type
+                except Exception:
+                    continue
+                poly_mask = geom_types.isin(["Polygon", "MultiPolygon"])
+                if not bool(poly_mask.any()):
+                    continue
+                gdf_poly = gdf.loc[poly_mask].copy()
+                if target_crs is not None and gdf_poly.crs is not None and gdf_poly.crs != target_crs:
+                    try:
+                        gdf_poly = gdf_poly.to_crs(target_crs)
+                    except Exception:
+                        pass
+                frames.append(gpd.GeoDataFrame(geometry=gdf_poly.geometry, crs=target_crs or gdf_poly.crs))
+        except Exception:
+            continue
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
+
+
 def map_points_to_bays(
     points_gdf: gpd.GeoDataFrame | None,
     bay_gdf: gpd.GeoDataFrame,
@@ -4281,6 +4336,57 @@ def run_app() -> None:
                                         f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
                                     )
                                     continue
+                        if dev_norm == normalize_for_compare("Earthing Transformer"):
+                            cabin_norms = {normalize_for_compare("Substation/Cabin")}
+                            cabins_gdf = collect_device_polygons_from_uploads(
+                                sup_gpkg_files, None, device_options, equip_map_sup, cabin_norms
+                            )
+                            switchgear_norms = {
+                                normalize_for_compare("MV Switch gear"),
+                                normalize_for_compare("INDOR SWITCHGEAR TABLE"),
+                            }
+                            switchgear_pts = collect_device_points_from_uploads(
+                                sup_gpkg_files, cabins_gdf.crs if cabins_gdf is not None else None, device_options, equip_map_sup, switchgear_norms
+                            )
+                            geoms: list[Any] = []
+                            if cabins_gdf is not None and not cabins_gdf.empty:
+                                try:
+                                    if switchgear_pts is not None and not switchgear_pts.empty and switchgear_pts.crs != cabins_gdf.crs:
+                                        switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
+                                except Exception:
+                                    pass
+                                for _, cabin in cabins_gdf.iterrows():
+                                    poly = cabin.geometry
+                                    anchor = None
+                                    if switchgear_pts is not None and not switchgear_pts.empty:
+                                        try:
+                                            pts_inside = switchgear_pts[switchgear_pts.within(poly)]
+                                        except Exception:
+                                            pts_inside = gpd.GeoDataFrame()
+                                        if not pts_inside.empty:
+                                            try:
+                                                anchor = pts_inside.unary_union.centroid
+                                            except Exception:
+                                                anchor = pts_inside.iloc[0].geometry
+                                    if anchor is None:
+                                        try:
+                                            anchor = poly.centroid
+                                        except Exception:
+                                            anchor = None
+                                    if anchor is not None:
+                                        geoms.append(anchor)
+                            if geoms:
+                                target_count = len(instances)
+                                geoms = expand_geometries(geoms, target_count)
+                                out_gdf = build_device_gdf_from_instances(instances, geoms, cabins_gdf.crs if cabins_gdf is not None else None)
+                                layer_name = derive_layer_name_from_filename(dev_name)
+                                file_name = f"{dev_name}.gpkg"
+                                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                    out_path = Path(tmpout.name)
+                                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                                outputs.append((file_name, out_path))
+                                logs.append(f"{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s)).")
+                                continue
                         tpl = load_template_layer(tpl_path)
                         if tpl is None:
                             logs.append(f"{dev_name}: template not found at {tpl_path}.")
