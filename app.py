@@ -4346,11 +4346,20 @@ def run_app() -> None:
                                     candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
                                     chosen_idx = None
                                     for cand in candidates:
+                                        cand_norms: list[str] = []
                                         norm = normalize_value_for_compare(cand)
-                                        if norm and norm in by_norm and by_norm[norm]:
-                                            chosen_idx = by_norm[norm].pop(0)
-                                            if chosen_idx in unused_set:
-                                                unused_set.remove(chosen_idx)
+                                        if norm:
+                                            cand_norms.append(norm)
+                                            stripped = norm.rstrip("0123456789").rstrip()
+                                            if stripped and stripped not in cand_norms:
+                                                cand_norms.append(stripped)
+                                        for cn in cand_norms:
+                                            if cn and cn in by_norm and by_norm[cn]:
+                                                chosen_idx = by_norm[cn].pop(0)
+                                                if chosen_idx in unused_set:
+                                                    unused_set.remove(chosen_idx)
+                                                break
+                                        if chosen_idx is not None:
                                             break
                                     if chosen_idx is None:
                                         chosen_idx = _take_unused()
