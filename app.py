@@ -4194,6 +4194,13 @@ def run_app() -> None:
                                 logs.append(f"{file_obj.name}: skipped fill (kept original geometry).")
                                 continue
                             device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
+                            if device_for_file not in device_options:
+                                out_path = _write_original_file(file_obj)
+                                outputs.append((file_obj.name, out_path))
+                                logs.append(
+                                    f"{file_obj.name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
+                                )
+                                continue
                             uploaded_device_norms.add(normalize_for_compare(device_for_file))
                             if device_for_file not in instance_cache:
                                 instance_cache[device_for_file] = parse_supervisor_device_table(
