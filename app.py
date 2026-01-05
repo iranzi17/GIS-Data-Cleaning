@@ -369,11 +369,45 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
     """Pick equipment/device name for a given file using explicit map then similarity."""
     norm_file = normalize_for_compare(Path(file_name).stem)
     override = FILE_DEVICE_OVERRIDES.get(norm_file)
-    if override and override in equipment_options:
-        return override
+    if override:
+        if override in equipment_options:
+            return override
+        try:
+            import difflib
+
+            best = difflib.get_close_matches(
+                normalize_for_compare(override),
+                [normalize_for_compare(e) for e in equipment_options],
+                n=1,
+                cutoff=0.8,
+            )
+            if best:
+                match_norm = best[0]
+                for opt in equipment_options:
+                    if normalize_for_compare(opt) == match_norm:
+                        return opt
+        except Exception:
+            pass
     mapped = equip_map.get(norm_file)
-    if mapped and mapped in equipment_options:
-        return mapped
+    if mapped:
+        if mapped in equipment_options:
+            return mapped
+        try:
+            import difflib
+
+            best = difflib.get_close_matches(
+                normalize_for_compare(mapped),
+                [normalize_for_compare(e) for e in equipment_options],
+                n=1,
+                cutoff=0.8,
+            )
+            if best:
+                match_norm = best[0]
+                for opt in equipment_options:
+                    if normalize_for_compare(opt) == match_norm:
+                        return opt
+        except Exception:
+            pass
     try:
         import difflib
 
