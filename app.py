@@ -2254,6 +2254,8 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("INDOR CB"): "Indoor Circuit Breaker/30kv/15kb",
     normalize_for_compare("INDOR CT"): "Indoor Current Transformer",
     normalize_for_compare("INDOR VT"): "Indoor Voltage Transformer",
+    normalize_for_compare("CT INDOR SWITCHGEAR"): "Indoor Current Transformer",
+    normalize_for_compare("ct_indor_switchgear"): "Indoor Current Transformer",
     normalize_for_compare("POWER_TRANSFORMER"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("power_transformer"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("TELECOM"): "Control and Protection Panels",
