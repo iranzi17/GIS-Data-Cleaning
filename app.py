@@ -2290,6 +2290,8 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("INDOR VT"): "Indoor Voltage Transformer",
     normalize_for_compare("CT INDOR SWITCHGEAR"): "Indoor Current Transformer",
     normalize_for_compare("ct_indor_switchgear"): "Indoor Current Transformer",
+    normalize_for_compare("UPS"): "Uninterruptable power supply(UPS)",
+    normalize_for_compare("TRANS_SYSTEM PROT2"): "Distance Protection",
     normalize_for_compare("POWER_TRANSFORMER"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("power_transformer"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("TELECOM"): "Control and Protection Panels",
