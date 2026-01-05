@@ -4359,13 +4359,32 @@ def run_app() -> None:
                                     if chosen_idx is None:
                                         continue
                                     poly = geoms_all[chosen_idx]
+                                    try:
+                                        bay_name_value = bay_gdf.iloc[chosen_idx].get(bay_field)
+                                    except Exception:
+                                        bay_name_value = None
                                     points_in_bay = points_by_bay.get(chosen_idx, [])
                                     lines = build_lines_from_points_in_polygon(poly, points_in_bay, 3)
                                     lines = expand_geometries(lines, 3)
                                     if not lines:
                                         continue
                                     for ln in lines:
-                                        expanded_instances.append(inst)
+                                        inst_copy = dict(inst)
+                                        fields_copy = dict(inst.get("fields", {}) or {})
+                                        if bay_name_value is not None:
+                                            for name_col in [
+                                                "Name",
+                                                "name",
+                                                "Line_Name",
+                                                "line_name",
+                                                "line",
+                                                "Line",
+                                                "Line_Bay_Name",
+                                                "line_bay_name",
+                                            ]:
+                                                fields_copy[name_col] = bay_name_value
+                                        inst_copy["fields"] = fields_copy
+                                        expanded_instances.append(inst_copy)
                                         expanded_geoms.append(ln)
                                 if expanded_geoms:
                                     out_gdf = build_device_gdf_from_instances(
