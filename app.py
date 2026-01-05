@@ -4343,7 +4343,12 @@ def run_app() -> None:
                                 expanded_instances: list[dict[str, Any]] = []
                                 expanded_geoms: list[Any] = []
                                 for inst in instances:
+                                    inst_fields = inst.get("fields", {}) or {}
                                     candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
+                                    for key, val in inst_fields.items():
+                                        norm_key = normalize_for_compare(key)
+                                        if any(tok in norm_key for tok in ["linebay", "line_bay", "bayname", "name"]):
+                                            candidates.append(val)
                                     chosen_idx = None
                                     for cand in candidates:
                                         cand_norms: list[str] = []
