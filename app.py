@@ -4013,6 +4013,7 @@ def run_app() -> None:
                         except Exception:
                             pass
                         bay_lookup: dict[int, Any] = {}
+                        bay_geom_cache = list(bay_gdf.geometry.items())
                         try:
                             joined = gpd.sjoin(out_gdf[[geom_name]], bay_gdf, how="left", predicate="intersects")
                         except TypeError:
@@ -4039,16 +4040,43 @@ def run_app() -> None:
                                 for idx, geom in out_gdf.geometry.items():
                                     if geom is None or getattr(geom, "is_empty", True):
                                         continue
-                                    for b_idx, b_row in bay_gdf.iterrows():
-                                        b_geom = b_row.geometry
+                                    for b_idx, b_row in bay_geom_cache:
+                                        b_geom = b_row
                                         if b_geom is None or getattr(b_geom, "is_empty", True):
                                             continue
                                         try:
                                             if b_geom.intersects(geom):
-                                                bay_lookup[idx] = b_row.get(bay_field)
+                                                bay_lookup[idx] = bay_gdf.iloc[int(b_idx)].get(bay_field)
                                                 break
                                         except Exception:
                                             continue
+                            except Exception:
+                                pass
+                        if not bay_lookup:
+                            # Nearest bay fallback
+                            try:
+                                for idx, geom in out_gdf.geometry.items():
+                                    if geom is None or getattr(geom, "is_empty", True):
+                                        continue
+                                    best_idx = None
+                                    best_dist = None
+                                    for b_idx, b_geom in bay_geom_cache:
+                                        if b_geom is None or getattr(b_geom, "is_empty", True):
+                                            continue
+                                        try:
+                                            dist = b_geom.distance(geom)
+                                        except Exception:
+                                            continue
+                                        if best_dist is None or dist < best_dist:
+                                            best_dist = dist
+                                            best_idx = b_idx
+                                    if best_idx is not None:
+                                        try:
+                                            bay_name_val = bay_gdf.iloc[int(best_idx)].get(bay_field)
+                                        except Exception:
+                                            bay_name_val = None
+                                        if bay_name_val is not None:
+                                            bay_lookup[idx] = bay_name_val
                             except Exception:
                                 pass
                         if bay_lookup:
