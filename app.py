@@ -1894,6 +1894,97 @@ def map_points_to_bays(
     return ordered_out
 
 
+def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any], geom_name: str) -> gpd.GeoDataFrame:
+    """Assign line name fields based on intersecting/nearest Line Bay polygons."""
+    if out_gdf is None or out_gdf.empty or geom_name not in out_gdf.columns:
+        return out_gdf
+    bay_gdf = load_line_bay_layer(
+        line_bay_info.get("path"),
+        line_bay_info.get("layer"),
+        line_bay_info.get("field"),
+    )
+    if bay_gdf is None or bay_gdf.empty:
+        return out_gdf
+    bay_field = line_bay_info.get("field")
+    try:
+        if out_gdf.crs is not None and bay_gdf.crs is not None and out_gdf.crs != bay_gdf.crs:
+            bay_gdf = bay_gdf.to_crs(out_gdf.crs)
+    except Exception:
+        pass
+
+    name_fields = [
+        "Name",
+        "name",
+        "Line_Name",
+        "line_name",
+        "line",
+        "Line",
+        "Line_Bay_Name",
+        "line_bay_name",
+    ]
+
+    bay_lookup: dict[int, Any] = {}
+    try:
+        joined = gpd.sjoin(out_gdf[[geom_name]].set_geometry(geom_name), bay_gdf, how="left", predicate="intersects")
+    except TypeError:
+        try:
+            joined = gpd.sjoin(out_gdf[[geom_name]].set_geometry(geom_name), bay_gdf, how="left", op="intersects")
+        except Exception:
+            joined = None
+    except Exception:
+        joined = None
+    if joined is not None and "index_right" in joined.columns:
+        for idx, row in joined.iterrows():
+            bay_idx = row.get("index_right")
+            if pd.isna(bay_idx):
+                continue
+            try:
+                bay_name_val = bay_gdf.iloc[int(bay_idx)].get(bay_field)
+            except Exception:
+                bay_name_val = None
+            if bay_name_val is not None:
+                bay_lookup[idx] = bay_name_val
+
+    # Nearest-bay fallback for any lines without match
+    if len(bay_lookup) < len(out_gdf):
+        try:
+            bay_centroids = [(idx, geom.centroid) for idx, geom in bay_gdf.geometry.items() if geom is not None and not geom.is_empty]
+            for idx, geom in out_gdf.geometry.items():
+                if idx in bay_lookup:
+                    continue
+                if geom is None or getattr(geom, "is_empty", True):
+                    continue
+                line_centroid = geom.centroid
+                best_idx = None
+                best_dist = None
+                for b_idx, b_cent in bay_centroids:
+                    try:
+                        dist = line_centroid.distance(b_cent)
+                    except Exception:
+                        continue
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best_idx = b_idx
+                if best_idx is not None:
+                    try:
+                        bay_name_val = bay_gdf.iloc[int(best_idx)].get(bay_field)
+                    except Exception:
+                        bay_name_val = None
+                    if bay_name_val is not None:
+                        bay_lookup[idx] = bay_name_val
+        except Exception:
+            pass
+
+    if bay_lookup:
+        for idx, bay_name_val in bay_lookup.items():
+            for col in name_fields:
+                try:
+                    out_gdf.loc[idx, col] = bay_name_val
+                except Exception:
+                    continue
+    return out_gdf
+
+
 def group_points_by_perp_gap(
     items: list[tuple[Any, float, float]],
     group_count: int,
@@ -3993,109 +4084,14 @@ def run_app() -> None:
                     crs=gdf_sup_local.crs,
                 )
 
-                # Post-fill: align High Voltage Line names to intersecting Line Bay names (uploaded HV lines).
+                # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
                 if (
                     normalize_for_compare(device_name) == normalize_for_compare("High Voltage Line")
                     and line_bay_info
                     and geom_name
                     and hasattr(out_gdf, "geometry")
                 ):
-                    bay_gdf = load_line_bay_layer(
-                        line_bay_info.get("path"),
-                        line_bay_info.get("layer"),
-                        line_bay_info.get("field"),
-                    )
-                    if bay_gdf is not None and not bay_gdf.empty:
-                        bay_field = line_bay_info.get("field")
-                        try:
-                            if out_gdf.crs is not None and bay_gdf.crs is not None and out_gdf.crs != bay_gdf.crs:
-                                bay_gdf = bay_gdf.to_crs(out_gdf.crs)
-                        except Exception:
-                            pass
-                        bay_lookup: dict[int, Any] = {}
-                        bay_geom_cache = list(bay_gdf.geometry.items())
-                        try:
-                            joined = gpd.sjoin(out_gdf[[geom_name]], bay_gdf, how="left", predicate="intersects")
-                        except TypeError:
-                            try:
-                                joined = gpd.sjoin(out_gdf[[geom_name]], bay_gdf, how="left", op="intersects")
-                            except Exception:
-                                joined = None
-                        except Exception:
-                            joined = None
-                        if joined is not None and "index_right" in joined.columns:
-                            for idx, row in joined.iterrows():
-                                bay_idx = row.get("index_right")
-                                if pd.isna(bay_idx):
-                                    continue
-                                try:
-                                    bay_name_val = bay_gdf.iloc[int(bay_idx)].get(bay_field)
-                                except Exception:
-                                    bay_name_val = None
-                                if bay_name_val is not None:
-                                    bay_lookup[idx] = bay_name_val
-                        if not bay_lookup:
-                            # Manual intersects/contains fallback
-                            try:
-                                for idx, geom in out_gdf.geometry.items():
-                                    if geom is None or getattr(geom, "is_empty", True):
-                                        continue
-                                    for b_idx, b_row in bay_geom_cache:
-                                        b_geom = b_row
-                                        if b_geom is None or getattr(b_geom, "is_empty", True):
-                                            continue
-                                        try:
-                                            if b_geom.intersects(geom):
-                                                bay_lookup[idx] = bay_gdf.iloc[int(b_idx)].get(bay_field)
-                                                break
-                                        except Exception:
-                                            continue
-                            except Exception:
-                                pass
-                        if not bay_lookup:
-                            # Nearest bay fallback
-                            try:
-                                for idx, geom in out_gdf.geometry.items():
-                                    if geom is None or getattr(geom, "is_empty", True):
-                                        continue
-                                    best_idx = None
-                                    best_dist = None
-                                    for b_idx, b_geom in bay_geom_cache:
-                                        if b_geom is None or getattr(b_geom, "is_empty", True):
-                                            continue
-                                        try:
-                                            dist = b_geom.distance(geom)
-                                        except Exception:
-                                            continue
-                                        if best_dist is None or dist < best_dist:
-                                            best_dist = dist
-                                            best_idx = b_idx
-                                    if best_idx is not None:
-                                        try:
-                                            bay_name_val = bay_gdf.iloc[int(best_idx)].get(bay_field)
-                                        except Exception:
-                                            bay_name_val = None
-                                        if bay_name_val is not None:
-                                            bay_lookup[idx] = bay_name_val
-                            except Exception:
-                                pass
-                        if bay_lookup:
-                            name_fields = [
-                                "Name",
-                                "name",
-                                "Line_Name",
-                                "line_name",
-                                "line",
-                                "Line",
-                                "Line_Bay_Name",
-                                "line_bay_name",
-                            ]
-                            for idx, bay_name_val in bay_lookup.items():
-                                for col in name_fields:
-                                    try:
-                                        out_gdf.loc[idx, col] = bay_name_val
-                                    except Exception:
-                                        continue
+                    out_gdf = apply_line_bay_names(out_gdf, line_bay_info, geom_name)
 
                 out_gdf = sanitize_gdf_for_gpkg(out_gdf)
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
