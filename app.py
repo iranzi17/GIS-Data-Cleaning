@@ -1898,6 +1898,16 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
     """Assign line name fields based on intersecting/nearest Line Bay polygons."""
     if out_gdf is None or out_gdf.empty or geom_name not in out_gdf.columns:
         return out_gdf
+    if line_bay_info.get("path") and line_bay_info.get("layer") is None:
+        try:
+            import fiona
+
+            layers = fiona.listlayers(line_bay_info.get("path"))
+            if layers:
+                line_bay_info = dict(line_bay_info)
+                line_bay_info["layer"] = layers[0]
+        except Exception:
+            pass
     bay_gdf = load_line_bay_layer(
         line_bay_info.get("path"),
         line_bay_info.get("layer"),
