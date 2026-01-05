@@ -379,7 +379,7 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
                 normalize_for_compare(override),
                 [normalize_for_compare(e) for e in equipment_options],
                 n=1,
-                cutoff=0.8,
+                cutoff=0.6,
             )
             if best:
                 match_norm = best[0]
@@ -399,7 +399,7 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
                 normalize_for_compare(mapped),
                 [normalize_for_compare(e) for e in equipment_options],
                 n=1,
-                cutoff=0.8,
+                cutoff=0.6,
             )
             if best:
                 match_norm = best[0]
