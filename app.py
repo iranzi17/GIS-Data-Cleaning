@@ -2010,6 +2010,34 @@ def _extract_bay_name_from_row(row: pd.Series, name_field: str | None, id_name_m
     return bay_val
 
 
+def replace_line_name_ids(out_gdf: gpd.GeoDataFrame, id_name_map: dict[str, Any], name_fields: list[str] | None = None) -> gpd.GeoDataFrame:
+    """Replace Name/Line name columns that still contain Line_Bay_ID with the corresponding Line_Bay_Name."""
+    if out_gdf is None or out_gdf.empty or not isinstance(id_name_map, dict) or not id_name_map:
+        return out_gdf
+    name_fields = name_fields or [
+        "Name",
+        "name",
+        "Line_Name",
+        "line_name",
+        "line",
+        "Line",
+        "Line_Bay_Name",
+        "line_bay_name",
+    ]
+    id_lookup = {normalize_value_for_compare(k): v for k, v in id_name_map.items()}
+    out = out_gdf.copy()
+    for col in name_fields:
+        if col not in out.columns:
+            continue
+        try:
+            series = out[col]
+            mapped = series.map(lambda v: id_lookup.get(normalize_value_for_compare(v), v) if pd.notna(v) else v)
+            out[col] = mapped
+        except Exception:
+            continue
+    return out
+
+
 def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any], geom_name: str) -> gpd.GeoDataFrame:
     """Assign line name fields based on intersecting/nearest Line Bay polygons."""
     if out_gdf is None or out_gdf.empty or geom_name not in out_gdf.columns:
@@ -4294,6 +4322,9 @@ def run_app() -> None:
                     and hasattr(out_gdf, "geometry")
                 ):
                     out_gdf = apply_line_bay_names(out_gdf, line_bay_info, geom_name)
+                    id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                    if isinstance(id_name_map, dict) and id_name_map:
+                        out_gdf = replace_line_name_ids(out_gdf, id_name_map)
 
                 out_gdf = sanitize_gdf_for_gpkg(out_gdf)
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
@@ -4807,6 +4838,9 @@ def run_app() -> None:
                             continue
                         out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
                         if dev_norm == normalize_for_compare("High Voltage Line"):
+                            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                            if isinstance(id_name_map, dict) and id_name_map:
+                                out_gdf = replace_line_name_ids(out_gdf, id_name_map)
                             out_gdf = ensure_name_fields_string(
                                 out_gdf,
                                 [
