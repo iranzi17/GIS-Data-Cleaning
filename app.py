@@ -2009,6 +2009,20 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
     return out_gdf
 
 
+def ensure_name_fields_string(gdf: gpd.GeoDataFrame, fields: list[str]) -> gpd.GeoDataFrame:
+    """Force name-like fields to string dtype to avoid GPKG schema errors."""
+    for col in fields:
+        if col in gdf.columns:
+            try:
+                gdf[col] = gdf[col].astype("string")
+            except Exception:
+                try:
+                    gdf[col] = gdf[col].astype(str)
+                except Exception:
+                    pass
+    return gdf
+
+
 def group_points_by_perp_gap(
     items: list[tuple[Any, float, float]],
     group_count: int,
@@ -4525,20 +4539,32 @@ def run_app() -> None:
                                         inst_copy["fields"] = fields_copy
                                         expanded_instances.append(inst_copy)
                                         expanded_geoms.append(ln)
-                                if expanded_geoms:
-                                    out_gdf = build_device_gdf_from_instances(
-                                        expanded_instances, expanded_geoms, bay_gdf.crs
-                                    )
-                                    layer_name = derive_layer_name_from_filename(dev_name)
-                                    file_name = f"{dev_name}.gpkg"
-                                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                                        out_path = Path(tmpout.name)
-                                    out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                                    outputs.append((file_name, out_path))
-                                    logs.append(
-                                        f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
-                                    )
-                                    continue
+                        if expanded_geoms:
+                            out_gdf = build_device_gdf_from_instances(
+                                expanded_instances, expanded_geoms, bay_gdf.crs
+                            )
+                            out_gdf = ensure_name_fields_string(
+                                out_gdf,
+                                [
+                                    "Name",
+                                    "Line_Name",
+                                    "Line_Bay_Name",
+                                    "line_name",
+                                    "line_bay_name",
+                                    "line",
+                                    "Line",
+                                ],
+                            )
+                            layer_name = derive_layer_name_from_filename(dev_name)
+                            file_name = f"{dev_name}.gpkg"
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            outputs.append((file_name, out_path))
+                            logs.append(
+                                f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
+                            )
+                            continue
                         if dev_norm == normalize_for_compare("Earthing Transformer"):
                             cabin_norms = {normalize_for_compare("Substation/Cabin")}
                             cabins_gdf = collect_device_polygons_from_uploads(
@@ -4607,6 +4633,19 @@ def run_app() -> None:
                             logs.append(f"{dev_name}: template has no geometry.")
                             continue
                         out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
+                        if dev_norm == normalize_for_compare("High Voltage Line"):
+                            out_gdf = ensure_name_fields_string(
+                                out_gdf,
+                                [
+                                    "Name",
+                                    "Line_Name",
+                                    "Line_Bay_Name",
+                                    "line_name",
+                                    "line_bay_name",
+                                    "line",
+                                    "Line",
+                                ],
+                            )
                         layer_name = derive_layer_name_from_filename(dev_name)
                         file_name = f"{dev_name}.gpkg"
                         with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
