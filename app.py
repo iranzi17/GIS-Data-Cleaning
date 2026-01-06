@@ -4814,6 +4814,11 @@ def run_app() -> None:
                                 target_count = len(instances)
                                 geoms = expand_geometries(geoms, target_count)
                                 out_gdf = build_device_gdf_from_instances(instances, geoms, cabins_gdf.crs if cabins_gdf is not None else None)
+                                try:
+                                    out_gdf = out_gdf.copy()
+                                    out_gdf.geometry = out_gdf.geometry.centroid
+                                except Exception:
+                                    pass
                                 layer_name = derive_layer_name_from_filename(dev_name)
                                 file_name = f"{dev_name}.gpkg"
                                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
@@ -4834,11 +4839,11 @@ def run_app() -> None:
                         if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
                             geoms = cabin_anchor_points.copy()
                         # Ensure Earthing Transformer auto-create always uses points (fall back to centroids if template isn't point-based).
-                        if dev_norm == normalize_for_compare("Earthing Transformer"):
-                            clean_geoms: list[Any] = []
-                            for g in geoms:
-                                if g is None or getattr(g, "is_empty", True):
-                                    continue
+                            if dev_norm == normalize_for_compare("Earthing Transformer"):
+                                clean_geoms: list[Any] = []
+                                for g in geoms:
+                                    if g is None or getattr(g, "is_empty", True):
+                                        continue
                                 if getattr(g, "geom_type", "").lower() == "point":
                                     clean_geoms.append(g)
                                 else:
@@ -4858,6 +4863,12 @@ def run_app() -> None:
                             logs.append(f"{dev_name}: template has no geometry.")
                             continue
                         out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
+                        if dev_norm == normalize_for_compare("Earthing Transformer"):
+                            try:
+                                out_gdf = out_gdf.copy()
+                                out_gdf.geometry = out_gdf.geometry.centroid
+                            except Exception:
+                                pass
                         if dev_norm == normalize_for_compare("High Voltage Line"):
                             id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
                             if isinstance(id_name_map, dict) and id_name_map:
