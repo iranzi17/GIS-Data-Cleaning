@@ -1915,6 +1915,47 @@ def map_points_to_bays(
     return ordered_out
 
 
+def _pick_line_bay_name_field(df: gpd.GeoDataFrame, selected: str | None) -> str | None:
+    """Choose a name-bearing column from a Line Bay layer, preferring *_name over *_id."""
+    if df is None or df.empty:
+        return selected
+    cols = list(df.columns)
+    if hasattr(df, "geometry") and df.geometry.name in cols:
+        cols = [c for c in cols if c != df.geometry.name]
+    if not cols:
+        return selected
+
+    def _score(col: str) -> int:
+        norm = normalize_for_compare(col)
+        score = 0
+        if "name" in norm:
+            score += 5
+        if "line" in norm:
+            score += 2
+        if "bay" in norm:
+            score += 2
+        if "id" in norm:
+            score -= 3
+        return score
+
+    lookup = {normalize_for_compare(c): c for c in cols}
+    sel_norm = normalize_for_compare(selected) if selected else ""
+    best_col = None
+    best_score = -999
+    for c in cols:
+        sc = _score(c)
+        if sel_norm and normalize_for_compare(c) == sel_norm:
+            sc += 1  # slight bias to user's pick
+        if sc > best_score:
+            best_score = sc
+            best_col = c
+    if best_col:
+        return best_col
+    if sel_norm and sel_norm in lookup:
+        return lookup[sel_norm]
+    return cols[0]
+
+
 def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any], geom_name: str) -> gpd.GeoDataFrame:
     """Assign line name fields based on intersecting/nearest Line Bay polygons."""
     if out_gdf is None or out_gdf.empty or geom_name not in out_gdf.columns:
@@ -1936,7 +1977,7 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
     )
     if bay_gdf is None or bay_gdf.empty:
         return out_gdf
-    bay_field = line_bay_info.get("field")
+    bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
     try:
         if out_gdf.crs is not None and bay_gdf.crs is not None and out_gdf.crs != bay_gdf.crs:
             bay_gdf = bay_gdf.to_crs(out_gdf.crs)
@@ -4518,30 +4559,7 @@ def run_app() -> None:
                                 line_bay_info.get("field"),
                             )
                             if bay_gdf is not None and not bay_gdf.empty:
-                                bay_field_selected = line_bay_info.get("field")
-                                # Prefer a name-like column for naming; fall back to the selected field.
-                                def _pick_bay_name_field(df: gpd.GeoDataFrame, selected: str | None) -> str | None:
-                                    cols = list(df.columns)
-                                    if df.geometry.name in cols:
-                                        cols = [c for c in cols if c != df.geometry.name]
-                                    lookup = {normalize_for_compare(c): c for c in cols}
-                                    # If selection already looks like a name, keep it.
-                                    if selected and "name" in normalize_for_compare(selected):
-                                        return selected
-                                    # Try common name fields.
-                                    for cand in ["line bay name", "line_bay_name", "name", "line name", "line_name"]:
-                                        n = normalize_for_compare(cand)
-                                        if n in lookup:
-                                            return lookup[n]
-                                    # Otherwise, if selection exists, use it; else pick the shortest string column.
-                                    if selected and normalize_for_compare(selected) in lookup:
-                                        return lookup[normalize_for_compare(selected)]
-                                    string_cols = [c for c in cols if pd.api.types.is_string_dtype(df[c])]
-                                    if string_cols:
-                                        return sorted(string_cols, key=len)[0]
-                                    return None
-
-                                bay_field = _pick_bay_name_field(bay_gdf, bay_field_selected)
+                                bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
                                 geom_col = bay_gdf.geometry.name
                                 geoms_all = list(bay_gdf[geom_col])
                                 by_norm: dict[str, list[int]] = {}
