@@ -4782,6 +4782,7 @@ def run_app() -> None:
                                 sup_gpkg_files, cabins_gdf.crs if cabins_gdf is not None else None, device_options, equip_map_sup, switchgear_norms
                             )
                             geoms: list[Any] = []
+                            cabin_anchor_points: list[Any] = []
                             if cabins_gdf is not None and not cabins_gdf.empty:
                                 try:
                                     if switchgear_pts is not None and not switchgear_pts.empty and switchgear_pts.crs != cabins_gdf.crs:
@@ -4808,6 +4809,7 @@ def run_app() -> None:
                                             anchor = None
                                     if anchor is not None:
                                         geoms.append(anchor)
+                                        cabin_anchor_points.append(anchor)
                             if geoms:
                                 target_count = len(instances)
                                 geoms = expand_geometries(geoms, target_count)
@@ -4826,6 +4828,8 @@ def run_app() -> None:
                             continue
                         tpl_gdf, _tpl_layer = tpl
                         geoms = list(tpl_gdf.geometry)
+                        if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
+                            geoms = cabin_anchor_points.copy()
                         if dev_norm == normalize_for_compare("High Voltage Line"):
                             instances = repeat_instances(instances, 3)
                         target_count = len(instances)
