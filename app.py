@@ -1956,6 +1956,60 @@ def _pick_line_bay_name_field(df: gpd.GeoDataFrame, selected: str | None) -> str
     return cols[0]
 
 
+def _build_line_bay_id_name_map(workbook_path: Path | None, sheet_name: str | None) -> dict[str, Any]:
+    """Build mapping of Line_Bay_ID -> Line_Bay_Name from the supervisor sheet."""
+    if workbook_path is None or sheet_name is None:
+        return {}
+    try:
+        instances = parse_supervisor_device_table(workbook_path, sheet_name, "Line Bay")
+    except Exception:
+        return {}
+    mapping: dict[str, Any] = {}
+    for inst in instances:
+        fields = inst.get("fields", {}) or {}
+        lookup = {normalize_for_compare(k): k for k in fields.keys()}
+        id_val = None
+        name_val = None
+        for alias in ["line_bay_id", "linebayid", "line bay id", "line_bayid", "line bay_id"]:
+            key = lookup.get(normalize_for_compare(alias))
+            if key:
+                id_val = fields.get(key)
+                break
+        for alias in ["line_bay_name", "linebayname", "line bay name", "line_bayname", "name"]:
+            key = lookup.get(normalize_for_compare(alias))
+            if key:
+                name_val = fields.get(key)
+                break
+        norm_id = normalize_value_for_compare(id_val)
+        if norm_id and name_val is not None and pd.notna(name_val):
+            mapping[norm_id] = name_val
+    return mapping
+
+
+def _extract_bay_name_from_row(row: pd.Series, name_field: str | None, id_name_map: dict[str, Any]) -> Any:
+    """Resolve a bay name from a row, falling back to id->name map and other name-like columns."""
+    bay_val = row.get(name_field) if name_field else None
+    lookup = {normalize_for_compare(k): k for k in row.index}
+
+    def _get_by_alias(aliases: list[str]) -> Any:
+        for alias in aliases:
+            key = lookup.get(normalize_for_compare(alias))
+            if key:
+                return row.get(key)
+        return None
+
+    id_val = _get_by_alias(["line_bay_id", "linebayid", "line bay id", "line_bayid", "line bay_id"])
+    norm_id = normalize_value_for_compare(id_val if id_val is not None else bay_val)
+    if norm_id and norm_id in id_name_map:
+        return id_name_map[norm_id]
+
+    if bay_val is None or pd.isna(bay_val):
+        name_alt = _get_by_alias(["line_bay_name", "linebayname", "line bay name", "line_bayname", "name"])
+        if name_alt is not None and not pd.isna(name_alt):
+            return name_alt
+    return bay_val
+
+
 def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any], geom_name: str) -> gpd.GeoDataFrame:
     """Assign line name fields based on intersecting/nearest Line Bay polygons."""
     if out_gdf is None or out_gdf.empty or geom_name not in out_gdf.columns:
@@ -1978,6 +2032,9 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
     if bay_gdf is None or bay_gdf.empty:
         return out_gdf
     bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
+    id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+    if not isinstance(id_name_map, dict):
+        id_name_map = {}
     try:
         if out_gdf.crs is not None and bay_gdf.crs is not None and out_gdf.crs != bay_gdf.crs:
             bay_gdf = bay_gdf.to_crs(out_gdf.crs)
@@ -2011,7 +2068,8 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
             if pd.isna(bay_idx):
                 continue
             try:
-                bay_name_val = bay_gdf.iloc[int(bay_idx)].get(bay_field)
+                bay_row = bay_gdf.iloc[int(bay_idx)]
+                bay_name_val = _extract_bay_name_from_row(bay_row, bay_field, id_name_map)
             except Exception:
                 bay_name_val = None
             if bay_name_val is not None:
@@ -2039,7 +2097,8 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
                         best_idx = b_idx
                 if best_idx is not None:
                     try:
-                        bay_name_val = bay_gdf.iloc[int(best_idx)].get(bay_field)
+                        bay_row = bay_gdf.iloc[int(best_idx)]
+                        bay_name_val = _extract_bay_name_from_row(bay_row, bay_field, id_name_map)
                     except Exception:
                         bay_name_val = None
                     if bay_name_val is not None:
@@ -3547,6 +3606,7 @@ def run_app() -> None:
                                         "path": line_bay_path,
                                         "layer": line_bay_layer,
                                         "field": line_bay_field,
+                                        "id_name_map": _build_line_bay_id_name_map(sup_wb_path, sup_sheet),
                                     }
                             else:
                                 st.warning("No attribute columns found in Line Bay layer.")
@@ -4560,11 +4620,14 @@ def run_app() -> None:
                             )
                             if bay_gdf is not None and not bay_gdf.empty:
                                 bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
+                                id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                                if not isinstance(id_name_map, dict):
+                                    id_name_map = {}
                                 geom_col = bay_gdf.geometry.name
                                 geoms_all = list(bay_gdf[geom_col])
                                 by_norm: dict[str, list[int]] = {}
                                 for idx, row in bay_gdf.iterrows():
-                                    name_val = row.get(bay_field)
+                                    name_val = _extract_bay_name_from_row(row, bay_field, id_name_map)
                                     norm = normalize_value_for_compare(name_val)
                                     if not norm:
                                         continue
@@ -4622,7 +4685,8 @@ def run_app() -> None:
                                         continue
                                     poly = geoms_all[chosen_idx]
                                     try:
-                                        bay_name_value = bay_gdf.iloc[chosen_idx].get(bay_field)
+                                        bay_row = bay_gdf.iloc[chosen_idx]
+                                        bay_name_value = _extract_bay_name_from_row(bay_row, bay_field, id_name_map)
                                     except Exception:
                                         bay_name_value = None
                                     points_in_bay = points_by_bay.get(chosen_idx, [])
