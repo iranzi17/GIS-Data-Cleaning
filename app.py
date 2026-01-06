@@ -4822,6 +4822,9 @@ def run_app() -> None:
                                 outputs.append((file_name, out_path))
                                 logs.append(f"{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s)).")
                                 continue
+                            else:
+                                logs.append(f"{dev_name}: skipped auto-create (no cabin polygons uploaded).")
+                                continue
                         tpl = load_template_layer(tpl_path)
                         if tpl is None:
                             logs.append(f"{dev_name}: template not found at {tpl_path}.")
