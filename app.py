@@ -449,6 +449,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             domain_code_map[key] = val
     instances: list[dict[str, Any]] = []
     current_fields: dict[str, Any] | None = None
+    type_map_device: dict[str, str] = {}
 
     def _extract_value(row: pd.Series, dtype: str) -> Any:
         def _is_blank(value: Any) -> bool:
@@ -588,6 +589,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "name_value": name_value,
                 "feeder_value": feeder_value,
                 "order": order.copy(),
+                "type_map": type_map_device.copy(),
             }
         )
 
@@ -648,6 +650,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 else:
                     type_str = "Double"
                     cache[cache_key] = type_str
+        # Track declared data type (column C) for later schema enforcement.
+        type_map_device[field_clean] = type_str
         val = _extract_value(row, type_str)
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
@@ -1433,6 +1437,12 @@ def build_device_gdf_from_instances(
     count = len(points)
     if count <= 0:
         return gpd.GeoDataFrame(geometry=[])
+    type_map_local: dict[str, str] = {}
+    for inst in instances:
+        tm = inst.get("type_map") if isinstance(inst, dict) else None
+        if isinstance(tm, dict) and tm:
+            type_map_local = dict(tm)
+            break
     fields_ordered: list[str] = []
     fields_seen: set[str] = set()
     for inst in instances:
@@ -1455,6 +1465,17 @@ def build_device_gdf_from_instances(
             fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
             data[f][idx] = fill_val
     out_gdf = gpd.GeoDataFrame(data, geometry=points, crs=crs)
+    if type_map_local:
+        norm_lookup = {normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None}
+        for col in out_gdf.columns:
+            if col == out_gdf.geometry.name:
+                continue
+            t_str = type_map_local.get(col) or norm_lookup.get(normalize_for_compare(col))
+            if t_str:
+                try:
+                    out_gdf[col] = coerce_series_to_type(out_gdf[col], t_str)
+                except Exception:
+                    pass
     return sanitize_gdf_for_gpkg(out_gdf)
 
 
@@ -3551,6 +3572,7 @@ def run_app() -> None:
                 elif ups_upload_candidate is None:
                     st.info("Upload an UPS GeoPackage or include UPS among uploads to place protection devices.")
             device_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_choice)
+            device_type_map = device_instances[0].get("type_map", {}) if device_instances else {}
             instance_labels = [inst["label"] for inst in device_instances]
             selected_instance = None
             if instance_labels:
@@ -3616,6 +3638,7 @@ def run_app() -> None:
                 sequential_instances: list[dict[str, Any]] | None = None,
                 line_bay_info: dict[str, Any] | None = None,
                 ups_anchor_info: dict[str, Any] | None = None,
+                type_map: dict[str, str] | None = None,
             ) -> tuple[Path, str]:
                 # normalize sequential_instances to a list of entries with fields + optional ids
                 seq_entries: list[dict[str, Any]] = []
@@ -3627,10 +3650,27 @@ def run_app() -> None:
                                     "fields": inst.get("fields", {}) or {},
                                     "id": inst.get("id_value"),
                                     "name": inst.get("name_value"),
+                                    "type_map": inst.get("type_map"),
                                 }
                             )
                         else:
-                            seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
+                            seq_entries.append(
+                                {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
+                            )
+
+                type_map_local = dict(type_map) if isinstance(type_map, dict) else {}
+
+                def _extract_type_map(instances: list[dict[str, Any]] | None) -> dict[str, str]:
+                    if not instances:
+                        return {}
+                    for inst in instances:
+                        tm = inst.get("type_map") if isinstance(inst, dict) else None
+                        if isinstance(tm, dict) and tm:
+                            return dict(tm)
+                    return {}
+
+                if not type_map_local:
+                    type_map_local = _extract_type_map(seq_entries)
 
                 block_assign = normalize_for_compare(device_name) in BLOCK_ASSIGN_DEVICES
 
@@ -3757,6 +3797,8 @@ def run_app() -> None:
                     parsed_instances = parsed
                     fm_local = parsed[0].get("fields", {})
                     order_local = parsed[0].get("order", [])
+                    if not type_map_local:
+                        type_map_local = _extract_type_map(parsed)
                 if fm_local is None and match_column is None:
                     raise ValueError(f"No field values available for device '{device_name}'.")
                 out_cols: dict[str, Any] = {}
@@ -3986,9 +4028,14 @@ def run_app() -> None:
                                         "fields": inst.get("fields", {}) or {},
                                         "id": inst.get("id_value"),
                                         "name": inst.get("name_value"),
+                                        "type_map": inst.get("type_map"),
                                     })
                                 else:
-                                    seq_entries.append({"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None})
+                                    seq_entries.append(
+                                        {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
+                                    )
+                            if not type_map_local:
+                                type_map_local = _extract_type_map(seq_entries)
                             seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
                             if block_assign and hasattr(gdf_sup_local, "geometry"):
                                 try:
@@ -4104,6 +4151,22 @@ def run_app() -> None:
                             out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
                             filled_fields.append(target_col)
 
+                if type_map_local:
+                    norm_type_lookup = {
+                        normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
+                    }
+                    for col_name, series in list(out_cols.items()):
+                        if col_name == geom_name:
+                            continue
+                        t_str = type_map_local.get(col_name)
+                        if t_str is None:
+                            t_str = norm_type_lookup.get(normalize_for_compare(col_name))
+                        if t_str:
+                            try:
+                                out_cols[col_name] = coerce_series_to_type(series, t_str)
+                            except Exception:
+                                pass
+
                 keep_cols = filled_fields.copy()
                 if match_column and match_column in out_cols:
                     norm_keep = {normalize_for_compare(c) for c in keep_cols}
@@ -4195,6 +4258,7 @@ def run_app() -> None:
                                     field_order=inst.get("order"),
                                     line_bay_info=line_bay_info,
                                     ups_anchor_info=ups_anchor_info,
+                                    type_map=inst.get("type_map") or device_type_map,
                                 )
                                 # create a friendly name per instance
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
@@ -4268,6 +4332,7 @@ def run_app() -> None:
                                 sequential_instances=seq_arg,
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
+                                type_map=device_type_map,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -4287,6 +4352,7 @@ def run_app() -> None:
                                 field_order=selected_instance.get("order") if selected_instance else None,
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
+                                type_map=device_type_map,
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -4348,6 +4414,7 @@ def run_app() -> None:
                             inst = _pick_instance_for_file(file_obj.name, instance_cache.get(device_for_file, []))
                             seq_arg = None
                             cached_instances = instance_cache.get(device_for_file, [])
+                            type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
                             if len(cached_instances) > 1:
                                 seq_arg = cached_instances
                             elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
@@ -4384,6 +4451,7 @@ def run_app() -> None:
                                 sequential_instances=seq_arg,
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
+                                type_map=type_map_device,
                             )
                             outputs.append((file_obj.name, out_path))
                             chosen_label = inst.get("label") if inst else "default instance"
