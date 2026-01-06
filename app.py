@@ -1986,8 +1986,13 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
             pass
 
     if bay_lookup:
+        target_cols = [c for c in name_fields if c in out_gdf.columns]
+        if not target_cols:
+            target_cols = ["Name"]
+            if "Name" not in out_gdf.columns:
+                out_gdf["Name"] = pd.NA
         for idx, bay_name_val in bay_lookup.items():
-            for col in name_fields:
+            for col in target_cols:
                 try:
                     out_gdf.loc[idx, col] = bay_name_val
                 except Exception:
