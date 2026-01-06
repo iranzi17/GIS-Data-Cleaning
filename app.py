@@ -4518,7 +4518,30 @@ def run_app() -> None:
                                 line_bay_info.get("field"),
                             )
                             if bay_gdf is not None and not bay_gdf.empty:
-                                bay_field = line_bay_info.get("field")
+                                bay_field_selected = line_bay_info.get("field")
+                                # Prefer a name-like column for naming; fall back to the selected field.
+                                def _pick_bay_name_field(df: gpd.GeoDataFrame, selected: str | None) -> str | None:
+                                    cols = list(df.columns)
+                                    if df.geometry.name in cols:
+                                        cols = [c for c in cols if c != df.geometry.name]
+                                    lookup = {normalize_for_compare(c): c for c in cols}
+                                    # If selection already looks like a name, keep it.
+                                    if selected and "name" in normalize_for_compare(selected):
+                                        return selected
+                                    # Try common name fields.
+                                    for cand in ["line bay name", "line_bay_name", "name", "line name", "line_name"]:
+                                        n = normalize_for_compare(cand)
+                                        if n in lookup:
+                                            return lookup[n]
+                                    # Otherwise, if selection exists, use it; else pick the shortest string column.
+                                    if selected and normalize_for_compare(selected) in lookup:
+                                        return lookup[normalize_for_compare(selected)]
+                                    string_cols = [c for c in cols if pd.api.types.is_string_dtype(df[c])]
+                                    if string_cols:
+                                        return sorted(string_cols, key=len)[0]
+                                    return None
+
+                                bay_field = _pick_bay_name_field(bay_gdf, bay_field_selected)
                                 geom_col = bay_gdf.geometry.name
                                 geoms_all = list(bay_gdf[geom_col])
                                 by_norm: dict[str, list[int]] = {}
