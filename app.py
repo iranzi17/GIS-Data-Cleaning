@@ -1997,6 +1997,15 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
                     out_gdf.loc[idx, col] = bay_name_val
                 except Exception:
                     continue
+        # ensure name fields are strings to avoid schema errors on write
+        for col in target_cols:
+            try:
+                out_gdf[col] = out_gdf[col].astype("string")
+            except Exception:
+                try:
+                    out_gdf[col] = out_gdf[col].astype(str)
+                except Exception:
+                    pass
     return out_gdf
 
 
