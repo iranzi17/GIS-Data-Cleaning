@@ -4304,21 +4304,6 @@ def run_app() -> None:
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
-                # For Line Bay guidance layers, preserve any pre-filled values in the uploaded GPKG
-                # (only fill where the original value is missing).
-                if normalize_for_compare(device_name) == normalize_for_compare("Line Bay"):
-                    for col in list(out_cols.keys()):
-                        if col == geom_name or col not in gdf_sup_local.columns:
-                            continue
-                        try:
-                            original = gdf_sup_local[col]
-                            filled = out_cols[col]
-                            mask_keep = ~original.isna()
-                            if mask_keep.any():
-                                out_cols[col] = filled.mask(mask_keep, original)
-                        except Exception:
-                            continue
-
                 # Drop utility columns (e.g., Composite_ID) from the output.
                 keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
 
