@@ -308,6 +308,10 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "cb_indoor_switch_gear": "Indoor Circuit Breaker/30kv/15kb",
         "ct_indoor_switch_gear": "Indoor Current Transformer",
         "vt_indoor_switch_gear": "Indoor Voltage Transformer",
+        "vt_indo0or_switch_gear": "Indoor Voltage Transformer",
+        "vt_indooor_switch_gear": "Indoor Voltage Transformer",
+        "power_transfomer": "Power Transformer/ Stepup Transformer",
+        "disconnector_switches": "High Voltage Switch/High Voltage Switch",
     }
     if GPKG_EQUIP_MAP_FILE.exists():
         try:
@@ -393,7 +397,7 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
             pass
     # Heuristic substring overrides for common indoor switchgear and power transformer stems with suffixes.
     norm_file_sub = norm_file
-    if "powertransformer" in norm_file_sub or "power_transformer" in norm_file_sub:
+    if "powertransformer" in norm_file_sub or "power_transformer" in norm_file_sub or "powertransfomer" in norm_file_sub:
         for opt in equipment_options:
             if normalize_for_compare(opt) == normalize_for_compare("Power Transformer/ Stepup Transformer"):
                 return opt
