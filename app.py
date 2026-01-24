@@ -305,6 +305,9 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "powertransformer": "Power Transformer/ Stepup Transformer",
         "telecom": "Control and Protection Panels",
         "telecom_odf": "Control and Protection Panels",
+        "cb_indoor_switch_gear": "Indoor Circuit Breaker/30kv/15kb",
+        "ct_indoor_switch_gear": "Indoor Current Transformer",
+        "vt_indoor_switch_gear": "Indoor Voltage Transformer",
     }
     if GPKG_EQUIP_MAP_FILE.exists():
         try:
@@ -388,6 +391,28 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
                         return opt
         except Exception:
             pass
+    # Heuristic substring overrides for common indoor switchgear and power transformer stems with suffixes.
+    norm_file_sub = norm_file
+    if "powertransformer" in norm_file_sub or "power_transformer" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Power Transformer/ Stepup Transformer"):
+                return opt
+        return "Power Transformer/ Stepup Transformer" if equipment_options else ""
+    if "cbindoor" in norm_file_sub or "cb_indoor_switch" in norm_file_sub or "indoorcircuitbreaker" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Indoor Circuit Breaker/30kv/15kb"):
+                return opt
+        return "Indoor Circuit Breaker/30kv/15kb" if equipment_options else ""
+    if "ctindoor" in norm_file_sub or "ct_indoor_switch" in norm_file_sub or "indoorcurrenttransformer" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Indoor Current Transformer"):
+                return opt
+        return "Indoor Current Transformer" if equipment_options else ""
+    if "vtindoor" in norm_file_sub or "vt_indoor_switch" in norm_file_sub or "indoorvoltagetransformer" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Indoor Voltage Transformer"):
+                return opt
+        return "Indoor Voltage Transformer" if equipment_options else ""
     mapped = equip_map.get(norm_file)
     if mapped:
         if mapped in equipment_options:
@@ -2574,6 +2599,10 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("power_transformer"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("TELECOM"): "Control and Protection Panels",
     normalize_for_compare("TELECOM_ODF"): "Control and Protection Panels",
+    normalize_for_compare("CB_INDOOR_SWITCH_GEAR"): "Indoor Circuit Breaker/30kv/15kb",
+    normalize_for_compare("CT_INDOOR_SWITCH_GEAR"): "Indoor Current Transformer",
+    normalize_for_compare("VT_INDOOR_SWITCH_GEAR"): "Indoor Voltage Transformer",
+    normalize_for_compare("INDOOR_SWITCH_GEAR_TABLE"): "MV Switch gear",
 }
 
 # Columns to drop from output after filling (utility fields used only for matching).
