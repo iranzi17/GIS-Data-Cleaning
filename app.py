@@ -412,11 +412,22 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
             if normalize_for_compare(opt) == normalize_for_compare("Indoor Current Transformer"):
                 return opt
         return "Indoor Current Transformer" if equipment_options else ""
-    if "vtindoor" in norm_file_sub or "vt_indoor_switch" in norm_file_sub or "indoorvoltagetransformer" in norm_file_sub:
+    if (
+        "vtindoor" in norm_file_sub
+        or "vt_indoor_switch" in norm_file_sub
+        or "vtindooor" in norm_file_sub
+        or ("vt" in norm_file_sub and ("switchgear" in norm_file_sub or "switch_gear" in norm_file_sub))
+        or "indoorvoltagetransformer" in norm_file_sub
+    ):
         for opt in equipment_options:
             if normalize_for_compare(opt) == normalize_for_compare("Indoor Voltage Transformer"):
                 return opt
         return "Indoor Voltage Transformer" if equipment_options else ""
+    if "disconnector" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("High Voltage Switch/High Voltage Switch"):
+                return opt
+        return "High Voltage Switch/High Voltage Switch" if equipment_options else ""
     mapped = equip_map.get(norm_file)
     if mapped:
         if mapped in equipment_options:
