@@ -37,6 +37,8 @@ MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
 TEMPLATE_DIR = BASE_DIR / "For High Voltage Line"
 HV_LINE_TEMPLATE_PATH = TEMPLATE_DIR / "High Voltage Lines.gpkg"
 EARTHING_TRANSFORMER_TEMPLATE_PATH = TEMPLATE_DIR / "EARTHING TRANSFORMER.gpkg"
+LINE_BAY_LIBRARY_DIR = BASE_DIR / "For Line Bays"
+LINE_BAY_LIBRARY_PATH = LINE_BAY_LIBRARY_DIR / "LINE BAY.gpkg"
 
 PREVIEW_ROWS = 30
 MAX_GPKG_NAME_LENGTH = 254
@@ -1664,7 +1666,7 @@ def expand_geometries(geoms: list[Any], target_count: int) -> list[Any]:
 @st.cache_data(show_spinner=False)
 def load_line_bay_layer(path: Path, layer: str | None, field: str | None) -> gpd.GeoDataFrame | None:
     """Load line bay polygons with the selected name field."""
-    if path is None or layer is None or field is None:
+    if path is None or layer is None:
         return None
     try:
         gdf = gpd.read_file(path, layer=layer)
@@ -1672,7 +1674,9 @@ def load_line_bay_layer(path: Path, layer: str | None, field: str | None) -> gpd
         return None
     if gdf.empty or not hasattr(gdf, "geometry"):
         return None
-    if field not in gdf.columns:
+    if field is None or field not in gdf.columns:
+        field = _pick_line_bay_name_field(gdf, field)
+    if field is None or field not in gdf.columns:
         return None
     geom_col = gdf.geometry.name
     try:
@@ -3670,6 +3674,9 @@ def run_app() -> None:
                         tmplb.write(line_bay_upload_candidate.getbuffer())
                         line_bay_path = Path(tmplb.name)
                     line_bay_label = line_bay_upload_candidate.name
+                elif LINE_BAY_LIBRARY_PATH.exists():
+                    line_bay_path = LINE_BAY_LIBRARY_PATH
+                    line_bay_label = LINE_BAY_LIBRARY_PATH.name
                 if line_bay_path is not None:
                     line_bay_layers = list_gpkg_layers(line_bay_path)
                     if not line_bay_layers:
