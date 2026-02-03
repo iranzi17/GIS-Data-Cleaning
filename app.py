@@ -2120,6 +2120,26 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
         "line_bay_name",
     ]
 
+    # Build an id->name map directly from the Line Bay layer to support attribute-based replacement.
+    layer_id_map: dict[str, Any] = {}
+    id_aliases = ["line_bay_id", "linebayid", "line bay id", "line_bayid", "line bay_id"]
+    for _, row in bay_gdf.iterrows():
+        lookup = {normalize_for_compare(k): k for k in row.index}
+        id_val = None
+        for alias in id_aliases:
+            key = lookup.get(normalize_for_compare(alias))
+            if key:
+                id_val = row.get(key)
+                break
+        name_val = _extract_bay_name_from_row(row, bay_field, id_name_map)
+        norm_id = normalize_value_for_compare(id_val)
+        if norm_id and name_val is not None and not pd.isna(name_val):
+            layer_id_map.setdefault(norm_id, name_val)
+
+    combined_id_map = dict(id_name_map)
+    for k, v in layer_id_map.items():
+        combined_id_map.setdefault(k, v)
+
     bay_lookup: dict[int, Any] = {}
     try:
         joined = gpd.sjoin(out_gdf[[geom_name]].set_geometry(geom_name), bay_gdf, how="left", predicate="intersects")
@@ -2195,6 +2215,10 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
                     out_gdf[col] = out_gdf[col].astype(str)
                 except Exception:
                     pass
+
+    # Final pass: replace any remaining Line_Bay_ID values with names using combined map.
+    if combined_id_map:
+        out_gdf = replace_line_name_ids(out_gdf, combined_id_map, name_fields=name_fields)
     return out_gdf
 
 
