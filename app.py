@@ -2802,6 +2802,16 @@ PREFIX_GROUP_DEVICES = {
     normalize_for_compare("High Voltage Switch/High Voltage Switch"),
 }
 
+# Substation fields to preserve from uploaded GPKG (do not overwrite).
+SUBSTATION_PRESERVE_FIELDS = {
+    normalize_for_compare("AssetGroup"),
+    normalize_for_compare("Asset Group"),
+    normalize_for_compare("AssetType"),
+    normalize_for_compare("Asset Type"),
+    normalize_for_compare("Substation_Name"),
+    normalize_for_compare("Substation Name"),
+}
+
 PROTECTION_LAYOUT_DEVICES = {
     normalize_for_compare("Distance Protection"),
     normalize_for_compare("Control and Protection Panels"),
@@ -4097,6 +4107,11 @@ def run_app() -> None:
                 gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
+                preserve_cols: set[str] = set()
+                if normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin"):
+                    for col in gdf_sup_local.columns:
+                        if normalize_for_compare(col) in SUBSTATION_PRESERVE_FIELDS:
+                            preserve_cols.add(col)
                 layout_applied = False
                 if (
                     ups_anchor_info
@@ -4292,6 +4307,10 @@ def run_app() -> None:
                             continue
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
+                    # Preserve selected Substation fields from the uploaded layer.
+                    for col in preserve_cols:
+                        out_cols[col] = gdf_sup_local[col].copy()
+
                     matched_hits = 0
                     matched_indices: set[int] = set()
                     for idx_val, norm_val in norm_target.items():
@@ -4473,6 +4492,11 @@ def run_app() -> None:
                                 continue
                             out_cols[col] = gdf_sup_local[col]
                         filled_fields = [c for c in gdf_sup_local.columns if c != geom_name]
+                    elif preserve_cols:
+                        # Preserve selected Substation fields but allow other fields to fill normally.
+                        for col in preserve_cols:
+                            out_cols[col] = gdf_sup_local[col].copy()
+                        filled_fields = [f for f in out_cols.keys() if f != geom_name]
                     elif seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
                             entry = _pick_seq_entry_by_feeder(
@@ -4516,6 +4540,8 @@ def run_app() -> None:
                     for col_name, series in list(out_cols.items()):
                         if col_name == geom_name:
                             continue
+                        if col_name in preserve_cols:
+                            continue
                         t_str = type_map_local.get(col_name)
                         if t_str is None:
                             t_str = norm_type_lookup.get(normalize_for_compare(col_name))
@@ -4530,6 +4556,9 @@ def run_app() -> None:
                     norm_keep = {normalize_for_compare(c) for c in keep_cols}
                     if normalize_for_compare(match_column) not in norm_keep:
                         keep_cols.append(match_column)
+                for col in preserve_cols:
+                    if col not in keep_cols and col in out_cols:
+                        keep_cols.append(col)
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
@@ -4585,6 +4614,8 @@ def run_app() -> None:
                     geom_name_out = out_gdf.geometry.name if hasattr(out_gdf, "geometry") else None
                     for col_name in out_gdf.columns:
                         if col_name == geom_name_out:
+                            continue
+                        if col_name in preserve_cols:
                             continue
                         t_str = type_map_local.get(col_name)
                         if t_str is None:
