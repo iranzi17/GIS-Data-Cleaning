@@ -10,6 +10,7 @@ import statistics
 import difflib
 import re
 import json
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
 import geopandas as gpd
@@ -34,6 +35,8 @@ REFERENCE_EXTENSIONS = (".xlsx", ".xlsm")
 ALIAS_FILE = REFERENCE_DATA_DIR / "alias_map.json"
 GPKG_EQUIP_MAP_FILE = REFERENCE_DATA_DIR / "gpkg_equipment_map.json"
 MAPPING_CACHE_FILE = REFERENCE_DATA_DIR / "schema_mapping_cache.json"
+DOMAIN_CODE_CACHE_FILE = REFERENCE_DATA_DIR / "domain_code_cache.json"
+DOMAIN_CODE_LOG_FILE = REFERENCE_DATA_DIR / "domain_code_log.jsonl"
 TEMPLATE_DIR = BASE_DIR / "For High Voltage Line"
 HV_LINE_TEMPLATE_PATH = TEMPLATE_DIR / "High Voltage Lines.gpkg"
 EARTHING_TRANSFORMER_TEMPLATE_PATH = TEMPLATE_DIR / "EARTHING TRANSFORMER.gpkg"
@@ -221,6 +224,53 @@ _SHEET_HEADER_CACHE: dict[tuple[str, str], list[str]] = {}
 _REFERENCE_SHEET_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 _SUB_COL_CACHE: dict[tuple[str, str], str | None] = {}
 _DOMAIN_CODE_LOOKUP: dict[str, Any] | None = None
+
+
+def append_domain_code_log(entries: list[dict[str, Any]], context: dict[str, Any]) -> None:
+    """Append domain-code usage entries to a JSONL log file."""
+    if not entries:
+        return
+    try:
+        ts = datetime.now().isoformat(timespec="seconds")
+        lines = []
+        for entry in entries:
+            record = {
+                "timestamp": ts,
+                "workbook": context.get("workbook"),
+                "sheet": context.get("sheet"),
+                "device": context.get("device"),
+                "output": context.get("output"),
+                "field": entry.get("field"),
+                "domain": entry.get("domain"),
+                "code": entry.get("code"),
+                "source": entry.get("source"),
+            }
+            lines.append(json.dumps(record, ensure_ascii=False))
+        with open(DOMAIN_CODE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        # best-effort logging; never break the app
+        pass
+
+
+def _collect_domain_log_entries(instances: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not instances:
+        return []
+    seen = set()
+    out: list[dict[str, Any]] = []
+    for inst in instances:
+        for entry in inst.get("domain_log", []) or []:
+            key = (
+                entry.get("field"),
+                entry.get("domain"),
+                entry.get("code"),
+                entry.get("source"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(entry)
+    return out
 
 
 def get_reference_columns() -> list[str]:
@@ -492,8 +542,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     instances: list[dict[str, Any]] = []
     current_fields: dict[str, Any] | None = None
     type_map_device: dict[str, str] = {}
+    current_domain_log: list[dict[str, Any]] = []
 
-    def _extract_value(row: pd.Series, dtype: str) -> Any:
+    def _extract_value(row: pd.Series, dtype: str, field_name: str) -> tuple[Any, dict[str, Any] | None]:
         def _is_blank(value: Any) -> bool:
             try:
                 if pd.isna(value):
@@ -524,25 +575,41 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
         domain_code = row.iloc[4] if len(row) > 4 else pd.NA
 
         norm_type = normalize_for_compare(dtype or "")
-        is_numeric = any(tok in norm_type for tok in ("int", "integer", "long", "short", "bigint", "smallint", "double", "float", "decimal", "real", "number"))
+        is_numeric = any(
+            tok in norm_type
+            for tok in ("int", "integer", "long", "short", "bigint", "smallint", "double", "float", "decimal", "real", "number")
+        )
 
-        if is_numeric and not _is_blank(domain_code):
-            return domain_code
-        if is_numeric and not _is_blank(val):
-            if _looks_like_unit_value(val) and _is_blank(domain_code):
-                return val
+        # Always honor explicit Domain Code when provided (even for text fields).
+        if not _is_blank(domain_code):
+            return domain_code, {
+                "field": field_name,
+                "domain": val,
+                "code": domain_code,
+                "source": "explicit",
+            }
+        # If a Domain text maps to a known code, use the code for full coverage.
+        if not _is_blank(val):
             dom_norm = normalize_value_for_compare(val)
             mapped = domain_code_map.get(dom_norm)
             if mapped is not None and not _is_blank(mapped):
-                return mapped
+                return mapped, {
+                    "field": field_name,
+                    "domain": val,
+                    "code": mapped,
+                    "source": "mapped",
+                }
+        if is_numeric and not _is_blank(val):
+            if _looks_like_unit_value(val):
+                return val, None
         if not _is_blank(val):
-            return val
+            return val, None
 
         if len(row) > 3:
             for v in row.iloc[3:]:
                 if not _is_blank(v):
-                    return v
-        return pd.NA
+                    return v, None
+        return pd.NA, None
 
     def _get_by_alias(fields: dict[str, Any], aliases: list[str]) -> Any:
         lookup = {normalize_for_compare(k): k for k in fields}
@@ -632,6 +699,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "feeder_value": feeder_value,
                 "order": order.copy(),
                 "type_map": type_map_device.copy(),
+                "domain_log": current_domain_log.copy(),
             }
         )
 
@@ -657,11 +725,13 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 _finalize_instance(current_fields, current_order)
             current_fields = {}
             current_order = []
+            current_domain_log = []
         elif pd.notna(dev_cell):
             if current_fields is not None and current_fields:
                 _finalize_instance(current_fields, current_order)
             current_fields = None
             current_order = []
+            current_domain_log = []
 
         if current_fields is None:
             continue
@@ -694,7 +764,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                     cache[cache_key] = type_str
         # Track declared data type (column C) for later schema enforcement.
         type_map_device[field_clean] = type_str
-        val = _extract_value(row, type_str)
+        val, log_entry = _extract_value(row, type_str, field_clean)
+        if log_entry:
+            current_domain_log.append(log_entry)
         series_val = pd.Series([val])
         coerced = coerce_series_to_type(series_val, type_str).iloc[0]
         current_fields[field_clean] = coerced
@@ -2360,9 +2432,18 @@ def split_instance_prefix_suffix(value: Any) -> tuple[str | None, int | None]:
 def load_domain_code_lookup() -> dict[str, Any]:
     """Build a global mapping of domain text -> domain code from supervisor workbooks."""
     lookup: dict[str, Any] = {}
+    # Load cached domain mappings if available.
+    if DOMAIN_CODE_CACHE_FILE.exists():
+        try:
+            data = json.loads(DOMAIN_CODE_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                lookup.update(data)
+        except Exception:
+            pass
     if not SUPERVISOR_WORKBOOK_DIR.exists():
         return lookup
     workbooks = [p for p in SUPERVISOR_WORKBOOK_DIR.glob("**/*") if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS]
+    updated = False
     for wb_path in sorted(workbooks):
         try:
             xl = pd.ExcelFile(wb_path)
@@ -2383,6 +2464,12 @@ def load_domain_code_lookup() -> dict[str, Any]:
                 dom_norm = normalize_value_for_compare(dom_val)
                 if dom_norm and dom_norm not in lookup:
                     lookup[dom_norm] = code_val
+                    updated = True
+    if updated:
+        try:
+            DOMAIN_CODE_CACHE_FILE.write_text(json.dumps(lookup, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     return lookup
 
 
@@ -4553,6 +4640,16 @@ def run_app() -> None:
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
                                 fname = f"{Path(sup_gpkg.name).stem}_{label_slug}.gpkg"
                                 outputs.append((fname, out_path))
+                                # Log domain codes applied for this instance output.
+                                append_domain_code_log(
+                                    _collect_domain_log_entries([inst]),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": device_choice,
+                                        "output": fname,
+                                    },
+                                )
 
                             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
                                 zip_path = Path(ztmp.name)
@@ -4623,6 +4720,15 @@ def run_app() -> None:
                                 ups_anchor_info=ups_anchor_info,
                                 type_map=device_type_map,
                             )
+                            append_domain_code_log(
+                                _collect_domain_log_entries(device_instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": device_choice,
+                                    "output": sup_gpkg.name,
+                                },
+                            )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
                             st.download_button(
@@ -4642,6 +4748,16 @@ def run_app() -> None:
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
                                 type_map=device_type_map,
+                            )
+                            log_instances = [selected_instance] if selected_instance else device_instances
+                            append_domain_code_log(
+                                _collect_domain_log_entries(log_instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": device_choice,
+                                    "output": sup_gpkg.name,
+                                },
                             )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
@@ -4743,6 +4859,16 @@ def run_app() -> None:
                                 type_map=type_map_device,
                             )
                             outputs.append((file_obj.name, out_path))
+                            log_instances = [inst] if inst else cached_instances
+                            append_domain_code_log(
+                                _collect_domain_log_entries(log_instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": device_for_file,
+                                    "output": file_obj.name,
+                                },
+                            )
                             chosen_label = inst.get("label") if inst else "default instance"
                             logs.append(
                                 f"{file_obj.name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
@@ -4786,6 +4912,15 @@ def run_app() -> None:
                                 out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                                 file_name = f"{layer_name}.gpkg"
                                 outputs.append((file_name, out_path))
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": file_name,
+                                    },
+                                )
                                 logs.append(f"{dev_name}: auto-created protection points ({len(points)}).")
 
                     template_devices = [
@@ -4921,6 +5056,15 @@ def run_app() -> None:
                                 out_path = Path(tmpout.name)
                             out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                             outputs.append((file_name, out_path))
+                            append_domain_code_log(
+                                _collect_domain_log_entries(instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": dev_name,
+                                    "output": file_name,
+                                },
+                            )
                             logs.append(
                                 f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
                             )
@@ -4981,6 +5125,15 @@ def run_app() -> None:
                                     out_path = Path(tmpout.name)
                                 out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                                 outputs.append((file_name, out_path))
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": file_name,
+                                    },
+                                )
                                 logs.append(f"{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s)).")
                                 continue
                             else:
@@ -5047,6 +5200,15 @@ def run_app() -> None:
                             out_path = Path(tmpout.name)
                         out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                         outputs.append((file_name, out_path))
+                        append_domain_code_log(
+                            _collect_domain_log_entries(instances),
+                            {
+                                "workbook": sup_wb_path.name if sup_wb_path else None,
+                                "sheet": sup_sheet,
+                                "device": dev_name,
+                                "output": file_name,
+                            },
+                        )
                         logs.append(f"{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
 
                     if outputs:
