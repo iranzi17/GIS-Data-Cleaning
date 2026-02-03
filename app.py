@@ -2709,6 +2709,12 @@ def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
     if "long" in t and "int" in t:
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="Int32")
+    if "short" in t and "int" not in t:
+        coerced = series.map(_extract_first_number)
+        return pd.Series(coerced, dtype="Int16")
+    if "long" in t and "int" not in t:
+        coerced = series.map(_extract_first_number)
+        return pd.Series(coerced, dtype="Int32")
     if any(tok in t for tok in ("int", "integer", "bigint", "smallint")):
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="Int64")
@@ -2810,6 +2816,14 @@ SUBSTATION_PRESERVE_FIELDS = {
     normalize_for_compare("Asset Type"),
     normalize_for_compare("Substation_Name"),
     normalize_for_compare("Substation Name"),
+}
+SUBSTATION_FORCE_TYPES = {
+    normalize_for_compare("AssetGroup"): "Long Integer",
+    normalize_for_compare("Asset Group"): "Long Integer",
+    normalize_for_compare("AssetType"): "Short Integer",
+    normalize_for_compare("Asset Type"): "Short Integer",
+    normalize_for_compare("Substation_Name"): "Short Integer",
+    normalize_for_compare("Substation Name"): "Short Integer",
 }
 
 PROTECTION_LAYOUT_DEVICES = {
@@ -4108,10 +4122,18 @@ def run_app() -> None:
                 geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
                 geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
                 preserve_cols: set[str] = set()
+                preserve_type_map: dict[str, str] = {}
                 if normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin"):
                     for col in gdf_sup_local.columns:
-                        if normalize_for_compare(col) in SUBSTATION_PRESERVE_FIELDS:
+                        norm_col = normalize_for_compare(col)
+                        if norm_col in SUBSTATION_PRESERVE_FIELDS:
                             preserve_cols.add(col)
+                        if norm_col in SUBSTATION_FORCE_TYPES:
+                            preserve_type_map[norm_col] = SUBSTATION_FORCE_TYPES[norm_col]
+                preserve_norms = {normalize_for_compare(c) for c in preserve_cols}
+
+                def _is_preserved_field(field_name: Any) -> bool:
+                    return normalize_for_compare(field_name) in preserve_norms
                 layout_applied = False
                 if (
                     ups_anchor_info
@@ -4303,7 +4325,7 @@ def run_app() -> None:
                                 all_fields_ordered.append(f)
 
                     for f in all_fields_ordered:
-                        if f == geom_name:
+                        if f == geom_name or _is_preserved_field(f):
                             continue
                         out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
 
@@ -4327,7 +4349,7 @@ def run_app() -> None:
                         matched_hits += 1
                         matched_indices.add(idx_val)
                         for f, val in fields.items():
-                            if f == geom_name:
+                            if f == geom_name or _is_preserved_field(f):
                                 continue
                             if f not in out_cols:
                                 out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4343,7 +4365,7 @@ def run_app() -> None:
                             fallback_fields = first_payload[0]
                         if fallback_fields:
                             for f, val in fallback_fields.items():
-                                if f == geom_name:
+                                if f == geom_name or _is_preserved_field(f):
                                     continue
                                 if f not in out_cols:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4352,7 +4374,7 @@ def run_app() -> None:
                     # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
                     if matched_hits == 0 and n > 1 and default_fields and not strict_line_bay:
                         for f, val in default_fields.items():
-                            if f == geom_name:
+                            if f == geom_name or _is_preserved_field(f):
                                 continue
                             if f not in out_cols:
                                 out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4371,7 +4393,7 @@ def run_app() -> None:
                             )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
-                                if f == geom_name:
+                                if f == geom_name or _is_preserved_field(f):
                                     continue
                                 if f not in out_cols:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4474,7 +4496,7 @@ def run_app() -> None:
                             )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
-                                if f == geom_name:
+                                if f == geom_name or _is_preserved_field(f):
                                     continue
                                 if f not in out_cols:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4509,7 +4531,7 @@ def run_app() -> None:
                             )
                             inst_fields = entry.get("fields", {})
                             for f, val in inst_fields.items():
-                                if f == geom_name:
+                                if f == geom_name or _is_preserved_field(f):
                                     continue
                                 if f not in out_cols:
                                     out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
@@ -4522,6 +4544,8 @@ def run_app() -> None:
                         for f in ordered_keys:
                             val = fm_local.get(f)
                             if val is None:
+                                continue
+                            if _is_preserved_field(f):
                                 continue
                             target_col = f
                             if target_col not in out_cols:
@@ -4542,9 +4566,12 @@ def run_app() -> None:
                             continue
                         if col_name in preserve_cols:
                             continue
-                        t_str = type_map_local.get(col_name)
+                        norm_col = normalize_for_compare(col_name)
+                        t_str = preserve_type_map.get(norm_col)
                         if t_str is None:
-                            t_str = norm_type_lookup.get(normalize_for_compare(col_name))
+                            t_str = type_map_local.get(col_name)
+                        if t_str is None:
+                            t_str = norm_type_lookup.get(norm_col)
                         if t_str:
                             try:
                                 out_cols[col_name] = coerce_series_to_type(series, t_str)
@@ -4615,11 +4642,12 @@ def run_app() -> None:
                     for col_name in out_gdf.columns:
                         if col_name == geom_name_out:
                             continue
-                        if col_name in preserve_cols:
-                            continue
-                        t_str = type_map_local.get(col_name)
+                        norm_col = normalize_for_compare(col_name)
+                        t_str = preserve_type_map.get(norm_col)
                         if t_str is None:
-                            t_str = norm_type_lookup.get(normalize_for_compare(col_name))
+                            t_str = type_map_local.get(col_name)
+                        if t_str is None:
+                            t_str = norm_type_lookup.get(norm_col)
                         if t_str:
                             try:
                                 out_gdf[col_name] = coerce_series_to_type(out_gdf[col_name], t_str)
