@@ -4684,6 +4684,8 @@ def run_app() -> None:
                     ]
                     for dev_name, tpl_path in template_devices:
                         dev_norm = normalize_for_compare(dev_name)
+                        expanded_instances: list[dict[str, Any]] = []
+                        expanded_geoms: list[Any] = []
                         if dev_norm in uploaded_device_norms:
                             continue
                         instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
@@ -4728,9 +4730,6 @@ def run_app() -> None:
                                 all_points = collect_point_geometries_from_uploads(sup_gpkg_files, bay_gdf.crs)
                                 points_source = preferred_points if preferred_points is not None and not preferred_points.empty else all_points
                                 points_by_bay = map_points_to_bays(points_source, bay_gdf) if points_source is not None else {}
-
-                                expanded_instances: list[dict[str, Any]] = []
-                                expanded_geoms: list[Any] = []
                                 for inst in instances:
                                     inst_fields = inst.get("fields", {}) or {}
                                     candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
