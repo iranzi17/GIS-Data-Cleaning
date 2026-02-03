@@ -4147,7 +4147,7 @@ def run_app() -> None:
                             out_cols[f].iat[idx_val] = fill_val
 
                     # If single feature and nothing matched, fill with default or first instance.
-                    if matched_hits == 0 and n == 1:
+                    if matched_hits == 0 and n == 1 and not strict_line_bay:
                         fallback_fields = default_fields
                         if fallback_fields is None and instance_map:
                             # take first instance_map entry
@@ -4162,7 +4162,7 @@ def run_app() -> None:
                                 fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
                                 out_cols[f].iat[0] = fill_val
                     # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
-                    if matched_hits == 0 and n > 1 and default_fields:
+                    if matched_hits == 0 and n > 1 and default_fields and not strict_line_bay:
                         for f, val in default_fields.items():
                             if f == geom_name:
                                 continue
@@ -4297,7 +4297,14 @@ def run_app() -> None:
 
                     filled_fields = [f for f in out_cols.keys() if f != geom_name]
                 else:
-                    if seq_entries:
+                    if strict_line_bay:
+                        # Preserve existing attributes for Line Bay when no matching is available; avoid auto-fill.
+                        for col in gdf_sup_local.columns:
+                            if col == geom_name:
+                                continue
+                            out_cols[col] = gdf_sup_local[col]
+                        filled_fields = [c for c in gdf_sup_local.columns if c != geom_name]
+                    elif seq_entries:
                         for row_rank, idx_row in enumerate(seq_row_indices):
                             entry = _pick_seq_entry_by_feeder(
                                 idx_row,
