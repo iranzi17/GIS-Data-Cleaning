@@ -4123,6 +4123,7 @@ def run_app() -> None:
                 geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
                 preserve_cols: set[str] = set()
                 preserve_type_map: dict[str, str] = {}
+                preserve_all_cols = normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin")
                 if normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin"):
                     for col in gdf_sup_local.columns:
                         norm_col = normalize_for_compare(col)
@@ -4194,6 +4195,12 @@ def run_app() -> None:
                 filled_fields: list[str] = []
                 if match_column and match_column in gdf_sup_local.columns:
                     out_cols[match_column] = gdf_sup_local[match_column].copy()
+                if preserve_all_cols:
+                    for col in gdf_sup_local.columns:
+                        if col == geom_name:
+                            continue
+                        if col not in out_cols:
+                            out_cols[col] = gdf_sup_local[col].copy()
 
                 seq_row_indices = list(range(n))
                 if hasattr(gdf_sup_local, "geometry"):
@@ -4514,7 +4521,7 @@ def run_app() -> None:
                                 continue
                             out_cols[col] = gdf_sup_local[col]
                         filled_fields = [c for c in gdf_sup_local.columns if c != geom_name]
-                    elif preserve_cols:
+                    elif preserve_cols and not preserve_all_cols:
                         # Preserve selected Substation fields but allow other fields to fill normally.
                         for col in preserve_cols:
                             out_cols[col] = gdf_sup_local[col].copy()
@@ -4564,8 +4571,6 @@ def run_app() -> None:
                     for col_name, series in list(out_cols.items()):
                         if col_name == geom_name:
                             continue
-                        if col_name in preserve_cols:
-                            continue
                         norm_col = normalize_for_compare(col_name)
                         t_str = preserve_type_map.get(norm_col)
                         if t_str is None:
@@ -4589,8 +4594,13 @@ def run_app() -> None:
                 if geom_name and geom_name not in keep_cols:
                     keep_cols.append(geom_name)
 
-                # Drop utility columns (e.g., Composite_ID) from the output.
-                keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
+                if preserve_all_cols:
+                    for col in gdf_sup_local.columns:
+                        if col != geom_name and col in out_cols and col not in keep_cols:
+                            keep_cols.append(col)
+                else:
+                    # Drop utility columns (e.g., Composite_ID) from the output.
+                    keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
 
                 # preserve column order where possible
                 out_gdf = gpd.GeoDataFrame(
