@@ -10,6 +10,8 @@ import statistics
 import difflib
 import re
 import json
+import csv
+import io
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
@@ -226,15 +228,14 @@ _SUB_COL_CACHE: dict[tuple[str, str], str | None] = {}
 _DOMAIN_CODE_LOOKUP: dict[str, Any] | None = None
 
 
-def append_domain_code_log(entries: list[dict[str, Any]], context: dict[str, Any]) -> None:
-    """Append domain-code usage entries to a JSONL log file."""
+def _build_domain_log_rows(entries: list[dict[str, Any]], context: dict[str, Any]) -> list[dict[str, Any]]:
     if not entries:
-        return
-    try:
-        ts = datetime.now().isoformat(timespec="seconds")
-        lines = []
-        for entry in entries:
-            record = {
+        return []
+    ts = datetime.now().isoformat(timespec="seconds")
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        rows.append(
+            {
                 "timestamp": ts,
                 "workbook": context.get("workbook"),
                 "sheet": context.get("sheet"),
@@ -245,12 +246,45 @@ def append_domain_code_log(entries: list[dict[str, Any]], context: dict[str, Any
                 "code": entry.get("code"),
                 "source": entry.get("source"),
             }
-            lines.append(json.dumps(record, ensure_ascii=False))
+        )
+    return rows
+
+
+def domain_log_rows_to_csv(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    headers = [
+        "timestamp",
+        "workbook",
+        "sheet",
+        "device",
+        "output",
+        "field",
+        "domain",
+        "code",
+        "source",
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k) for k in headers})
+    return buf.getvalue()
+
+
+def append_domain_code_log(entries: list[dict[str, Any]], context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Append domain-code usage entries to a JSONL log file and return rows."""
+    rows = _build_domain_log_rows(entries, context)
+    if not rows:
+        return []
+    try:
+        lines = [json.dumps(row, ensure_ascii=False) for row in rows]
         with open(DOMAIN_CODE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception:
         # best-effort logging; never break the app
         pass
+    return rows
 
 
 def _collect_domain_log_entries(instances: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -4625,6 +4659,7 @@ def run_app() -> None:
                     try:
                         if fill_mode == "One GeoPackage per instance" and instance_labels:
                             outputs: list[tuple[str, Path]] = []
+                            run_domain_rows: list[dict[str, Any]] = []
                             for inst in device_instances:
                                 out_path, layer_name = fill_one_gpkg(
                                     sup_gpkg,
@@ -4641,7 +4676,7 @@ def run_app() -> None:
                                 fname = f"{Path(sup_gpkg.name).stem}_{label_slug}.gpkg"
                                 outputs.append((fname, out_path))
                                 # Log domain codes applied for this instance output.
-                                append_domain_code_log(
+                                run_domain_rows.extend(append_domain_code_log(
                                     _collect_domain_log_entries([inst]),
                                     {
                                         "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -4649,13 +4684,15 @@ def run_app() -> None:
                                         "device": device_choice,
                                         "output": fname,
                                     },
-                                )
+                                ))
 
                             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
                                 zip_path = Path(ztmp.name)
                             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                                 for fname, out_path in outputs:
                                     zf.write(out_path, arcname=fname)
+                                if run_domain_rows:
+                                    zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
                             with open(zip_path, "rb") as f:
                                 data = f.read()
                             st.download_button(
@@ -4720,7 +4757,7 @@ def run_app() -> None:
                                 ups_anchor_info=ups_anchor_info,
                                 type_map=device_type_map,
                             )
-                            append_domain_code_log(
+                            run_domain_rows = append_domain_code_log(
                                 _collect_domain_log_entries(device_instances),
                                 {
                                     "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -4738,6 +4775,18 @@ def run_app() -> None:
                                 mime="application/geopackage+sqlite3",
                                 key="sup_download_rowmatch",
                             )
+                            if run_domain_rows:
+                                zip_buf = io.BytesIO()
+                                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                    zf.writestr(Path(sup_gpkg.name).name, data_bytes)
+                                    zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                                st.download_button(
+                                    "Download filled GeoPackage + domain log (zip)",
+                                    data=zip_buf.getvalue(),
+                                    file_name=f"{Path(sup_gpkg.name).stem}_with_domain_log.zip",
+                                    mime="application/zip",
+                                    key="sup_download_rowmatch_with_log",
+                                )
                         else:
                             out_path, layer_name = fill_one_gpkg(
                                 sup_gpkg,
@@ -4750,7 +4799,7 @@ def run_app() -> None:
                                 type_map=device_type_map,
                             )
                             log_instances = [selected_instance] if selected_instance else device_instances
-                            append_domain_code_log(
+                            run_domain_rows = append_domain_code_log(
                                 _collect_domain_log_entries(log_instances),
                                 {
                                     "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -4768,6 +4817,18 @@ def run_app() -> None:
                                 mime="application/geopackage+sqlite3",
                                 key="sup_download",
                             )
+                            if run_domain_rows:
+                                zip_buf = io.BytesIO()
+                                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                                    zf.writestr(Path(sup_gpkg.name).name, data_bytes)
+                                    zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                                st.download_button(
+                                    "Download filled GeoPackage + domain log (zip)",
+                                    data=zip_buf.getvalue(),
+                                    file_name=f"{Path(sup_gpkg.name).stem}_with_domain_log.zip",
+                                    mime="application/zip",
+                                    key="sup_download_with_log",
+                                )
                     except Exception as exc:
                         st.error(f"Supervisor fill failed: {exc}")
             else:
@@ -4777,6 +4838,7 @@ def run_app() -> None:
                     outputs: list[tuple[str, Path]] = []
                     instance_cache: dict[str, list[dict[str, Any]]] = {}
                     uploaded_device_norms: set[str] = set()
+                    run_domain_rows: list[dict[str, Any]] = []
 
                     def _write_original_file(file_obj):
                         with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
@@ -4860,7 +4922,7 @@ def run_app() -> None:
                             )
                             outputs.append((file_obj.name, out_path))
                             log_instances = [inst] if inst else cached_instances
-                            append_domain_code_log(
+                            run_domain_rows.extend(append_domain_code_log(
                                 _collect_domain_log_entries(log_instances),
                                 {
                                     "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -4868,7 +4930,7 @@ def run_app() -> None:
                                     "device": device_for_file,
                                     "output": file_obj.name,
                                 },
-                            )
+                            ))
                             chosen_label = inst.get("label") if inst else "default instance"
                             logs.append(
                                 f"{file_obj.name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
@@ -4912,7 +4974,7 @@ def run_app() -> None:
                                 out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                                 file_name = f"{layer_name}.gpkg"
                                 outputs.append((file_name, out_path))
-                                append_domain_code_log(
+                                run_domain_rows.extend(append_domain_code_log(
                                     _collect_domain_log_entries(instances),
                                     {
                                         "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -4920,7 +4982,7 @@ def run_app() -> None:
                                         "device": dev_name,
                                         "output": file_name,
                                     },
-                                )
+                                ))
                                 logs.append(f"{dev_name}: auto-created protection points ({len(points)}).")
 
                     template_devices = [
@@ -5056,7 +5118,7 @@ def run_app() -> None:
                                 out_path = Path(tmpout.name)
                             out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                             outputs.append((file_name, out_path))
-                            append_domain_code_log(
+                            run_domain_rows.extend(append_domain_code_log(
                                 _collect_domain_log_entries(instances),
                                 {
                                     "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -5064,7 +5126,7 @@ def run_app() -> None:
                                     "device": dev_name,
                                     "output": file_name,
                                 },
-                            )
+                            ))
                             logs.append(
                                 f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
                             )
@@ -5125,7 +5187,7 @@ def run_app() -> None:
                                     out_path = Path(tmpout.name)
                                 out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                                 outputs.append((file_name, out_path))
-                                append_domain_code_log(
+                                run_domain_rows.extend(append_domain_code_log(
                                     _collect_domain_log_entries(instances),
                                     {
                                         "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -5133,7 +5195,7 @@ def run_app() -> None:
                                         "device": dev_name,
                                         "output": file_name,
                                     },
-                                )
+                                ))
                                 logs.append(f"{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s)).")
                                 continue
                             else:
@@ -5200,7 +5262,7 @@ def run_app() -> None:
                             out_path = Path(tmpout.name)
                         out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
                         outputs.append((file_name, out_path))
-                        append_domain_code_log(
+                        run_domain_rows.extend(append_domain_code_log(
                             _collect_domain_log_entries(instances),
                             {
                                 "workbook": sup_wb_path.name if sup_wb_path else None,
@@ -5208,7 +5270,7 @@ def run_app() -> None:
                                 "device": dev_name,
                                 "output": file_name,
                             },
-                        )
+                        ))
                         logs.append(f"{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
 
                     if outputs:
@@ -5217,6 +5279,8 @@ def run_app() -> None:
                         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                             for name, out_path in outputs:
                                 zf.write(out_path, arcname=Path(name).name)
+                            if run_domain_rows:
+                                zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
                         with open(zip_path, "rb") as f:
                             data = f.read()
                         st.download_button(
