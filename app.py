@@ -3654,6 +3654,7 @@ def run_app() -> None:
             show_line_bay = (
                 normalize_for_compare(device_choice) in LINE_BAY_SPATIAL_DEVICES
                 or line_bay_upload_candidate is not None
+                or LINE_BAY_LIBRARY_PATH.exists()
             )
             with st.expander("Line Bay polygons for High Voltage Line snapping", expanded=show_line_bay):
                 line_bay_path = None
@@ -4414,12 +4415,23 @@ def run_app() -> None:
                 # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
                 if (
                     normalize_for_compare(device_name) == normalize_for_compare("High Voltage Line")
-                    and line_bay_info
                     and geom_name
                     and hasattr(out_gdf, "geometry")
                 ):
-                    out_gdf = apply_line_bay_names(out_gdf, line_bay_info, geom_name)
-                    id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                    # Fall back to the Line Bay library folder if no Line Bay info was provided.
+                    lb_info = line_bay_info
+                    if lb_info is None and LINE_BAY_LIBRARY_PATH.exists():
+                        lb_info = {
+                            "path": LINE_BAY_LIBRARY_PATH,
+                            "layer": None,
+                            "field": None,
+                            "id_name_map": {},
+                        }
+                    if lb_info:
+                        out_gdf = apply_line_bay_names(out_gdf, lb_info, geom_name)
+                        id_name_map = lb_info.get("id_name_map") if isinstance(lb_info, dict) else {}
+                    else:
+                        id_name_map = {}
                     if isinstance(id_name_map, dict) and id_name_map:
                         out_gdf = replace_line_name_ids(out_gdf, id_name_map)
 
