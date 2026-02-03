@@ -2554,7 +2554,13 @@ def coerce_series_to_type(series: pd.Series, type_str: str) -> pd.Series:
         return series
     if any(tok in t for tok in ("date", "datetime", "timestamp")):
         return pd.to_datetime(series, errors="coerce")
-    if any(tok in t for tok in ("int", "integer", "long", "short", "bigint", "smallint")):
+    if "short" in t and "int" in t:
+        coerced = series.map(_extract_first_number)
+        return pd.Series(coerced, dtype="Int16")
+    if "long" in t and "int" in t:
+        coerced = series.map(_extract_first_number)
+        return pd.Series(coerced, dtype="Int32")
+    if any(tok in t for tok in ("int", "integer", "bigint", "smallint")):
         coerced = series.map(_extract_first_number)
         return pd.Series(coerced, dtype="Int64")
     if any(tok in t for tok in ("double", "float", "decimal", "real", "number")):
