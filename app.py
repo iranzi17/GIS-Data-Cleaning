@@ -3657,9 +3657,15 @@ def run_app() -> None:
                                 def _score_bay_col(col: str) -> int:
                                     norm = normalize_for_compare(col)
                                     score = 0
-                                    for kw in ["name", "line", "bay", "id"]:
-                                        if kw in norm:
-                                            score += 1
+                                    # Strongly prefer name-bearing columns; de-prioritize ids.
+                                    if "name" in norm:
+                                        score += 3
+                                    if "bay" in norm:
+                                        score += 2
+                                    if "line" in norm:
+                                        score += 1
+                                    if "id" in norm:
+                                        score -= 2
                                     return score
                                 default_col = sorted(candidate_cols, key=lambda c: (-_score_bay_col(c), len(c)))[0]
                                 line_bay_field = st.selectbox(
@@ -4395,10 +4401,21 @@ def run_app() -> None:
                         file_pref_cols = match_overrides_for_file(sup_gpkg.name)
                         pref_cols = file_pref_cols + [c for c in pref_cols if c not in file_pref_cols]
 
+                        is_line_bay = normalize_for_compare(device_choice) == normalize_for_compare("Line Bay")
+
                         def _score_col(col: str) -> int:
                             norm = normalize_for_compare(col)
                             score = 0
-                            for kw in ["id", "name", "bay", "switch", "gear", "line", "feeder", "arrester", "lightning", "substation"]:
+                            # Prefer names for Line Bay to avoid defaulting to IDs; otherwise balanced keyword scoring.
+                            if "name" in norm:
+                                score += 3 if is_line_bay else 1
+                            if "bay" in norm:
+                                score += 2 if is_line_bay else 1
+                            if "line" in norm:
+                                score += 1
+                            if "id" in norm:
+                                score += -2 if is_line_bay else 1
+                            for kw in ["switch", "gear", "feeder", "arrester", "lightning", "substation"]:
                                 if kw in norm:
                                     score += 1
                             return score
