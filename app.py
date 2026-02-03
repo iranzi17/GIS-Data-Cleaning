@@ -2972,6 +2972,16 @@ def ensure_valid_gpkg_dtypes(series: pd.Series) -> pd.Series:
 
     if pd.api.types.is_numeric_dtype(series):
         if pd.api.types.is_integer_dtype(series):
+            dtype_name = str(series.dtype)
+            # Preserve declared integer widths when possible.
+            if "int8" in dtype_name.lower():
+                return series.astype("Int8" if "u" not in dtype_name.lower() else "UInt8")
+            if "int16" in dtype_name.lower():
+                return series.astype("Int16" if "u" not in dtype_name.lower() else "UInt16")
+            if "int32" in dtype_name.lower():
+                return series.astype("Int32" if "u" not in dtype_name.lower() else "UInt32")
+            if "int64" in dtype_name.lower():
+                return series.astype("Int64" if "u" not in dtype_name.lower() else "UInt64")
             return series.astype("Int64")
         return series.astype("float64")
 
@@ -4446,6 +4456,23 @@ def run_app() -> None:
                         out_gdf = replace_line_name_ids(out_gdf, id_name_map)
 
                 out_gdf = sanitize_gdf_for_gpkg(out_gdf)
+                # Re-apply declared types after sanitization to preserve int widths (e.g., Short Integer).
+                if type_map_local:
+                    norm_type_lookup = {
+                        normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
+                    }
+                    geom_name_out = out_gdf.geometry.name if hasattr(out_gdf, "geometry") else None
+                    for col_name in out_gdf.columns:
+                        if col_name == geom_name_out:
+                            continue
+                        t_str = type_map_local.get(col_name)
+                        if t_str is None:
+                            t_str = norm_type_lookup.get(normalize_for_compare(col_name))
+                        if t_str:
+                            try:
+                                out_gdf[col_name] = coerce_series_to_type(out_gdf[col_name], t_str)
+                            except Exception:
+                                pass
                 with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
                     out_path = Path(tmpout.name)
                 out_gdf.to_file(out_path, driver="GPKG", layer=layer)
