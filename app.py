@@ -4413,11 +4413,21 @@ def run_app() -> None:
                 )
 
                 # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
-                if (
-                    normalize_for_compare(device_name) == normalize_for_compare("High Voltage Line")
-                    and geom_name
-                    and hasattr(out_gdf, "geometry")
-                ):
+                hv_name_norm = normalize_for_compare("High Voltage Line")
+                hv_match = normalize_for_compare(device_name) == hv_name_norm
+                if not hv_match:
+                    try:
+                        layer_norm = normalize_for_compare(layer or "")
+                        hv_match = hv_name_norm in layer_norm or layer_norm == hv_name_norm
+                    except Exception:
+                        hv_match = False
+                if not hv_match:
+                    try:
+                        file_norm = normalize_for_compare(Path(getattr(file_obj, "name", "")).stem)
+                        hv_match = hv_name_norm in file_norm or file_norm == hv_name_norm
+                    except Exception:
+                        hv_match = False
+                if hv_match and geom_name and hasattr(out_gdf, "geometry"):
                     # Fall back to the Line Bay library folder if no Line Bay info was provided.
                     lb_info = line_bay_info
                     if lb_info is None and LINE_BAY_LIBRARY_PATH.exists():
