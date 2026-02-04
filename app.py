@@ -2817,6 +2817,11 @@ SUBSTATION_PRESERVE_FIELDS = {
     normalize_for_compare("Substation_Name"),
     normalize_for_compare("Substation Name"),
 }
+SUBSTATION_PRESERVE_ORDER = [
+    "AssetGroup",
+    "AssetType",
+    "Substation_Name",
+]
 SUBSTATION_FORCE_TYPES = {
     normalize_for_compare("AssetGroup"): "Long Integer",
     normalize_for_compare("Asset Group"): "Long Integer",
@@ -4601,6 +4606,41 @@ def run_app() -> None:
                 else:
                     # Drop utility columns (e.g., Composite_ID) from the output.
                     keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
+
+                if preserve_all_cols:
+                    # Reorder attributes to match supervisor sheet order, then original column order.
+                    norm_out_lookup = {normalize_for_compare(c): c for c in out_cols.keys()}
+                    if order_local:
+                        sheet_order = order_local
+                    elif type_map_local:
+                        sheet_order = list(type_map_local.keys())
+                    else:
+                        sheet_order = []
+                    ordered_cols: list[str] = []
+                    # Ensure preserved Substation fields keep their preferred ordering.
+                    for pref in SUBSTATION_PRESERVE_ORDER:
+                        col = norm_out_lookup.get(normalize_for_compare(pref))
+                        if col and col not in ordered_cols:
+                            ordered_cols.append(col)
+                    for f in sheet_order:
+                        col = norm_out_lookup.get(normalize_for_compare(f))
+                        if col and col not in ordered_cols:
+                            ordered_cols.append(col)
+                    for col in gdf_sup_local.columns:
+                        if col == geom_name:
+                            continue
+                        if col in out_cols and col not in ordered_cols:
+                            ordered_cols.append(col)
+                    for col in out_cols.keys():
+                        if col == geom_name:
+                            continue
+                        if col not in ordered_cols:
+                            ordered_cols.append(col)
+                    if match_column and match_column in out_cols and match_column not in ordered_cols:
+                        ordered_cols.append(match_column)
+                    if geom_name and geom_name in out_cols:
+                        ordered_cols.append(geom_name)
+                    keep_cols = ordered_cols
 
                 # preserve column order where possible
                 out_gdf = gpd.GeoDataFrame(
