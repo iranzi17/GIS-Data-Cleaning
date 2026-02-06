@@ -3859,12 +3859,15 @@ def run_app() -> None:
         "Upload a device GeoPackage and a supervisor Electric-device workbook; choose a device entry and fill its attributes into the GPKG with proper data types."
     )
     sup_gpkg_zip = st.file_uploader(
-        "Upload ZIP of substation folders (each folder name = substation)",
+        "Upload ZIP(s) of substation folders (each folder name = substation)",
         type=["zip"],
+        accept_multiple_files=True,
         key="sup_gpkg_zip",
     )
-    if sup_gpkg_zip is not None:
-        st.caption("Example ZIP structure: NDERA/LINE BAY.gpkg, NDERA/High Voltage Line.gpkg, BUGARAMA/LINE BAY.gpkg")
+    if sup_gpkg_zip:
+        st.caption(
+            "Example ZIP structure: NDERA/LINE BAY.gpkg, NDERA/High Voltage Line.gpkg, BUGARAMA/LINE BAY.gpkg"
+        )
     sup_gpkg_files = st.file_uploader(
         "Upload device GeoPackage (GPKG)", type=["gpkg"], accept_multiple_files=True, key="sup_gpkg"
     )
@@ -3877,7 +3880,7 @@ def run_app() -> None:
     else:
         st.info(f"Add supervisor workbooks to: {SUPERVISOR_WORKBOOK_DIR}")
 
-    if sup_gpkg_zip is not None:
+    if sup_gpkg_zip:
         if st.button("Fill all substation folders (zip)", key="sup_fill_zip"):
             wb_map = list_supervisor_workbooks()
             if not wb_map:
@@ -3888,15 +3891,20 @@ def run_app() -> None:
                 outputs: list[tuple[str, Path]] = []
                 run_domain_rows: list[dict[str, Any]] = []
                 try:
-                    zip_path = tmp_in_dir / "sup_batch.zip"
-                    with open(zip_path, "wb") as f:
-                        f.write(sup_gpkg_zip.getbuffer())
-                    with zipfile.ZipFile(zip_path, "r") as zf:
-                        zf.extractall(tmp_in_dir)
+                    zip_files = sup_gpkg_zip if isinstance(sup_gpkg_zip, list) else [sup_gpkg_zip]
+                    gpkg_paths: list[Path] = []
+                    for idx, zip_file in enumerate(zip_files, start=1):
+                        zip_path = tmp_in_dir / f"sup_batch_{idx}.zip"
+                        with open(zip_path, "wb") as f:
+                            f.write(zip_file.getbuffer())
+                        extract_dir = tmp_in_dir / f"zip_{idx}"
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(zip_path, "r") as zf:
+                            zf.extractall(extract_dir)
+                        gpkg_paths.extend(list(extract_dir.rglob("*.gpkg")))
 
-                    gpkg_paths = list(tmp_in_dir.rglob("*.gpkg"))
                     if not gpkg_paths:
-                        st.error("No GeoPackages found inside the ZIP.")
+                        st.error("No GeoPackages found inside the ZIP(s).")
                     else:
                         wb_index = _build_supervisor_workbook_index(wb_map)
                         equip_map_sup = load_gpkg_equipment_map()
@@ -3904,6 +3912,8 @@ def run_app() -> None:
                         groups: dict[str, list[Path]] = {}
                         for gpkg_path in gpkg_paths:
                             rel_parts = gpkg_path.relative_to(tmp_in_dir).parts
+                            if rel_parts and rel_parts[0].startswith("zip_"):
+                                rel_parts = rel_parts[1:]
                             substation_name = rel_parts[0] if len(rel_parts) > 1 else gpkg_path.stem
                             groups.setdefault(substation_name, []).append(gpkg_path)
 
