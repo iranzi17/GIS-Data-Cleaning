@@ -3893,12 +3893,14 @@ def run_app() -> None:
                 try:
                     zip_files = sup_gpkg_zip if isinstance(sup_gpkg_zip, list) else [sup_gpkg_zip]
                     gpkg_paths: list[Path] = []
+                    zip_root_labels: dict[str, str] = {}
                     for idx, zip_file in enumerate(zip_files, start=1):
                         zip_path = tmp_in_dir / f"sup_batch_{idx}.zip"
                         with open(zip_path, "wb") as f:
                             f.write(zip_file.getbuffer())
                         extract_dir = tmp_in_dir / f"zip_{idx}"
                         extract_dir.mkdir(parents=True, exist_ok=True)
+                        zip_root_labels[extract_dir.name] = Path(getattr(zip_file, "name", f"zip_{idx}")).stem
                         with zipfile.ZipFile(zip_path, "r") as zf:
                             zf.extractall(extract_dir)
                         gpkg_paths.extend(list(extract_dir.rglob("*.gpkg")))
@@ -3912,9 +3914,13 @@ def run_app() -> None:
                         groups: dict[str, list[Path]] = {}
                         for gpkg_path in gpkg_paths:
                             rel_parts = gpkg_path.relative_to(tmp_in_dir).parts
+                            zip_root = rel_parts[0] if rel_parts else ""
                             if rel_parts and rel_parts[0].startswith("zip_"):
                                 rel_parts = rel_parts[1:]
-                            substation_name = rel_parts[0] if len(rel_parts) > 1 else gpkg_path.stem
+                            if len(rel_parts) > 1:
+                                substation_name = rel_parts[0]
+                            else:
+                                substation_name = zip_root_labels.get(zip_root, gpkg_path.stem)
                             groups.setdefault(substation_name, []).append(gpkg_path)
 
                         for substation_name, files in sorted(groups.items(), key=lambda x: x[0]):
