@@ -151,6 +151,101 @@ def list_supervisor_workbooks() -> dict[str, Path]:
     return workbooks
 
 
+def _get_file_name(file_obj: Any) -> str:
+    """Return a stable display name for a file-like object or Path."""
+    if isinstance(file_obj, (Path, str)):
+        return Path(file_obj).name
+    return getattr(file_obj, "name", "")
+
+
+def _coerce_gpkg_path(file_obj: Any) -> Path | None:
+    """Return a filesystem Path for a GPKG file-like object or Path."""
+    if file_obj is None:
+        return None
+    if isinstance(file_obj, (Path, str)):
+        try:
+            path = Path(file_obj)
+            return path if path.exists() else None
+        except Exception:
+            return None
+    data = None
+    try:
+        data = file_obj.getbuffer()
+    except Exception:
+        try:
+            data = file_obj.read()
+        except Exception:
+            data = None
+    if data is None:
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
+            tmp.write(data)
+            return Path(tmp.name)
+    except Exception:
+        return None
+
+
+def _normalize_substation_key(name: str) -> str:
+    """Normalize substation/workbook labels for loose matching."""
+    norm = normalize_value_for_compare(name)
+    if not norm:
+        return ""
+    tokens = [t for t in norm.split() if t not in {"data", "substation"}]
+    return " ".join(tokens).strip()
+
+
+def _build_supervisor_workbook_index(
+    workbooks: dict[str, Path],
+) -> dict[str, tuple[str, Path]]:
+    index: dict[str, tuple[str, Path]] = {}
+    for label, path in workbooks.items():
+        stem = Path(label).stem
+        norm = _normalize_substation_key(stem)
+        if norm and norm not in index:
+            index[norm] = (label, path)
+    return index
+
+
+def resolve_supervisor_workbook_for_substation(
+    substation_name: str,
+    workbooks: dict[str, Path],
+    index: dict[str, tuple[str, Path]] | None = None,
+) -> tuple[str | None, Path | None]:
+    """Return (label, path) for the best-matching supervisor workbook."""
+    if not workbooks:
+        return None, None
+    if index is None:
+        index = _build_supervisor_workbook_index(workbooks)
+    target = _normalize_substation_key(substation_name)
+    if not target:
+        return None, None
+    if target in index:
+        return index[target]
+    # try partial containment match
+    for key, val in index.items():
+        if key and (key in target or target in key):
+            return val
+    # fuzzy fallback
+    try:
+        best = difflib.get_close_matches(target, list(index.keys()), n=1, cutoff=0.6)
+        if best:
+            return index[best[0]]
+    except Exception:
+        pass
+    return None, None
+
+
+def pick_supervisor_sheet(excel_file: pd.ExcelFile) -> str | None:
+    """Pick a default supervisor sheet for a workbook."""
+    if not excel_file.sheet_names:
+        return None
+    for sheet in excel_file.sheet_names:
+        if normalize_for_compare(sheet) == normalize_for_compare("Electric device"):
+            return sheet
+    return excel_file.sheet_names[0]
+
+
 def detect_normalized_collisions(series: pd.Series) -> dict[str, set[str]]:
     """
     Return mapping of normalized value -> set of distinct raw values when
@@ -1804,9 +1899,9 @@ def collect_point_geometries_from_uploads(
     frames: list[gpd.GeoDataFrame] = []
     for file_obj in files:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                tmp.write(file_obj.getbuffer())
-                gpkg_path = Path(tmp.name)
+            gpkg_path = _coerce_gpkg_path(file_obj)
+            if gpkg_path is None:
+                continue
             layers = list_gpkg_layers(gpkg_path)
             if not layers:
                 continue
@@ -1858,15 +1953,16 @@ def collect_device_points_from_uploads(
     frames: list[gpd.GeoDataFrame] = []
     for file_obj in files:
         try:
-            dev_name = resolve_equipment_name(file_obj.name, device_options, equip_map)
+            file_name = _get_file_name(file_obj)
+            dev_name = resolve_equipment_name(file_name, device_options, equip_map)
         except Exception:
             dev_name = None
         if normalize_for_compare(dev_name) not in target_device_norms:
             continue
         try:
-            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                tmp.write(file_obj.getbuffer())
-                gpkg_path = Path(tmp.name)
+            gpkg_path = _coerce_gpkg_path(file_obj)
+            if gpkg_path is None:
+                continue
             layers = list_gpkg_layers(gpkg_path)
             if not layers:
                 continue
@@ -1918,15 +2014,16 @@ def collect_device_polygons_from_uploads(
     frames: list[gpd.GeoDataFrame] = []
     for file_obj in files:
         try:
-            dev_name = resolve_equipment_name(file_obj.name, device_options, equip_map)
+            file_name = _get_file_name(file_obj)
+            dev_name = resolve_equipment_name(file_name, device_options, equip_map)
         except Exception:
             dev_name = None
         if normalize_for_compare(dev_name) not in target_device_norms:
             continue
         try:
-            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                tmp.write(file_obj.getbuffer())
-                gpkg_path = Path(tmp.name)
+            gpkg_path = _coerce_gpkg_path(file_obj)
+            if gpkg_path is None:
+                continue
             layers = list_gpkg_layers(gpkg_path)
             if not layers:
                 continue
@@ -3761,6 +3858,13 @@ def run_app() -> None:
     st.caption(
         "Upload a device GeoPackage and a supervisor Electric-device workbook; choose a device entry and fill its attributes into the GPKG with proper data types."
     )
+    sup_gpkg_zip = st.file_uploader(
+        "Upload ZIP of substation folders (each folder name = substation)",
+        type=["zip"],
+        key="sup_gpkg_zip",
+    )
+    if sup_gpkg_zip is not None:
+        st.caption("Example ZIP structure: NDERA/LINE BAY.gpkg, NDERA/High Voltage Line.gpkg, BUGARAMA/LINE BAY.gpkg")
     sup_gpkg_files = st.file_uploader(
         "Upload device GeoPackage (GPKG)", type=["gpkg"], accept_multiple_files=True, key="sup_gpkg"
     )
@@ -3773,7 +3877,186 @@ def run_app() -> None:
     else:
         st.info(f"Add supervisor workbooks to: {SUPERVISOR_WORKBOOK_DIR}")
 
-    if sup_gpkg_files and sup_wb_path:
+    if sup_gpkg_zip is not None:
+        if st.button("Fill all substation folders (zip)", key="sup_fill_zip"):
+            wb_map = list_supervisor_workbooks()
+            if not wb_map:
+                st.error(f"No supervisor workbooks found in {SUPERVISOR_WORKBOOK_DIR}.")
+            else:
+                tmp_in_dir = Path(tempfile.mkdtemp())
+                logs: list[str] = []
+                outputs: list[tuple[str, Path]] = []
+                run_domain_rows: list[dict[str, Any]] = []
+                try:
+                    zip_path = tmp_in_dir / "sup_batch.zip"
+                    with open(zip_path, "wb") as f:
+                        f.write(sup_gpkg_zip.getbuffer())
+                    with zipfile.ZipFile(zip_path, "r") as zf:
+                        zf.extractall(tmp_in_dir)
+
+                    gpkg_paths = list(tmp_in_dir.rglob("*.gpkg"))
+                    if not gpkg_paths:
+                        st.error("No GeoPackages found inside the ZIP.")
+                    else:
+                        wb_index = _build_supervisor_workbook_index(wb_map)
+                        equip_map_sup = load_gpkg_equipment_map()
+
+                        groups: dict[str, list[Path]] = {}
+                        for gpkg_path in gpkg_paths:
+                            rel_parts = gpkg_path.relative_to(tmp_in_dir).parts
+                            substation_name = rel_parts[0] if len(rel_parts) > 1 else gpkg_path.stem
+                            groups.setdefault(substation_name, []).append(gpkg_path)
+
+                        for substation_name, files in sorted(groups.items(), key=lambda x: x[0]):
+                            wb_label, wb_path = resolve_supervisor_workbook_for_substation(
+                                substation_name, wb_map, wb_index
+                            )
+                            if wb_path is None:
+                                logs.append(f"{substation_name}: skipped (no matching supervisor workbook).")
+                                continue
+                            try:
+                                sup_excel = pd.ExcelFile(wb_path)
+                            except Exception as exc:
+                                logs.append(f"{substation_name}: failed to read workbook '{wb_label}' ({exc}).")
+                                continue
+                            sup_sheet = pick_supervisor_sheet(sup_excel)
+                            if not sup_sheet:
+                                logs.append(f"{substation_name}: skipped (no sheets found in '{wb_label}').")
+                                continue
+                            try:
+                                raw_sup = pd.read_excel(wb_path, sheet_name=sup_sheet, dtype=str, header=None)
+                                if raw_sup.empty:
+                                    logs.append(f"{substation_name}: skipped (sheet '{sup_sheet}' is empty).")
+                                    continue
+                                raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
+                                device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str)))
+                            except Exception as exc:
+                                logs.append(f"{substation_name}: failed to read '{sup_sheet}' in '{wb_label}' ({exc}).")
+                                continue
+                            if not device_options:
+                                logs.append(f"{substation_name}: skipped (no devices found in '{wb_label}').")
+                                continue
+
+                            protection_in_uploads = False
+                            ups_upload_candidate = None
+                            line_bay_upload_candidate = None
+                            for file_path in files:
+                                try:
+                                    dev_name = resolve_equipment_name(file_path.name, device_options, equip_map_sup)
+                                except Exception:
+                                    continue
+                                if normalize_for_compare(dev_name) in PROTECTION_LAYOUT_DEVICES:
+                                    protection_in_uploads = True
+                                if (
+                                    ups_upload_candidate is None
+                                    and normalize_for_compare(dev_name) == normalize_for_compare("Uninterruptable power supply(UPS)")
+                                ):
+                                    ups_upload_candidate = file_path
+                                if (
+                                    line_bay_upload_candidate is None
+                                    and normalize_for_compare(dev_name) == normalize_for_compare("Line Bay")
+                                ):
+                                    line_bay_upload_candidate = file_path
+                            if ups_upload_candidate is None:
+                                for file_path in files:
+                                    if "ups" in normalize_for_compare(Path(file_path.name).stem):
+                                        ups_upload_candidate = file_path
+                                        break
+                            if line_bay_upload_candidate is None:
+                                for file_path in files:
+                                    stem_norm = normalize_for_compare(Path(file_path.name).stem)
+                                    if "linebay" in stem_norm or "line bay" in stem_norm or "line_bay" in stem_norm:
+                                        line_bay_upload_candidate = file_path
+                                        break
+
+                            line_bay_info = None
+                            if line_bay_upload_candidate is not None:
+                                try:
+                                    line_bay_layers = list_gpkg_layers(line_bay_upload_candidate)
+                                    if line_bay_layers:
+                                        line_bay_layer = line_bay_layers[0]
+                                        gdf_bay_preview = gpd.read_file(line_bay_upload_candidate, layer=line_bay_layer)
+                                        geom_col = (
+                                            gdf_bay_preview.geometry.name
+                                            if hasattr(gdf_bay_preview, "geometry")
+                                            else None
+                                        )
+                                        candidate_cols = [c for c in gdf_bay_preview.columns if c != geom_col]
+                                        if candidate_cols:
+                                            def _score_bay_col(col: str) -> int:
+                                                norm = normalize_for_compare(col)
+                                                score = 0
+                                                if "name" in norm:
+                                                    score += 3
+                                                if "bay" in norm:
+                                                    score += 2
+                                                if "line" in norm:
+                                                    score += 1
+                                                if "id" in norm:
+                                                    score -= 2
+                                                return score
+                                            default_col = sorted(candidate_cols, key=lambda c: (-_score_bay_col(c), len(c)))[0]
+                                            line_bay_info = {
+                                                "path": line_bay_upload_candidate,
+                                                "layer": line_bay_layer,
+                                                "field": default_col,
+                                                "id_name_map": _build_line_bay_id_name_map(wb_path, sup_sheet),
+                                            }
+                                except Exception:
+                                    line_bay_info = None
+
+                            ups_anchor_info = None
+                            if ups_upload_candidate is not None:
+                                try:
+                                    ups_layers = list_gpkg_layers(ups_upload_candidate)
+                                    if ups_layers:
+                                        ups_anchor_info = {
+                                            "path": ups_upload_candidate,
+                                            "layer": ups_layers[0],
+                                            "spacing": float(PROTECTION_LAYOUT_SPACING),
+                                        }
+                                except Exception:
+                                    ups_anchor_info = None
+                            elif protection_in_uploads:
+                                logs.append(f"{substation_name}: protection layout skipped (UPS not found).")
+
+                            logs.append(f"{substation_name}: using workbook '{wb_label}' (sheet '{sup_sheet}').")
+
+                            batch_outputs, batch_logs, batch_domain_rows = _fill_supervisor_batch(
+                                files,
+                                device_options,
+                                wb_path,
+                                sup_sheet,
+                                equip_map_sup,
+                                line_bay_info,
+                                ups_anchor_info,
+                                output_prefix=substation_name,
+                            )
+                            outputs.extend(batch_outputs)
+                            logs.extend(batch_logs)
+                            run_domain_rows.extend(batch_domain_rows)
+
+                    if outputs:
+                        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
+                            zip_path = Path(ztmp.name)
+                        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            for name, out_path in outputs:
+                                zf.write(out_path, arcname=name)
+                            if run_domain_rows:
+                                zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                        with open(zip_path, "rb") as f:
+                            data = f.read()
+                        st.download_button(
+                            "Download filled GeoPackages (zip)",
+                            data=data,
+                            file_name="filled_supervisor_gpkgs.zip",
+                            mime="application/zip",
+                            key="sup_download_zip_batch",
+                        )
+                    st.text_area("Supervisor batch log", value="\n".join(logs) if logs else "No logs.", height=220)
+                finally:
+                    shutil.rmtree(tmp_in_dir, ignore_errors=True)
+    elif sup_gpkg_files and sup_wb_path:
         try:
             sup_excel = pd.ExcelFile(sup_wb_path)
             sup_sheet = st.selectbox("Supervisor sheet", sup_excel.sheet_names, key="sup_sheet")
@@ -4120,9 +4403,10 @@ def run_app() -> None:
                     if seq_order and row_rank < len(seq_order):
                         return seq_entries[seq_order[row_rank]]
                     return seq_entries[row_rank % len(seq_entries)]
-                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                    tmp.write(file_obj.getbuffer())
-                    gpkg_path = Path(tmp.name)
+                file_name = _get_file_name(file_obj)
+                gpkg_path = _coerce_gpkg_path(file_obj)
+                if gpkg_path is None:
+                    raise ValueError("Could not read the GeoPackage.")
                 layers = list_gpkg_layers(gpkg_path)
                 layer = layer_override or (layers[0] if layers else None)
                 if not layer:
@@ -4664,7 +4948,7 @@ def run_app() -> None:
                         hv_match = False
                 if not hv_match:
                     try:
-                        file_norm = normalize_for_compare(Path(getattr(file_obj, "name", "")).stem)
+                        file_norm = normalize_for_compare(Path(file_name).stem)
                         hv_match = hv_name_norm in file_norm or file_norm == hv_name_norm
                     except Exception:
                         hv_match = False
@@ -4711,6 +4995,491 @@ def run_app() -> None:
                     out_path = Path(tmpout.name)
                 out_gdf.to_file(out_path, driver="GPKG", layer=layer)
                 return out_path, layer
+
+            def _fill_supervisor_batch(
+                files: list[Any],
+                device_options: list[str],
+                sup_wb_path: Path,
+                sup_sheet: str,
+                equip_map_sup: dict[str, str],
+                line_bay_info: dict[str, Any] | None,
+                ups_anchor_info: dict[str, Any] | None,
+                output_prefix: str | None = None,
+            ) -> tuple[list[tuple[str, Path]], list[str], list[dict[str, Any]]]:
+                logs: list[str] = []
+                outputs: list[tuple[str, Path]] = []
+                instance_cache: dict[str, list[dict[str, Any]]] = {}
+                uploaded_device_norms: set[str] = set()
+                run_domain_rows: list[dict[str, Any]] = []
+
+                def _record_output(name: str, out_path: Path) -> None:
+                    arc_name = Path(name).name
+                    if output_prefix:
+                        arc_name = str(Path(output_prefix) / arc_name)
+                    outputs.append((arc_name, out_path))
+
+                def _write_original_file(file_obj):
+                    gpkg_path = _coerce_gpkg_path(file_obj)
+                    if gpkg_path is None:
+                        raise ValueError("Could not read GeoPackage.")
+                    return gpkg_path
+
+                def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
+                    if not instances:
+                        return None
+                    if len(instances) == 1:
+                        return instances[0]
+                    stem_norm = normalize_for_compare(Path(name).stem)
+                    for inst in instances:
+                        for cand in (inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")):
+                            if pd.notna(cand) and normalize_for_compare(cand) in stem_norm:
+                                return inst
+                    return instances[0]
+
+                prefix_label = f"{output_prefix}/" if output_prefix else ""
+
+                for file_obj in files:
+                    file_name = _get_file_name(file_obj)
+                    try:
+                        stem_norm = normalize_for_compare(Path(file_name).stem)
+                        if stem_norm in SKIP_BATCH_FILL_STEMS:
+                            out_path = _write_original_file(file_obj)
+                            _record_output(file_name, out_path)
+                            logs.append(f"{prefix_label}{file_name}: skipped fill (kept original geometry).")
+                            continue
+                        device_for_file = resolve_equipment_name(file_name, device_options, equip_map_sup)
+                        if device_for_file not in device_options:
+                            out_path = _write_original_file(file_obj)
+                            _record_output(file_name, out_path)
+                            logs.append(
+                                f"{prefix_label}{file_name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
+                            )
+                            continue
+                        uploaded_device_norms.add(normalize_for_compare(device_for_file))
+                        if device_for_file not in instance_cache:
+                            instance_cache[device_for_file] = parse_supervisor_device_table(
+                                sup_wb_path, sup_sheet, device_for_file
+                            )
+                        inst = _pick_instance_for_file(file_name, instance_cache.get(device_for_file, []))
+                        seq_arg = None
+                        cached_instances = instance_cache.get(device_for_file, [])
+                        type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
+                        if len(cached_instances) > 1:
+                            seq_arg = cached_instances
+                        elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
+                            seq_arg = cached_instances
+                        inst_map = None
+                        default_fields = inst.get("fields") if inst else None
+                        if (
+                            cached_instances
+                            and ups_anchor_info is not None
+                            and normalize_for_compare(device_for_file) in PROTECTION_LAYOUT_DEVICES
+                        ):
+                            inst_map = {}
+                            for inst_item in cached_instances:
+                                fields = inst_item.get("fields", {})
+                                order = inst_item.get("order", [])
+                                id_val = inst_item.get("id_value")
+                                feeder_val = inst_item.get("feeder_value")
+                                name_val = inst_item.get("name_value")
+                                candidates = [id_val, name_val, feeder_val]
+                                if pd.notna(id_val) and pd.notna(feeder_val):
+                                    candidates.append(f"{id_val}_{feeder_val}")
+                                    candidates.append(f"{feeder_val}_{id_val}")
+                                for cand in candidates:
+                                    norm = normalize_value_for_compare(cand)
+                                    if norm and norm not in inst_map:
+                                        inst_map[norm] = (fields, order)
+                        out_path, used_layer = fill_one_gpkg(
+                            file_obj,
+                            device_for_file,
+                            field_map=inst.get("fields") if inst else None,
+                            field_order=inst.get("order") if inst else None,
+                            instance_map=inst_map,
+                            default_fields=default_fields,
+                            sequential_instances=seq_arg,
+                            line_bay_info=line_bay_info,
+                            ups_anchor_info=ups_anchor_info,
+                            type_map=type_map_device,
+                        )
+                        _record_output(file_name, out_path)
+                        log_instances = [inst] if inst else cached_instances
+                        run_domain_rows.extend(
+                            append_domain_code_log(
+                                _collect_domain_log_entries(log_instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": device_for_file,
+                                    "output": f"{prefix_label}{file_name}",
+                                },
+                            )
+                        )
+                        chosen_label = inst.get("label") if inst else "default instance"
+                        logs.append(
+                            f"{prefix_label}{file_name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
+                        )
+                    except Exception as exc:
+                        out_path = _write_original_file(file_obj)
+                        _record_output(file_name, out_path)
+                        logs.append(f"{prefix_label}{file_name}: failed ({exc}); kept original file.")
+
+                if ups_anchor_info:
+                    protection_devices = [
+                        dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
+                    ]
+                    anchor, anchor_crs = load_ups_anchor_and_crs(
+                        ups_anchor_info.get("path"),
+                        ups_anchor_info.get("layer"),
+                    )
+                    try:
+                        spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
+                    except Exception:
+                        spacing_val = PROTECTION_LAYOUT_SPACING
+                    if anchor is None:
+                        logs.append(f"{prefix_label}Protection auto-create skipped: UPS anchor could not be resolved.")
+                    else:
+                        for dev_name in protection_devices:
+                            if normalize_for_compare(dev_name) in uploaded_device_norms:
+                                continue
+                            instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                            if not instances:
+                                continue
+                            points = build_protection_layout_points(anchor, len(instances), spacing_val)
+                            if not points or len(points) != len(instances):
+                                logs.append(f"{prefix_label}{dev_name}: protection layout failed (no points).")
+                                continue
+                            out_gdf = build_device_gdf_from_instances(instances, points, anchor_crs)
+                            layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            file_name = f"{layer_name}.gpkg"
+                            _record_output(file_name, out_path)
+                            run_domain_rows.extend(
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": f"{prefix_label}{file_name}",
+                                    },
+                                )
+                            )
+                            logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
+
+                template_devices = [
+                    ("High Voltage Line", HV_LINE_TEMPLATE_PATH),
+                    ("Earthing Transformer", EARTHING_TRANSFORMER_TEMPLATE_PATH),
+                ]
+                for dev_name, tpl_path in template_devices:
+                    dev_norm = normalize_for_compare(dev_name)
+                    expanded_instances: list[dict[str, Any]] = []
+                    expanded_geoms: list[Any] = []
+                    if dev_norm in uploaded_device_norms:
+                        continue
+                    instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                    if not instances:
+                        logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                        continue
+                    if dev_norm == normalize_for_compare("High Voltage Line") and line_bay_info:
+                        bay_gdf = load_line_bay_layer(
+                            line_bay_info.get("path"),
+                            line_bay_info.get("layer"),
+                            line_bay_info.get("field"),
+                        )
+                        if bay_gdf is not None and not bay_gdf.empty:
+                            bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
+                            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                            if not isinstance(id_name_map, dict):
+                                id_name_map = {}
+                            geom_col = bay_gdf.geometry.name
+                            geoms_all = list(bay_gdf[geom_col])
+                            by_norm: dict[str, list[int]] = {}
+                            for idx, row in bay_gdf.iterrows():
+                                name_val = _extract_bay_name_from_row(row, bay_field, id_name_map)
+                                norm = normalize_value_for_compare(name_val)
+                                if not norm:
+                                    continue
+                                by_norm.setdefault(norm, []).append(idx)
+                            unused_ids = list(range(len(bay_gdf)))
+                            unused_set = set(unused_ids)
+
+                            def _take_unused() -> int | None:
+                                while unused_ids:
+                                    idx = unused_ids.pop(0)
+                                    if idx in unused_set:
+                                        unused_set.remove(idx)
+                                        return idx
+                                return None
+
+                            lightning_norms = {normalize_for_compare("Lightning Arrester")}
+                            preferred_points = collect_device_points_from_uploads(
+                                files, bay_gdf.crs, device_options, equip_map_sup, lightning_norms
+                            )
+                            all_points = collect_point_geometries_from_uploads(files, bay_gdf.crs)
+                            points_source = (
+                                preferred_points
+                                if preferred_points is not None and not preferred_points.empty
+                                else all_points
+                            )
+                            points_by_bay = (
+                                map_points_to_bays(points_source, bay_gdf) if points_source is not None else {}
+                            )
+                            for inst in instances:
+                                inst_fields = inst.get("fields", {}) or {}
+                                candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
+                                for key, val in inst_fields.items():
+                                    norm_key = normalize_for_compare(key)
+                                    if any(tok in norm_key for tok in ["linebay", "line_bay", "bayname", "name"]):
+                                        candidates.append(val)
+                                chosen_idx = None
+                                for cand in candidates:
+                                    cand_norms: list[str] = []
+                                    norm = normalize_value_for_compare(cand)
+                                    if norm:
+                                        cand_norms.append(norm)
+                                        stripped = norm.rstrip("0123456789").rstrip()
+                                        if stripped and stripped not in cand_norms:
+                                            cand_norms.append(stripped)
+                                    for cn in cand_norms:
+                                        if cn and cn in by_norm and by_norm[cn]:
+                                            chosen_idx = by_norm[cn].pop(0)
+                                            if chosen_idx in unused_set:
+                                                unused_set.remove(chosen_idx)
+                                            break
+                                    if chosen_idx is not None:
+                                        break
+                                if chosen_idx is None:
+                                    chosen_idx = _take_unused()
+                                if chosen_idx is None and geoms_all:
+                                    chosen_idx = 0
+                                if chosen_idx is None:
+                                    continue
+                                poly = geoms_all[chosen_idx]
+                                try:
+                                    bay_row = bay_gdf.iloc[chosen_idx]
+                                    bay_name_value = _extract_bay_name_from_row(bay_row, bay_field, id_name_map)
+                                except Exception:
+                                    bay_name_value = None
+                                points_in_bay = points_by_bay.get(chosen_idx, [])
+                                lines = build_lines_from_points_in_polygon(poly, points_in_bay, 3)
+                                lines = expand_geometries(lines, 3)
+                                if not lines:
+                                    continue
+                                for ln in lines:
+                                    inst_copy = dict(inst)
+                                    fields_copy = dict(inst.get("fields", {}) or {})
+                                    if bay_name_value is not None:
+                                        for name_col in [
+                                            "Name",
+                                            "name",
+                                            "Line_Name",
+                                            "line_name",
+                                            "line",
+                                            "Line",
+                                            "Line_Bay_Name",
+                                            "line_bay_name",
+                                        ]:
+                                            fields_copy[name_col] = bay_name_value
+                                    inst_copy["fields"] = fields_copy
+                                    expanded_instances.append(inst_copy)
+                                    expanded_geoms.append(ln)
+                    if expanded_geoms:
+                        out_gdf = build_device_gdf_from_instances(expanded_instances, expanded_geoms, bay_gdf.crs)
+                        out_gdf = ensure_name_fields_string(
+                            out_gdf,
+                            [
+                                "Name",
+                                "Line_Name",
+                                "Line_Bay_Name",
+                                "line_name",
+                                "line_bay_name",
+                                "line",
+                                "Line",
+                            ],
+                        )
+                        layer_name = derive_layer_name_from_filename(dev_name)
+                        file_name = f"{dev_name}.gpkg"
+                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                            out_path = Path(tmpout.name)
+                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                        _record_output(file_name, out_path)
+                        run_domain_rows.extend(
+                            append_domain_code_log(
+                                _collect_domain_log_entries(instances),
+                                {
+                                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                                    "sheet": sup_sheet,
+                                    "device": dev_name,
+                                    "output": f"{prefix_label}{file_name}",
+                                },
+                            )
+                        )
+                        logs.append(
+                            f"{prefix_label}{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
+                        )
+                        continue
+                    if dev_norm == normalize_for_compare("Earthing Transformer"):
+                        cabin_norms = {normalize_for_compare("Substation/Cabin")}
+                        cabins_gdf = collect_device_polygons_from_uploads(
+                            files, None, device_options, equip_map_sup, cabin_norms
+                        )
+                        switchgear_norms = {
+                            normalize_for_compare("MV Switch gear"),
+                            normalize_for_compare("INDOR SWITCHGEAR TABLE"),
+                        }
+                        switchgear_pts = collect_device_points_from_uploads(
+                            files,
+                            cabins_gdf.crs if cabins_gdf is not None else None,
+                            device_options,
+                            equip_map_sup,
+                            switchgear_norms,
+                        )
+                        geoms: list[Any] = []
+                        cabin_anchor_points: list[Any] = []
+                        if cabins_gdf is not None and not cabins_gdf.empty:
+                            try:
+                                if (
+                                    switchgear_pts is not None
+                                    and not switchgear_pts.empty
+                                    and switchgear_pts.crs != cabins_gdf.crs
+                                ):
+                                    switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
+                            except Exception:
+                                pass
+                            for _, cabin in cabins_gdf.iterrows():
+                                poly = cabin.geometry
+                                anchor = None
+                                if switchgear_pts is not None and not switchgear_pts.empty:
+                                    try:
+                                        pts_inside = switchgear_pts[switchgear_pts.within(poly)]
+                                    except Exception:
+                                        pts_inside = gpd.GeoDataFrame()
+                                    if not pts_inside.empty:
+                                        try:
+                                            anchor = pts_inside.unary_union.centroid
+                                        except Exception:
+                                            anchor = pts_inside.iloc[0].geometry
+                                if anchor is None:
+                                    try:
+                                        anchor = poly.centroid
+                                    except Exception:
+                                        anchor = None
+                                if anchor is not None:
+                                    geoms.append(anchor)
+                                    cabin_anchor_points.append(anchor)
+                        if geoms:
+                            target_count = len(instances)
+                            geoms = expand_geometries(geoms, target_count)
+                            out_gdf = build_device_gdf_from_instances(
+                                instances, geoms, cabins_gdf.crs if cabins_gdf is not None else None
+                            )
+                            try:
+                                out_gdf = out_gdf.copy()
+                                out_gdf.geometry = out_gdf.geometry.centroid
+                            except Exception:
+                                pass
+                            layer_name = derive_layer_name_from_filename(dev_name)
+                            file_name = f"{dev_name}.gpkg"
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            _record_output(file_name, out_path)
+                            run_domain_rows.extend(
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": f"{prefix_label}{file_name}",
+                                    },
+                                )
+                            )
+                            logs.append(
+                                f"{prefix_label}{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s))."
+                            )
+                            continue
+                        else:
+                            logs.append(f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded).")
+                            continue
+                    tpl = load_template_layer(tpl_path)
+                    if tpl is None:
+                        logs.append(f"{prefix_label}{dev_name}: template not found at {tpl_path}.")
+                        continue
+                    tpl_gdf, _tpl_layer = tpl
+                    geoms = list(tpl_gdf.geometry)
+                    if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
+                        geoms = cabin_anchor_points.copy()
+                    # Ensure Earthing Transformer auto-create always uses points (fall back to centroids if template isn't point-based).
+                        if dev_norm == normalize_for_compare("Earthing Transformer"):
+                            clean_geoms: list[Any] = []
+                            for g in geoms:
+                                if g is None or getattr(g, "is_empty", True):
+                                    continue
+                                if getattr(g, "geom_type", "").lower() == "point":
+                                    clean_geoms.append(g)
+                                else:
+                                    try:
+                                        clean_geoms.append(g.centroid)
+                                    except Exception:
+                                        continue
+                            geoms = clean_geoms
+                    if dev_norm == normalize_for_compare("High Voltage Line"):
+                        instances = repeat_instances(instances, 3)
+                    target_count = len(instances)
+                    if target_count <= 0:
+                        logs.append(f"{prefix_label}{dev_name}: skipped (no instances to fill).")
+                        continue
+                    geoms = expand_geometries(geoms, target_count)
+                    if not geoms:
+                        logs.append(f"{prefix_label}{dev_name}: template has no geometry.")
+                        continue
+                    out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
+                    if dev_norm == normalize_for_compare("Earthing Transformer"):
+                        try:
+                            out_gdf = out_gdf.copy()
+                            out_gdf.geometry = out_gdf.geometry.centroid
+                        except Exception:
+                            pass
+                    if dev_norm == normalize_for_compare("High Voltage Line"):
+                        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                        if isinstance(id_name_map, dict) and id_name_map:
+                            out_gdf = replace_line_name_ids(out_gdf, id_name_map)
+                        out_gdf = ensure_name_fields_string(
+                            out_gdf,
+                            [
+                                "Name",
+                                "Line_Name",
+                                "Line_Bay_Name",
+                                "line_name",
+                                "line_bay_name",
+                                "line",
+                                "Line",
+                            ],
+                        )
+                    layer_name = derive_layer_name_from_filename(dev_name)
+                    file_name = f"{dev_name}.gpkg"
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                        out_path = Path(tmpout.name)
+                    out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                    _record_output(file_name, out_path)
+                    run_domain_rows.extend(
+                        append_domain_code_log(
+                            _collect_domain_log_entries(instances),
+                            {
+                                "workbook": sup_wb_path.name if sup_wb_path else None,
+                                "sheet": sup_sheet,
+                                "device": dev_name,
+                                "output": f"{prefix_label}{file_name}",
+                            },
+                        )
+                    )
+                    logs.append(f"{prefix_label}{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
+
+                return outputs, logs, run_domain_rows
 
             if len(sup_gpkg_files) == 1:
                 sup_gpkg = sup_gpkg_files[0]
@@ -4947,451 +5716,22 @@ def run_app() -> None:
             else:
                 st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically using a per-file device match.")
                 if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
-                    logs: list[str] = []
-                    outputs: list[tuple[str, Path]] = []
-                    instance_cache: dict[str, list[dict[str, Any]]] = {}
-                    uploaded_device_norms: set[str] = set()
-                    run_domain_rows: list[dict[str, Any]] = []
-
-                    def _write_original_file(file_obj):
-                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp:
-                            tmp.write(file_obj.getbuffer())
-                            return Path(tmp.name)
-
-                    def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
-                        if not instances:
-                            return None
-                        if len(instances) == 1:
-                            return instances[0]
-                        stem_norm = normalize_for_compare(Path(name).stem)
-                        for inst in instances:
-                            for cand in (inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")):
-                                if pd.notna(cand) and normalize_for_compare(cand) in stem_norm:
-                                    return inst
-                        return instances[0]
-
-                    for file_obj in sup_gpkg_files:
-                        try:
-                            stem_norm = normalize_for_compare(Path(file_obj.name).stem)
-                            if stem_norm in SKIP_BATCH_FILL_STEMS:
-                                out_path = _write_original_file(file_obj)
-                                outputs.append((file_obj.name, out_path))
-                                logs.append(f"{file_obj.name}: skipped fill (kept original geometry).")
-                                continue
-                            device_for_file = resolve_equipment_name(file_obj.name, device_options, equip_map_sup)
-                            if device_for_file not in device_options:
-                                out_path = _write_original_file(file_obj)
-                                outputs.append((file_obj.name, out_path))
-                                logs.append(
-                                    f"{file_obj.name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
-                                )
-                                continue
-                            uploaded_device_norms.add(normalize_for_compare(device_for_file))
-                            if device_for_file not in instance_cache:
-                                instance_cache[device_for_file] = parse_supervisor_device_table(
-                                    sup_wb_path, sup_sheet, device_for_file
-                                )
-                            inst = _pick_instance_for_file(file_obj.name, instance_cache.get(device_for_file, []))
-                            seq_arg = None
-                            cached_instances = instance_cache.get(device_for_file, [])
-                            type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
-                            if len(cached_instances) > 1:
-                                seq_arg = cached_instances
-                            elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
-                                seq_arg = cached_instances
-                            inst_map = None
-                            default_fields = inst.get("fields") if inst else None
-                            if (
-                                cached_instances
-                                and ups_anchor_info is not None
-                                and normalize_for_compare(device_for_file) in PROTECTION_LAYOUT_DEVICES
-                            ):
-                                inst_map = {}
-                                for inst_item in cached_instances:
-                                    fields = inst_item.get("fields", {})
-                                    order = inst_item.get("order", [])
-                                    id_val = inst_item.get("id_value")
-                                    feeder_val = inst_item.get("feeder_value")
-                                    name_val = inst_item.get("name_value")
-                                    candidates = [id_val, name_val, feeder_val]
-                                    if pd.notna(id_val) and pd.notna(feeder_val):
-                                        candidates.append(f"{id_val}_{feeder_val}")
-                                        candidates.append(f"{feeder_val}_{id_val}")
-                                    for cand in candidates:
-                                        norm = normalize_value_for_compare(cand)
-                                        if norm and norm not in inst_map:
-                                            inst_map[norm] = (fields, order)
-                            out_path, used_layer = fill_one_gpkg(
-                                file_obj,
-                                device_for_file,
-                                field_map=inst.get("fields") if inst else None,
-                                field_order=inst.get("order") if inst else None,
-                                instance_map=inst_map,
-                                default_fields=default_fields,
-                                sequential_instances=seq_arg,
-                                line_bay_info=line_bay_info,
-                                ups_anchor_info=ups_anchor_info,
-                                type_map=type_map_device,
-                            )
-                            outputs.append((file_obj.name, out_path))
-                            log_instances = [inst] if inst else cached_instances
-                            run_domain_rows.extend(append_domain_code_log(
-                                _collect_domain_log_entries(log_instances),
-                                {
-                                    "workbook": sup_wb_path.name if sup_wb_path else None,
-                                    "sheet": sup_sheet,
-                                    "device": device_for_file,
-                                    "output": file_obj.name,
-                                },
-                            ))
-                            chosen_label = inst.get("label") if inst else "default instance"
-                            logs.append(
-                                f"{file_obj.name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
-                            )
-                        except Exception as exc:
-                            out_path = _write_original_file(file_obj)
-                            outputs.append((file_obj.name, out_path))
-                            logs.append(f"{file_obj.name}: failed ({exc}); kept original file.")
-
-                    if ups_anchor_info:
-                        protection_devices = [
-                            dev
-                            for dev in device_options
-                            if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
-                        ]
-                        anchor, anchor_crs = load_ups_anchor_and_crs(
-                            ups_anchor_info.get("path"),
-                            ups_anchor_info.get("layer"),
-                        )
-                        try:
-                            spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
-                        except Exception:
-                            spacing_val = PROTECTION_LAYOUT_SPACING
-                        if anchor is None:
-                            logs.append("Protection auto-create skipped: UPS anchor could not be resolved.")
-                        else:
-                            for dev_name in protection_devices:
-                                if normalize_for_compare(dev_name) in uploaded_device_norms:
-                                    continue
-                                instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
-                                if not instances:
-                                    continue
-                                points = build_protection_layout_points(anchor, len(instances), spacing_val)
-                                if not points or len(points) != len(instances):
-                                    logs.append(f"{dev_name}: protection layout failed (no points).")
-                                    continue
-                                out_gdf = build_device_gdf_from_instances(instances, points, anchor_crs)
-                                layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
-                                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                                    out_path = Path(tmpout.name)
-                                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                                file_name = f"{layer_name}.gpkg"
-                                outputs.append((file_name, out_path))
-                                run_domain_rows.extend(append_domain_code_log(
-                                    _collect_domain_log_entries(instances),
-                                    {
-                                        "workbook": sup_wb_path.name if sup_wb_path else None,
-                                        "sheet": sup_sheet,
-                                        "device": dev_name,
-                                        "output": file_name,
-                                    },
-                                ))
-                                logs.append(f"{dev_name}: auto-created protection points ({len(points)}).")
-
-                    template_devices = [
-                        ("High Voltage Line", HV_LINE_TEMPLATE_PATH),
-                        ("Earthing Transformer", EARTHING_TRANSFORMER_TEMPLATE_PATH),
-                    ]
-                    for dev_name, tpl_path in template_devices:
-                        dev_norm = normalize_for_compare(dev_name)
-                        expanded_instances: list[dict[str, Any]] = []
-                        expanded_geoms: list[Any] = []
-                        if dev_norm in uploaded_device_norms:
-                            continue
-                        instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
-                        if not instances:
-                            logs.append(f"{dev_name}: skipped (no instances in sheet).")
-                            continue
-                        if dev_norm == normalize_for_compare("High Voltage Line") and line_bay_info:
-                            bay_gdf = load_line_bay_layer(
-                                line_bay_info.get("path"),
-                                line_bay_info.get("layer"),
-                                line_bay_info.get("field"),
-                            )
-                            if bay_gdf is not None and not bay_gdf.empty:
-                                bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
-                                id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-                                if not isinstance(id_name_map, dict):
-                                    id_name_map = {}
-                                geom_col = bay_gdf.geometry.name
-                                geoms_all = list(bay_gdf[geom_col])
-                                by_norm: dict[str, list[int]] = {}
-                                for idx, row in bay_gdf.iterrows():
-                                    name_val = _extract_bay_name_from_row(row, bay_field, id_name_map)
-                                    norm = normalize_value_for_compare(name_val)
-                                    if not norm:
-                                        continue
-                                    by_norm.setdefault(norm, []).append(idx)
-                                unused_ids = list(range(len(bay_gdf)))
-                                unused_set = set(unused_ids)
-
-                                def _take_unused() -> int | None:
-                                    while unused_ids:
-                                        idx = unused_ids.pop(0)
-                                        if idx in unused_set:
-                                            unused_set.remove(idx)
-                                            return idx
-                                    return None
-
-                                lightning_norms = {normalize_for_compare("Lightning Arrester")}
-                                preferred_points = collect_device_points_from_uploads(
-                                    sup_gpkg_files, bay_gdf.crs, device_options, equip_map_sup, lightning_norms
-                                )
-                                all_points = collect_point_geometries_from_uploads(sup_gpkg_files, bay_gdf.crs)
-                                points_source = preferred_points if preferred_points is not None and not preferred_points.empty else all_points
-                                points_by_bay = map_points_to_bays(points_source, bay_gdf) if points_source is not None else {}
-                                for inst in instances:
-                                    inst_fields = inst.get("fields", {}) or {}
-                                    candidates = [inst.get("id_value"), inst.get("name_value"), inst.get("feeder_value")]
-                                    for key, val in inst_fields.items():
-                                        norm_key = normalize_for_compare(key)
-                                        if any(tok in norm_key for tok in ["linebay", "line_bay", "bayname", "name"]):
-                                            candidates.append(val)
-                                    chosen_idx = None
-                                    for cand in candidates:
-                                        cand_norms: list[str] = []
-                                        norm = normalize_value_for_compare(cand)
-                                        if norm:
-                                            cand_norms.append(norm)
-                                            stripped = norm.rstrip("0123456789").rstrip()
-                                            if stripped and stripped not in cand_norms:
-                                                cand_norms.append(stripped)
-                                        for cn in cand_norms:
-                                            if cn and cn in by_norm and by_norm[cn]:
-                                                chosen_idx = by_norm[cn].pop(0)
-                                                if chosen_idx in unused_set:
-                                                    unused_set.remove(chosen_idx)
-                                                break
-                                        if chosen_idx is not None:
-                                            break
-                                    if chosen_idx is None:
-                                        chosen_idx = _take_unused()
-                                    if chosen_idx is None and geoms_all:
-                                        chosen_idx = 0
-                                    if chosen_idx is None:
-                                        continue
-                                    poly = geoms_all[chosen_idx]
-                                    try:
-                                        bay_row = bay_gdf.iloc[chosen_idx]
-                                        bay_name_value = _extract_bay_name_from_row(bay_row, bay_field, id_name_map)
-                                    except Exception:
-                                        bay_name_value = None
-                                    points_in_bay = points_by_bay.get(chosen_idx, [])
-                                    lines = build_lines_from_points_in_polygon(poly, points_in_bay, 3)
-                                    lines = expand_geometries(lines, 3)
-                                    if not lines:
-                                        continue
-                                    for ln in lines:
-                                        inst_copy = dict(inst)
-                                        fields_copy = dict(inst.get("fields", {}) or {})
-                                        if bay_name_value is not None:
-                                            for name_col in [
-                                                "Name",
-                                                "name",
-                                                "Line_Name",
-                                                "line_name",
-                                                "line",
-                                                "Line",
-                                                "Line_Bay_Name",
-                                                "line_bay_name",
-                                            ]:
-                                                fields_copy[name_col] = bay_name_value
-                                        inst_copy["fields"] = fields_copy
-                                        expanded_instances.append(inst_copy)
-                                        expanded_geoms.append(ln)
-                        if expanded_geoms:
-                            out_gdf = build_device_gdf_from_instances(
-                                expanded_instances, expanded_geoms, bay_gdf.crs
-                            )
-                            out_gdf = ensure_name_fields_string(
-                                out_gdf,
-                                [
-                                    "Name",
-                                    "Line_Name",
-                                    "Line_Bay_Name",
-                                    "line_name",
-                                    "line_bay_name",
-                                    "line",
-                                    "Line",
-                                ],
-                            )
-                            layer_name = derive_layer_name_from_filename(dev_name)
-                            file_name = f"{dev_name}.gpkg"
-                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                                out_path = Path(tmpout.name)
-                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                            outputs.append((file_name, out_path))
-                            run_domain_rows.extend(append_domain_code_log(
-                                _collect_domain_log_entries(instances),
-                                {
-                                    "workbook": sup_wb_path.name if sup_wb_path else None,
-                                    "sheet": sup_sheet,
-                                    "device": dev_name,
-                                    "output": file_name,
-                                },
-                            ))
-                            logs.append(
-                                f"{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
-                            )
-                            continue
-                        if dev_norm == normalize_for_compare("Earthing Transformer"):
-                            cabin_norms = {normalize_for_compare("Substation/Cabin")}
-                            cabins_gdf = collect_device_polygons_from_uploads(
-                                sup_gpkg_files, None, device_options, equip_map_sup, cabin_norms
-                            )
-                            switchgear_norms = {
-                                normalize_for_compare("MV Switch gear"),
-                                normalize_for_compare("INDOR SWITCHGEAR TABLE"),
-                            }
-                            switchgear_pts = collect_device_points_from_uploads(
-                                sup_gpkg_files, cabins_gdf.crs if cabins_gdf is not None else None, device_options, equip_map_sup, switchgear_norms
-                            )
-                            geoms: list[Any] = []
-                            cabin_anchor_points: list[Any] = []
-                            if cabins_gdf is not None and not cabins_gdf.empty:
-                                try:
-                                    if switchgear_pts is not None and not switchgear_pts.empty and switchgear_pts.crs != cabins_gdf.crs:
-                                        switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
-                                except Exception:
-                                    pass
-                                for _, cabin in cabins_gdf.iterrows():
-                                    poly = cabin.geometry
-                                    anchor = None
-                                    if switchgear_pts is not None and not switchgear_pts.empty:
-                                        try:
-                                            pts_inside = switchgear_pts[switchgear_pts.within(poly)]
-                                        except Exception:
-                                            pts_inside = gpd.GeoDataFrame()
-                                        if not pts_inside.empty:
-                                            try:
-                                                anchor = pts_inside.unary_union.centroid
-                                            except Exception:
-                                                anchor = pts_inside.iloc[0].geometry
-                                    if anchor is None:
-                                        try:
-                                            anchor = poly.centroid
-                                        except Exception:
-                                            anchor = None
-                                    if anchor is not None:
-                                        geoms.append(anchor)
-                                        cabin_anchor_points.append(anchor)
-                            if geoms:
-                                target_count = len(instances)
-                                geoms = expand_geometries(geoms, target_count)
-                                out_gdf = build_device_gdf_from_instances(instances, geoms, cabins_gdf.crs if cabins_gdf is not None else None)
-                                try:
-                                    out_gdf = out_gdf.copy()
-                                    out_gdf.geometry = out_gdf.geometry.centroid
-                                except Exception:
-                                    pass
-                                layer_name = derive_layer_name_from_filename(dev_name)
-                                file_name = f"{dev_name}.gpkg"
-                                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                                    out_path = Path(tmpout.name)
-                                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                                outputs.append((file_name, out_path))
-                                run_domain_rows.extend(append_domain_code_log(
-                                    _collect_domain_log_entries(instances),
-                                    {
-                                        "workbook": sup_wb_path.name if sup_wb_path else None,
-                                        "sheet": sup_sheet,
-                                        "device": dev_name,
-                                        "output": file_name,
-                                    },
-                                ))
-                                logs.append(f"{dev_name}: auto-created beside switchgear inside cabins ({len(geoms)} feature(s)).")
-                                continue
-                            else:
-                                logs.append(f"{dev_name}: skipped auto-create (no cabin polygons uploaded).")
-                                continue
-                        tpl = load_template_layer(tpl_path)
-                        if tpl is None:
-                            logs.append(f"{dev_name}: template not found at {tpl_path}.")
-                            continue
-                        tpl_gdf, _tpl_layer = tpl
-                        geoms = list(tpl_gdf.geometry)
-                        if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
-                            geoms = cabin_anchor_points.copy()
-                        # Ensure Earthing Transformer auto-create always uses points (fall back to centroids if template isn't point-based).
-                            if dev_norm == normalize_for_compare("Earthing Transformer"):
-                                clean_geoms: list[Any] = []
-                                for g in geoms:
-                                    if g is None or getattr(g, "is_empty", True):
-                                        continue
-                                if getattr(g, "geom_type", "").lower() == "point":
-                                    clean_geoms.append(g)
-                                else:
-                                    try:
-                                        clean_geoms.append(g.centroid)
-                                    except Exception:
-                                        continue
-                            geoms = clean_geoms
-                        if dev_norm == normalize_for_compare("High Voltage Line"):
-                            instances = repeat_instances(instances, 3)
-                        target_count = len(instances)
-                        if target_count <= 0:
-                            logs.append(f"{dev_name}: skipped (no instances to fill).")
-                            continue
-                        geoms = expand_geometries(geoms, target_count)
-                        if not geoms:
-                            logs.append(f"{dev_name}: template has no geometry.")
-                            continue
-                        out_gdf = build_device_gdf_from_instances(instances, geoms, tpl_gdf.crs)
-                        if dev_norm == normalize_for_compare("Earthing Transformer"):
-                            try:
-                                out_gdf = out_gdf.copy()
-                                out_gdf.geometry = out_gdf.geometry.centroid
-                            except Exception:
-                                pass
-                        if dev_norm == normalize_for_compare("High Voltage Line"):
-                            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-                            if isinstance(id_name_map, dict) and id_name_map:
-                                out_gdf = replace_line_name_ids(out_gdf, id_name_map)
-                            out_gdf = ensure_name_fields_string(
-                                out_gdf,
-                                [
-                                    "Name",
-                                    "Line_Name",
-                                    "Line_Bay_Name",
-                                    "line_name",
-                                    "line_bay_name",
-                                    "line",
-                                    "Line",
-                                ],
-                            )
-                        layer_name = derive_layer_name_from_filename(dev_name)
-                        file_name = f"{dev_name}.gpkg"
-                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                            out_path = Path(tmpout.name)
-                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                        outputs.append((file_name, out_path))
-                        run_domain_rows.extend(append_domain_code_log(
-                            _collect_domain_log_entries(instances),
-                            {
-                                "workbook": sup_wb_path.name if sup_wb_path else None,
-                                "sheet": sup_sheet,
-                                "device": dev_name,
-                                "output": file_name,
-                            },
-                        ))
-                        logs.append(f"{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
+                    outputs, logs, run_domain_rows = _fill_supervisor_batch(
+                        sup_gpkg_files,
+                        device_options,
+                        sup_wb_path,
+                        sup_sheet,
+                        equip_map_sup,
+                        line_bay_info,
+                        ups_anchor_info,
+                    )
 
                     if outputs:
                         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
                             zip_path = Path(ztmp.name)
                         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                             for name, out_path in outputs:
-                                zf.write(out_path, arcname=Path(name).name)
+                                zf.write(out_path, arcname=name)
                             if run_domain_rows:
                                 zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
                         with open(zip_path, "rb") as f:
