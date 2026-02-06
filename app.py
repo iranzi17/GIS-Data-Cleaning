@@ -5193,6 +5193,8 @@ def run_app() -> None:
                     dev_norm = normalize_for_compare(dev_name)
                     expanded_instances: list[dict[str, Any]] = []
                     expanded_geoms: list[Any] = []
+                    bay_gdf = None
+                    cabin_anchor_points: list[Any] = []
                     if dev_norm in uploaded_device_norms:
                         continue
                     instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
@@ -5302,41 +5304,41 @@ def run_app() -> None:
                                     inst_copy["fields"] = fields_copy
                                     expanded_instances.append(inst_copy)
                                     expanded_geoms.append(ln)
-                    if expanded_geoms:
-                        out_gdf = build_device_gdf_from_instances(expanded_instances, expanded_geoms, bay_gdf.crs)
-                        out_gdf = ensure_name_fields_string(
-                            out_gdf,
-                            [
-                                "Name",
-                                "Line_Name",
-                                "Line_Bay_Name",
-                                "line_name",
-                                "line_bay_name",
-                                "line",
-                                "Line",
-                            ],
-                        )
-                        layer_name = derive_layer_name_from_filename(dev_name)
-                        file_name = f"{dev_name}.gpkg"
-                        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                            out_path = Path(tmpout.name)
-                        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                        _record_output(file_name, out_path)
-                        run_domain_rows.extend(
-                            append_domain_code_log(
-                                _collect_domain_log_entries(instances),
-                                {
-                                    "workbook": sup_wb_path.name if sup_wb_path else None,
-                                    "sheet": sup_sheet,
-                                    "device": dev_name,
-                                    "output": f"{prefix_label}{file_name}",
-                                },
+                        if expanded_geoms and bay_gdf is not None:
+                            out_gdf = build_device_gdf_from_instances(expanded_instances, expanded_geoms, bay_gdf.crs)
+                            out_gdf = ensure_name_fields_string(
+                                out_gdf,
+                                [
+                                    "Name",
+                                    "Line_Name",
+                                    "Line_Bay_Name",
+                                    "line_name",
+                                    "line_bay_name",
+                                    "line",
+                                    "Line",
+                                ],
                             )
-                        )
-                        logs.append(
-                            f"{prefix_label}{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
-                        )
-                        continue
+                            layer_name = derive_layer_name_from_filename(dev_name)
+                            file_name = f"{dev_name}.gpkg"
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            _record_output(file_name, out_path)
+                            run_domain_rows.extend(
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": f"{prefix_label}{file_name}",
+                                    },
+                                )
+                            )
+                            logs.append(
+                                f"{prefix_label}{dev_name}: auto-created from Line Bay polygons ({len(expanded_geoms)} feature(s))."
+                            )
+                            continue
                     if dev_norm == normalize_for_compare("Earthing Transformer"):
                         cabin_norms = {normalize_for_compare("Substation/Cabin")}
                         cabins_gdf = collect_device_polygons_from_uploads(
@@ -5354,7 +5356,6 @@ def run_app() -> None:
                             switchgear_norms,
                         )
                         geoms: list[Any] = []
-                        cabin_anchor_points: list[Any] = []
                         if cabins_gdf is not None and not cabins_gdf.empty:
                             try:
                                 if (
@@ -5427,7 +5428,7 @@ def run_app() -> None:
                         continue
                     tpl_gdf, _tpl_layer = tpl
                     geoms = list(tpl_gdf.geometry)
-                    if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
+                    if dev_norm == normalize_for_compare("Earthing Transformer") and cabin_anchor_points:
                         geoms = cabin_anchor_points.copy()
                     # Ensure Earthing Transformer auto-create always uses points (fall back to centroids if template isn't point-based).
                     if dev_norm == normalize_for_compare("Earthing Transformer"):
