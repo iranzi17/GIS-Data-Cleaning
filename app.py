@@ -2897,6 +2897,9 @@ FILE_MATCH_OVERRIDES = {
         "Feeder Type",
     ],
     normalize_for_compare("LINE BAY"): [
+        "Line_Bay_Name",
+        "Line Bay Name",
+        "LineBayName",
         "LineBayID",
         "Line Bay ID",
         "Line_Bay_ID",
@@ -3399,11 +3402,12 @@ def preferred_match_columns(device_name: str) -> list[str]:
     norm = normalize_for_compare(device_name)
     preferences = {
         normalize_for_compare("Line Bay"): [
+            "Line_Bay_Name",
+            "Line Bay Name",
+            "LineBayName",
             "LineBayID",
             "Line Bay ID",
             "Line_Bay_ID",
-            "Line Bay Name",
-            "Line_Bay_Name",
         ],
         normalize_for_compare("MV Switch gear"): [
             "FeederID",
