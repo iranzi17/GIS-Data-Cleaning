@@ -4038,19 +4038,28 @@ def run_app() -> None:
 
                             logs.append(f"{substation_name}: using workbook '{wb_label}' (sheet '{sup_sheet}').")
 
-                            batch_outputs, batch_logs, batch_domain_rows = _fill_supervisor_batch(
-                                files,
-                                device_options,
-                                wb_path,
-                                sup_sheet,
-                                equip_map_sup,
-                                line_bay_info,
-                                ups_anchor_info,
-                                output_prefix=substation_name,
-                            )
-                            outputs.extend(batch_outputs)
-                            logs.extend(batch_logs)
-                            run_domain_rows.extend(batch_domain_rows)
+                            try:
+                                batch_outputs, batch_logs, batch_domain_rows = _fill_supervisor_batch(
+                                    files,
+                                    device_options,
+                                    wb_path,
+                                    sup_sheet,
+                                    equip_map_sup,
+                                    line_bay_info,
+                                    ups_anchor_info,
+                                    output_prefix=substation_name,
+                                )
+                                outputs.extend(batch_outputs)
+                                logs.extend(batch_logs)
+                                run_domain_rows.extend(batch_domain_rows)
+                            except Exception as exc:
+                                logs.append(f"{substation_name}: batch failed ({type(exc).__name__}: {exc})")
+                                try:
+                                    import traceback
+
+                                    logs.append(traceback.format_exc())
+                                except Exception:
+                                    pass
 
                     if outputs:
                         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
