@@ -5430,19 +5430,19 @@ def run_app() -> None:
                     if dev_norm == normalize_for_compare("Earthing Transformer") and 'cabin_anchor_points' in locals() and cabin_anchor_points:
                         geoms = cabin_anchor_points.copy()
                     # Ensure Earthing Transformer auto-create always uses points (fall back to centroids if template isn't point-based).
-                        if dev_norm == normalize_for_compare("Earthing Transformer"):
-                            clean_geoms: list[Any] = []
-                            for g in geoms:
-                                if g is None or getattr(g, "is_empty", True):
+                    if dev_norm == normalize_for_compare("Earthing Transformer"):
+                        clean_geoms: list[Any] = []
+                        for g in geoms:
+                            if g is None or getattr(g, "is_empty", True):
+                                continue
+                            if getattr(g, "geom_type", "").lower() == "point":
+                                clean_geoms.append(g)
+                            else:
+                                try:
+                                    clean_geoms.append(g.centroid)
+                                except Exception:
                                     continue
-                                if getattr(g, "geom_type", "").lower() == "point":
-                                    clean_geoms.append(g)
-                                else:
-                                    try:
-                                        clean_geoms.append(g.centroid)
-                                    except Exception:
-                                        continue
-                            geoms = clean_geoms
+                        geoms = clean_geoms
                     if dev_norm == normalize_for_compare("High Voltage Line"):
                         instances = repeat_instances(instances, 3)
                     target_count = len(instances)
