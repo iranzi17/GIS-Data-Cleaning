@@ -2294,6 +2294,7 @@ def _fill_supervisor_batch(
     line_bay_info: dict[str, Any] | None,
     ups_anchor_info: dict[str, Any] | None,
     fill_one_gpkg_fn,
+    seq_assign_fallback: bool = True,
     output_prefix: str | None = None,
 ) -> tuple[list[tuple[str, Path]], list[str], list[dict[str, Any]]]:
     """Fill a batch of supervisor GeoPackages and return outputs + logs + domain rows."""
@@ -2391,6 +2392,9 @@ def _fill_supervisor_batch(
                 line_bay_info=line_bay_info,
                 ups_anchor_info=ups_anchor_info,
                 type_map=type_map_device,
+                sup_wb_path=sup_wb_path,
+                sup_sheet=sup_sheet,
+                seq_assign_fallback=seq_assign_fallback,
             )
             _record_output(file_name, out_path)
             log_instances = [inst] if inst else cached_instances
@@ -4052,6 +4056,717 @@ def derive_layer_name_from_filename(name: str) -> str:
     return base
 
 
+def fill_one_gpkg(
+    file_obj,
+    device_name: str,
+    layer_override: str | None = None,
+    field_map: dict[str, Any] | None = None,
+    match_column: str | None = None,
+    instance_map: dict[str, tuple[dict[str, Any], list[str]]] | None = None,
+    default_fields: dict[str, Any] | None = None,
+    field_order: list[str] | None = None,
+    sequential_instances: list[dict[str, Any]] | None = None,
+    line_bay_info: dict[str, Any] | None = None,
+    ups_anchor_info: dict[str, Any] | None = None,
+    type_map: dict[str, str] | None = None,
+    sup_wb_path: Path | None = None,
+    sup_sheet: str | None = None,
+    seq_assign_fallback: bool = True,
+) -> tuple[Path, str]:
+    # normalize sequential_instances to a list of entries with fields + optional ids
+    seq_entries: list[dict[str, Any]] = []
+    if sequential_instances:
+        for inst in sequential_instances:
+            if isinstance(inst, dict) and "fields" in inst:
+                seq_entries.append(
+                    {
+                        "fields": inst.get("fields", {}) or {},
+                        "id": inst.get("id_value"),
+                        "name": inst.get("name_value"),
+                        "type_map": inst.get("type_map"),
+                    }
+                )
+            else:
+                seq_entries.append(
+                    {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
+                )
+
+    type_map_local = dict(type_map) if isinstance(type_map, dict) else {}
+
+    def _extract_type_map(instances: list[dict[str, Any]] | None) -> dict[str, str]:
+        if not instances:
+            return {}
+        for inst in instances:
+            tm = inst.get("type_map") if isinstance(inst, dict) else None
+            if isinstance(tm, dict) and tm:
+                return dict(tm)
+        return {}
+
+    if not type_map_local:
+        type_map_local = _extract_type_map(seq_entries)
+
+    block_assign = normalize_for_compare(device_name) in BLOCK_ASSIGN_DEVICES
+    strict_line_bay = normalize_for_compare(device_name) == normalize_for_compare("Line Bay")
+
+    def _build_seq_entry_order(total_rows: int, total_entries: int) -> list[int]:
+        if total_rows <= 0 or total_entries <= 0:
+            return []
+        if not block_assign or total_entries == 1:
+            return [i % total_entries for i in range(total_rows)]
+        base = total_rows // total_entries
+        remainder = total_rows % total_entries
+        order: list[int] = []
+        for entry_idx in range(total_entries):
+            size = base + (1 if entry_idx < remainder else 0)
+            if size <= 0:
+                continue
+            order.extend([entry_idx] * size)
+        if len(order) < total_rows:
+            order.extend([total_entries - 1] * (total_rows - len(order)))
+        return order[:total_rows]
+
+    def _pick_seq_entry_by_feeder(
+        row_idx: int,
+        row_rank: int,
+        gdf_local: gpd.GeoDataFrame,
+        seq_order: list[int],
+        group_map: dict[int, int] | None,
+        prefix_map: dict[int, dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Choose sequential instance based on feeder type if available, else follow ordered groups."""
+        if not seq_entries:
+            return {}
+        feeder_col = None
+        norm_lookup = {normalize_for_compare(c): c for c in gdf_local.columns}
+        for cand in ["feeder type", "feeder_type", "feeder category"]:
+            if normalize_for_compare(cand) in norm_lookup:
+                feeder_col = norm_lookup[normalize_for_compare(cand)]
+                break
+        if feeder_col:
+            try:
+                val = gdf_local.loc[row_idx, feeder_col]
+            except Exception:
+                val = gdf_local.iloc[row_rank][feeder_col] if row_rank < len(gdf_local) else None
+            norm_val = normalize_value_for_compare(val)
+            def _match_entry(target: str) -> dict[str, Any] | None:
+                for ent in seq_entries:
+                    ident = ent.get("id") or ent.get("name")
+                    ident_norm = normalize_for_compare(ident)
+                    if target in ident_norm:
+                        return ent
+                return None
+            if "line" in norm_val:
+                chosen = _match_entry("mv3") or _match_entry("3")
+                if chosen:
+                    return chosen
+            if "transformer" in norm_val:
+                chosen = _match_entry("mv1") or _match_entry("1")
+                if chosen:
+                    return chosen
+        if prefix_map and row_idx in prefix_map:
+            return prefix_map[row_idx]
+        if group_map and row_idx in group_map:
+            group_idx = group_map[row_idx]
+            if 0 <= group_idx < len(seq_entries):
+                return seq_entries[group_idx]
+        if seq_order and row_rank < len(seq_order):
+            return seq_entries[seq_order[row_rank]]
+        return seq_entries[row_rank % len(seq_entries)]
+    file_name = _get_file_name(file_obj)
+    gpkg_path = _coerce_gpkg_path(file_obj)
+    if gpkg_path is None:
+        raise ValueError("Could not read the GeoPackage.")
+    layers = list_gpkg_layers(gpkg_path)
+    layer = layer_override or (layers[0] if layers else None)
+    if not layer:
+        raise ValueError("No layers found in the uploaded GeoPackage.")
+    gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
+    geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
+    geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
+    preserve_cols: set[str] = set()
+    preserve_type_map: dict[str, str] = {}
+    preserve_all_cols = normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin")
+    if normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin"):
+        for col in gdf_sup_local.columns:
+            norm_col = normalize_for_compare(col)
+            if norm_col in SUBSTATION_PRESERVE_FIELDS:
+                preserve_cols.add(col)
+            if norm_col in SUBSTATION_FORCE_TYPES:
+                preserve_type_map[norm_col] = SUBSTATION_FORCE_TYPES[norm_col]
+    preserve_norms = {normalize_for_compare(c) for c in preserve_cols}
+
+    def _is_preserved_field(field_name: Any) -> bool:
+        return normalize_for_compare(field_name) in preserve_norms
+    layout_applied = False
+    if (
+        ups_anchor_info
+        and normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES
+        and hasattr(gdf_sup_local, "geometry")
+    ):
+        desired_count = len(gdf_sup_local)
+        if seq_entries and len(seq_entries) > desired_count:
+            desired_count = len(seq_entries)
+        anchor = resolve_ups_anchor_point(
+            ups_anchor_info.get("path"),
+            ups_anchor_info.get("layer"),
+            gdf_sup_local.crs,
+        )
+        try:
+            spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
+        except Exception:
+            spacing_val = PROTECTION_LAYOUT_SPACING
+        if anchor is not None:
+            layout_applied = True
+            if desired_count > len(gdf_sup_local):
+                extra = desired_count - len(gdf_sup_local)
+                extra_points = build_protection_layout_points(anchor, extra, spacing_val)
+                if extra_points and len(extra_points) == extra:
+                    extra_rows = pd.DataFrame(
+                        {col: [pd.NA] * extra for col in gdf_sup_local.columns}
+                    )
+                    gdf_sup_local = pd.concat(
+                        [gdf_sup_local, extra_rows],
+                        ignore_index=True,
+                    )
+                    if geom_name:
+                        gdf_sup_local = gpd.GeoDataFrame(
+                            gdf_sup_local,
+                            geometry=geom_name,
+                            crs=geom_crs,
+                        )
+                    gdf_sup_local = gdf_sup_local.copy()
+                    gdf_sup_local.geometry.iloc[-extra:] = extra_points
+    fm_local = field_map
+    order_local = field_order or []
+    if fm_local is None and match_column is None:
+        if sup_wb_path is None or sup_sheet is None:
+            raise ValueError("Supervisor workbook and sheet are required for parsing.")
+        parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
+        if not parsed:
+            raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
+        # keep parsed instances available for fallback sequential assignment
+        parsed_instances = parsed
+        fm_local = parsed[0].get("fields", {})
+        order_local = parsed[0].get("order", [])
+        if not type_map_local:
+            type_map_local = _extract_type_map(parsed)
+    if fm_local is None and match_column is None:
+        raise ValueError(f"No field values available for device '{device_name}'.")
+    out_cols: dict[str, Any] = {}
+    if geom_name:
+        out_cols[geom_name] = gdf_sup_local.geometry
+    n = len(gdf_sup_local)
+    filled_fields: list[str] = []
+    if match_column and match_column in gdf_sup_local.columns:
+        out_cols[match_column] = gdf_sup_local[match_column].copy()
+    if preserve_all_cols:
+        for col in gdf_sup_local.columns:
+            if col == geom_name:
+                continue
+            if col not in out_cols:
+                out_cols[col] = gdf_sup_local[col].copy()
+
+    seq_row_indices = list(range(n))
+    if hasattr(gdf_sup_local, "geometry"):
+        try:
+            seq_row_indices = order_indices_by_location(gdf_sup_local.geometry)
+        except Exception:
+            seq_row_indices = list(range(n))
+    seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
+    seq_group_map = None
+    if block_assign and seq_entries and hasattr(gdf_sup_local, "geometry"):
+        try:
+            seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
+        except Exception:
+            seq_group_map = None
+    prefix_assignment_map: dict[int, dict[str, Any]] | None = None
+    if (
+        seq_entries
+        and hasattr(gdf_sup_local, "geometry")
+        and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
+    ):
+        prefix_groups: dict[str, list[tuple[int | None, dict[str, Any]]]] = {}
+        prefix_order: list[str] = []
+        for inst in seq_entries:
+            ident = inst.get("id") or inst.get("name")
+            res = split_instance_prefix_suffix(ident)
+            if not isinstance(res, tuple) or len(res) != 2:
+                continue
+            prefix, suffix = res
+            if not prefix:
+                continue
+            key = normalize_for_compare(prefix)
+            if key not in prefix_groups:
+                prefix_groups[key] = []
+                prefix_order.append(key)
+            prefix_groups[key].append((suffix, inst))
+        if prefix_groups:
+            for key, items in prefix_groups.items():
+                prefix_groups[key] = sorted(
+                    items,
+                    key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
+                )
+            prefix_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(prefix_groups))
+            group_ids = sorted(set(prefix_group_map.values()))
+            prefix_by_group: dict[int, str] = {}
+            for idx, gid in enumerate(group_ids):
+                prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
+            prefix_assignment_map = {}
+            for gid in group_ids:
+                pref_key = prefix_by_group.get(gid)
+                if not pref_key:
+                    continue
+                entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
+                if not entries:
+                    continue
+                row_indices = [idx for idx in seq_row_indices if prefix_group_map.get(idx) == gid]
+                for j, idx_row in enumerate(row_indices):
+                    prefix_assignment_map[idx_row] = entries[j % len(entries)]
+    spatial_norm_target = None
+    if (
+        instance_map
+        and line_bay_info
+        and normalize_for_compare(device_name) in LINE_BAY_SPATIAL_DEVICES
+        and hasattr(gdf_sup_local, "geometry")
+    ):
+        try:
+            spatial_norm_target = build_spatial_match_targets(
+                gdf_sup_local,
+                line_bay_info.get("path"),
+                line_bay_info.get("layer"),
+                line_bay_info.get("field"),
+            )
+        except Exception:
+            spatial_norm_target = None
+
+    def _maybe_fill_match_id(idx_row: int, entry: dict[str, Any]) -> None:
+        if not match_column:
+            return
+        if match_column not in out_cols:
+            return
+        try:
+            current_val = out_cols[match_column].iat[idx_row]
+        except Exception:
+            return
+        if pd.isna(current_val) or (isinstance(current_val, str) and current_val.strip() == ""):
+            new_id = entry.get("id") or entry.get("name")
+            if new_id:
+                out_cols[match_column].iat[idx_row] = new_id
+
+    if instance_map and (match_column or spatial_norm_target is not None or layout_applied):
+        match_norm_target = None
+        if match_column:
+            if match_column in gdf_sup_local.columns:
+                match_norm_target = gdf_sup_local[match_column].map(normalize_value_for_compare)
+            elif spatial_norm_target is None:
+                raise ValueError(f"Match column '{match_column}' not found in layer '{layer}'.")
+        if match_norm_target is not None:
+            match_norm_target = match_norm_target.reindex(gdf_sup_local.index)
+        if spatial_norm_target is not None:
+            spatial_norm_target = spatial_norm_target.reindex(gdf_sup_local.index)
+
+        norm_target = match_norm_target
+        if spatial_norm_target is not None:
+            if norm_target is None:
+                norm_target = spatial_norm_target
+            else:
+                norm_target = spatial_norm_target.copy()
+                missing = norm_target.isna() | (norm_target == "")
+                norm_target.loc[missing] = match_norm_target.loc[missing]
+        if norm_target is None:
+            norm_target = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+
+        # initialize output columns for all fields we might fill
+        all_fields_ordered: list[str] = []
+        all_fields_seen: set[str] = set()
+        # honor order from the first instance if available
+        for _, (fields, order) in instance_map.items():
+            for f in order:
+                if f not in all_fields_seen:
+                    all_fields_seen.add(f)
+                    all_fields_ordered.append(f)
+            for f in fields.keys():
+                if f not in all_fields_seen:
+                    all_fields_seen.add(f)
+                    all_fields_ordered.append(f)
+        if default_fields:
+            for f in default_fields.keys():
+                if f not in all_fields_seen:
+                    all_fields_seen.add(f)
+                    all_fields_ordered.append(f)
+
+        for f in all_fields_ordered:
+            if f == geom_name or _is_preserved_field(f):
+                continue
+            out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+
+        # Preserve selected Substation fields from the uploaded layer.
+        for col in preserve_cols:
+            out_cols[col] = gdf_sup_local[col].copy()
+
+        matched_hits = 0
+        matched_indices: set[int] = set()
+        for idx_val, norm_val in norm_target.items():
+            payload = instance_map.get(norm_val)
+            if payload is None:
+                # If we have multiple instances to distribute, defer filling to the sequential pass.
+                if seq_entries:
+                    payload = (None, [])
+                else:
+                    payload = (default_fields, [])
+            fields, _order = payload
+            if not fields:
+                continue
+            matched_hits += 1
+            matched_indices.add(idx_val)
+            for f, val in fields.items():
+                if f == geom_name or _is_preserved_field(f):
+                    continue
+                if f not in out_cols:
+                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                out_cols[f].iat[idx_val] = fill_val
+
+        # If single feature and nothing matched, fill with default or first instance.
+        if matched_hits == 0 and n == 1 and not strict_line_bay:
+            fallback_fields = default_fields
+            if fallback_fields is None and instance_map:
+                # take first instance_map entry
+                first_payload = next(iter(instance_map.values()), (None, []))
+                fallback_fields = first_payload[0]
+            if fallback_fields:
+                for f, val in fallback_fields.items():
+                    if f == geom_name or _is_preserved_field(f):
+                        continue
+                    if f not in out_cols:
+                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                    fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                    out_cols[f].iat[0] = fill_val
+        # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
+        if matched_hits == 0 and n > 1 and default_fields and not strict_line_bay:
+            for f, val in default_fields.items():
+                if f == geom_name or _is_preserved_field(f):
+                    continue
+                if f not in out_cols:
+                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+        # If still no matches and sequential instances are provided, distribute them across rows.
+        if matched_hits == 0 and seq_entries and not strict_line_bay:
+            for row_rank, idx_row in enumerate(seq_row_indices):
+                entry = _pick_seq_entry_by_feeder(
+                    idx_row,
+                    row_rank,
+                    gdf_sup_local,
+                    seq_entry_order,
+                    seq_group_map,
+                    prefix_assignment_map,
+                )
+                inst_fields = entry.get("fields", {})
+                for f, val in inst_fields.items():
+                    if f == geom_name or _is_preserved_field(f):
+                        continue
+                    if f not in out_cols:
+                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                    fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                    out_cols[f].iat[idx_row] = fill_val
+                _maybe_fill_match_id(idx_row, entry)
+
+        # If some rows remain unmatched, fill those rows using sequential instances (feeder-aware) without overwriting matched rows.
+        if (not strict_line_bay) and (
+            (seq_entries and len(matched_indices) < n) or (
+                not seq_entries
+                and 'parsed_instances' in locals()
+                and len(parsed_instances) > 1
+                and len(matched_indices) < n
+                and seq_assign_fallback
+            )
+        ):
+            # ensure we have seq_entries list to consume
+            if not seq_entries and 'parsed_instances' in locals() and len(parsed_instances) > 1:
+                # build seq_entries from parsed_instances (fields + optional id/name)
+                for inst in parsed_instances:
+                    if isinstance(inst, dict) and "fields" in inst:
+                        seq_entries.append({
+                            "fields": inst.get("fields", {}) or {},
+                            "id": inst.get("id_value"),
+                            "name": inst.get("name_value"),
+                            "type_map": inst.get("type_map"),
+                        })
+                    else:
+                        seq_entries.append(
+                            {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
+                        )
+                if not type_map_local:
+                    type_map_local = _extract_type_map(seq_entries)
+                seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
+                if block_assign and hasattr(gdf_sup_local, "geometry"):
+                    try:
+                        seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
+                    except Exception:
+                        seq_group_map = None
+                if (
+                    seq_entries
+                    and hasattr(gdf_sup_local, "geometry")
+                    and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
+                ):
+                    prefix_groups = {}
+                    prefix_order = []
+                    for inst in seq_entries:
+                        ident = inst.get("id") or inst.get("name")
+                        res = split_instance_prefix_suffix(ident)
+                        if not isinstance(res, tuple) or len(res) != 2:
+                            continue
+                        prefix, suffix = res
+                        if not prefix:
+                            continue
+                        key = normalize_for_compare(prefix)
+                        if key not in prefix_groups:
+                            prefix_groups[key] = []
+                            prefix_order.append(key)
+                        prefix_groups[key].append((suffix, inst))
+                    if prefix_groups:
+                        for key, items in prefix_groups.items():
+                            prefix_groups[key] = sorted(
+                                items,
+                                key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
+                            )
+                        prefix_group_map = group_indices_by_perp_gap(
+                            gdf_sup_local.geometry, len(prefix_groups)
+                        )
+                        group_ids = sorted(set(prefix_group_map.values()))
+                        prefix_by_group = {}
+                        for idx, gid in enumerate(group_ids):
+                            prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
+                        prefix_assignment_map = {}
+                        for gid in group_ids:
+                            pref_key = prefix_by_group.get(gid)
+                            if not pref_key:
+                                continue
+                            entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
+                            if not entries:
+                                continue
+                            row_indices = [
+                                idx
+                                for idx in seq_row_indices
+                                if prefix_group_map.get(idx) == gid
+                            ]
+                            for j, idx_row in enumerate(row_indices):
+                                prefix_assignment_map[idx_row] = entries[j % len(entries)]
+
+            for row_rank, idx_row in enumerate(seq_row_indices):
+                if idx_row in matched_indices:
+                    continue
+                entry = _pick_seq_entry_by_feeder(
+                    idx_row,
+                    row_rank,
+                    gdf_sup_local,
+                    seq_entry_order,
+                    seq_group_map,
+                    prefix_assignment_map,
+                )
+                inst_fields = entry.get("fields", {})
+                for f, val in inst_fields.items():
+                    if f == geom_name or _is_preserved_field(f):
+                        continue
+                    if f not in out_cols:
+                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                    if pd.isna(out_cols[f].iat[idx_row]):
+                        fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                        out_cols[f].iat[idx_row] = fill_val
+                _maybe_fill_match_id(idx_row, entry)
+
+        filled_fields = [f for f in out_cols.keys() if f != geom_name]
+    else:
+        if strict_line_bay:
+            # Preserve existing attributes for Line Bay when no matching is available; avoid auto-fill.
+            for col in gdf_sup_local.columns:
+                if col == geom_name:
+                    continue
+                out_cols[col] = gdf_sup_local[col]
+            filled_fields = [c for c in gdf_sup_local.columns if c != geom_name]
+        elif preserve_cols and not preserve_all_cols:
+            # Preserve selected Substation fields but allow other fields to fill normally.
+            for col in preserve_cols:
+                out_cols[col] = gdf_sup_local[col].copy()
+            filled_fields = [f for f in out_cols.keys() if f != geom_name]
+        elif seq_entries:
+            for row_rank, idx_row in enumerate(seq_row_indices):
+                entry = _pick_seq_entry_by_feeder(
+                    idx_row,
+                    row_rank,
+                    gdf_sup_local,
+                    seq_entry_order,
+                    seq_group_map,
+                    prefix_assignment_map,
+                )
+                inst_fields = entry.get("fields", {})
+                for f, val in inst_fields.items():
+                    if f == geom_name or _is_preserved_field(f):
+                        continue
+                    if f not in out_cols:
+                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
+                    fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+                    out_cols[f].iat[idx_row] = fill_val
+                _maybe_fill_match_id(idx_row, entry)
+            filled_fields = [f for f in out_cols.keys() if f != geom_name]
+        else:
+            ordered_keys = order_local if order_local else list(fm_local.keys())
+            for f in ordered_keys:
+                val = fm_local.get(f)
+                if val is None:
+                    continue
+                if _is_preserved_field(f):
+                    continue
+                target_col = f
+                if target_col not in out_cols:
+                    out_cols[target_col] = pd.NA
+                if isinstance(val, pd.Series):
+                    fill_val = val.iloc[0] if not val.empty else pd.NA
+                else:
+                    fill_val = val
+                out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
+                filled_fields.append(target_col)
+
+    if type_map_local:
+        norm_type_lookup = {
+            normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
+        }
+        for col_name, series in list(out_cols.items()):
+            if col_name == geom_name:
+                continue
+            norm_col = normalize_for_compare(col_name)
+            t_str = preserve_type_map.get(norm_col)
+            if t_str is None:
+                t_str = type_map_local.get(col_name)
+            if t_str is None:
+                t_str = norm_type_lookup.get(norm_col)
+            if t_str:
+                try:
+                    out_cols[col_name] = coerce_series_to_type(series, t_str)
+                except Exception:
+                    pass
+
+    keep_cols = filled_fields.copy()
+    if match_column and match_column in out_cols:
+        norm_keep = {normalize_for_compare(c) for c in keep_cols}
+        if normalize_for_compare(match_column) not in norm_keep:
+            keep_cols.append(match_column)
+    for col in preserve_cols:
+        if col not in keep_cols and col in out_cols:
+            keep_cols.append(col)
+    if geom_name and geom_name not in keep_cols:
+        keep_cols.append(geom_name)
+
+    if preserve_all_cols:
+        for col in gdf_sup_local.columns:
+            if col != geom_name and col in out_cols and col not in keep_cols:
+                keep_cols.append(col)
+    else:
+        # Drop utility columns (e.g., Composite_ID) from the output.
+        keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
+
+    if preserve_all_cols:
+        # Reorder attributes to match supervisor sheet order, then original column order.
+        norm_out_lookup = {normalize_for_compare(c): c for c in out_cols.keys()}
+        if order_local:
+            sheet_order = order_local
+        elif type_map_local:
+            sheet_order = list(type_map_local.keys())
+        else:
+            sheet_order = []
+        ordered_cols: list[str] = []
+        # Ensure preserved Substation fields keep their preferred ordering.
+        for pref in SUBSTATION_PRESERVE_ORDER:
+            col = norm_out_lookup.get(normalize_for_compare(pref))
+            if col and col not in ordered_cols:
+                ordered_cols.append(col)
+        for f in sheet_order:
+            col = norm_out_lookup.get(normalize_for_compare(f))
+            if col and col not in ordered_cols:
+                ordered_cols.append(col)
+        for col in gdf_sup_local.columns:
+            if col == geom_name:
+                continue
+            if col in out_cols and col not in ordered_cols:
+                ordered_cols.append(col)
+        for col in out_cols.keys():
+            if col == geom_name:
+                continue
+            if col not in ordered_cols:
+                ordered_cols.append(col)
+        if match_column and match_column in out_cols and match_column not in ordered_cols:
+            ordered_cols.append(match_column)
+        if geom_name and geom_name in out_cols:
+            ordered_cols.append(geom_name)
+        keep_cols = ordered_cols
+
+    # preserve column order where possible
+    out_gdf = gpd.GeoDataFrame(
+        {c: out_cols[c] for c in keep_cols if c in out_cols},
+        geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None,
+        crs=gdf_sup_local.crs,
+    )
+
+    # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
+    hv_name_norm = normalize_for_compare("High Voltage Line")
+    hv_match = normalize_for_compare(device_name) == hv_name_norm
+    if not hv_match:
+        try:
+            layer_norm = normalize_for_compare(layer or "")
+            hv_match = hv_name_norm in layer_norm or layer_norm == hv_name_norm
+        except Exception:
+            hv_match = False
+    if not hv_match:
+        try:
+            file_norm = normalize_for_compare(Path(file_name).stem)
+            hv_match = hv_name_norm in file_norm or file_norm == hv_name_norm
+        except Exception:
+            hv_match = False
+    if hv_match and geom_name and hasattr(out_gdf, "geometry"):
+        # Fall back to the Line Bay library folder if no Line Bay info was provided.
+        lb_info = line_bay_info
+        if lb_info is None and LINE_BAY_LIBRARY_PATH.exists():
+            lb_info = {
+                "path": LINE_BAY_LIBRARY_PATH,
+                "layer": None,
+                "field": None,
+                "id_name_map": {},
+            }
+        if lb_info:
+            out_gdf = apply_line_bay_names(out_gdf, lb_info, geom_name)
+            id_name_map = lb_info.get("id_name_map") if isinstance(lb_info, dict) else {}
+        else:
+            id_name_map = {}
+        if isinstance(id_name_map, dict) and id_name_map:
+            out_gdf = replace_line_name_ids(out_gdf, id_name_map)
+
+    out_gdf = sanitize_gdf_for_gpkg(out_gdf)
+    # Re-apply declared types after sanitization to preserve int widths (e.g., Short Integer).
+    if type_map_local:
+        norm_type_lookup = {
+            normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
+        }
+        geom_name_out = out_gdf.geometry.name if hasattr(out_gdf, "geometry") else None
+        for col_name in out_gdf.columns:
+            if col_name == geom_name_out:
+                continue
+            norm_col = normalize_for_compare(col_name)
+            t_str = preserve_type_map.get(norm_col)
+            if t_str is None:
+                t_str = type_map_local.get(col_name)
+            if t_str is None:
+                t_str = norm_type_lookup.get(norm_col)
+            if t_str:
+                try:
+                    out_gdf[col_name] = coerce_series_to_type(out_gdf[col_name], t_str)
+                except Exception:
+                    pass
+    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+        out_path = Path(tmpout.name)
+    out_gdf.to_file(out_path, driver="GPKG", layer=layer)
+    return out_path, layer
+
 def run_app() -> None:
     """Streamlit entrypoint."""
     st.set_page_config(page_title="Internal Substation Attribute Loader", layout="wide")
@@ -4346,6 +5061,7 @@ def run_app() -> None:
     st.caption(
         "Upload a device GeoPackage and a supervisor Electric-device workbook; choose a device entry and fill its attributes into the GPKG with proper data types."
     )
+    seq_assign_fallback = True
     sup_gpkg_zip = st.file_uploader(
         "Upload ZIP(s) of substation folders (each folder name = substation)",
         type=["zip"],
@@ -4536,6 +5252,7 @@ def run_app() -> None:
                                     line_bay_info,
                                     ups_anchor_info,
                                     fill_one_gpkg,
+                                    seq_assign_fallback=seq_assign_fallback,
                                     output_prefix=substation_name,
                                 )
                                 outputs.extend(batch_outputs)
@@ -4804,711 +5521,6 @@ def run_app() -> None:
                     return best_col
                 return field_name
 
-            def fill_one_gpkg(
-                file_obj,
-                device_name: str,
-                layer_override: str | None = None,
-                field_map: dict[str, Any] | None = None,
-                match_column: str | None = None,
-                instance_map: dict[str, tuple[dict[str, Any], list[str]]] | None = None,
-                default_fields: dict[str, Any] | None = None,
-                field_order: list[str] | None = None,
-                sequential_instances: list[dict[str, Any]] | None = None,
-                line_bay_info: dict[str, Any] | None = None,
-                ups_anchor_info: dict[str, Any] | None = None,
-                type_map: dict[str, str] | None = None,
-            ) -> tuple[Path, str]:
-                # normalize sequential_instances to a list of entries with fields + optional ids
-                seq_entries: list[dict[str, Any]] = []
-                if sequential_instances:
-                    for inst in sequential_instances:
-                        if isinstance(inst, dict) and "fields" in inst:
-                            seq_entries.append(
-                                {
-                                    "fields": inst.get("fields", {}) or {},
-                                    "id": inst.get("id_value"),
-                                    "name": inst.get("name_value"),
-                                    "type_map": inst.get("type_map"),
-                                }
-                            )
-                        else:
-                            seq_entries.append(
-                                {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
-                            )
-
-                type_map_local = dict(type_map) if isinstance(type_map, dict) else {}
-
-                def _extract_type_map(instances: list[dict[str, Any]] | None) -> dict[str, str]:
-                    if not instances:
-                        return {}
-                    for inst in instances:
-                        tm = inst.get("type_map") if isinstance(inst, dict) else None
-                        if isinstance(tm, dict) and tm:
-                            return dict(tm)
-                    return {}
-
-                if not type_map_local:
-                    type_map_local = _extract_type_map(seq_entries)
-
-                block_assign = normalize_for_compare(device_name) in BLOCK_ASSIGN_DEVICES
-                strict_line_bay = normalize_for_compare(device_name) == normalize_for_compare("Line Bay")
-
-                def _build_seq_entry_order(total_rows: int, total_entries: int) -> list[int]:
-                    if total_rows <= 0 or total_entries <= 0:
-                        return []
-                    if not block_assign or total_entries == 1:
-                        return [i % total_entries for i in range(total_rows)]
-                    base = total_rows // total_entries
-                    remainder = total_rows % total_entries
-                    order: list[int] = []
-                    for entry_idx in range(total_entries):
-                        size = base + (1 if entry_idx < remainder else 0)
-                        if size <= 0:
-                            continue
-                        order.extend([entry_idx] * size)
-                    if len(order) < total_rows:
-                        order.extend([total_entries - 1] * (total_rows - len(order)))
-                    return order[:total_rows]
-
-                def _pick_seq_entry_by_feeder(
-                    row_idx: int,
-                    row_rank: int,
-                    gdf_local: gpd.GeoDataFrame,
-                    seq_order: list[int],
-                    group_map: dict[int, int] | None,
-                    prefix_map: dict[int, dict[str, Any]] | None,
-                ) -> dict[str, Any]:
-                    """Choose sequential instance based on feeder type if available, else follow ordered groups."""
-                    if not seq_entries:
-                        return {}
-                    feeder_col = None
-                    norm_lookup = {normalize_for_compare(c): c for c in gdf_local.columns}
-                    for cand in ["feeder type", "feeder_type", "feeder category"]:
-                        if normalize_for_compare(cand) in norm_lookup:
-                            feeder_col = norm_lookup[normalize_for_compare(cand)]
-                            break
-                    if feeder_col:
-                        try:
-                            val = gdf_local.loc[row_idx, feeder_col]
-                        except Exception:
-                            val = gdf_local.iloc[row_rank][feeder_col] if row_rank < len(gdf_local) else None
-                        norm_val = normalize_value_for_compare(val)
-                        def _match_entry(target: str) -> dict[str, Any] | None:
-                            for ent in seq_entries:
-                                ident = ent.get("id") or ent.get("name")
-                                ident_norm = normalize_for_compare(ident)
-                                if target in ident_norm:
-                                    return ent
-                            return None
-                        if "line" in norm_val:
-                            chosen = _match_entry("mv3") or _match_entry("3")
-                            if chosen:
-                                return chosen
-                        if "transformer" in norm_val:
-                            chosen = _match_entry("mv1") or _match_entry("1")
-                            if chosen:
-                                return chosen
-                    if prefix_map and row_idx in prefix_map:
-                        return prefix_map[row_idx]
-                    if group_map and row_idx in group_map:
-                        group_idx = group_map[row_idx]
-                        if 0 <= group_idx < len(seq_entries):
-                            return seq_entries[group_idx]
-                    if seq_order and row_rank < len(seq_order):
-                        return seq_entries[seq_order[row_rank]]
-                    return seq_entries[row_rank % len(seq_entries)]
-                file_name = _get_file_name(file_obj)
-                gpkg_path = _coerce_gpkg_path(file_obj)
-                if gpkg_path is None:
-                    raise ValueError("Could not read the GeoPackage.")
-                layers = list_gpkg_layers(gpkg_path)
-                layer = layer_override or (layers[0] if layers else None)
-                if not layer:
-                    raise ValueError("No layers found in the uploaded GeoPackage.")
-                gdf_sup_local = gpd.read_file(gpkg_path, layer=layer)
-                geom_name = gdf_sup_local.geometry.name if hasattr(gdf_sup_local, "geometry") else None
-                geom_crs = gdf_sup_local.crs if hasattr(gdf_sup_local, "crs") else None
-                preserve_cols: set[str] = set()
-                preserve_type_map: dict[str, str] = {}
-                preserve_all_cols = normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin")
-                if normalize_for_compare(device_name) == normalize_for_compare("Substation/Cabin"):
-                    for col in gdf_sup_local.columns:
-                        norm_col = normalize_for_compare(col)
-                        if norm_col in SUBSTATION_PRESERVE_FIELDS:
-                            preserve_cols.add(col)
-                        if norm_col in SUBSTATION_FORCE_TYPES:
-                            preserve_type_map[norm_col] = SUBSTATION_FORCE_TYPES[norm_col]
-                preserve_norms = {normalize_for_compare(c) for c in preserve_cols}
-
-                def _is_preserved_field(field_name: Any) -> bool:
-                    return normalize_for_compare(field_name) in preserve_norms
-                layout_applied = False
-                if (
-                    ups_anchor_info
-                    and normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES
-                    and hasattr(gdf_sup_local, "geometry")
-                ):
-                    desired_count = len(gdf_sup_local)
-                    if seq_entries and len(seq_entries) > desired_count:
-                        desired_count = len(seq_entries)
-                    anchor = resolve_ups_anchor_point(
-                        ups_anchor_info.get("path"),
-                        ups_anchor_info.get("layer"),
-                        gdf_sup_local.crs,
-                    )
-                    try:
-                        spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
-                    except Exception:
-                        spacing_val = PROTECTION_LAYOUT_SPACING
-                    if anchor is not None:
-                        layout_applied = True
-                        if desired_count > len(gdf_sup_local):
-                            extra = desired_count - len(gdf_sup_local)
-                            extra_points = build_protection_layout_points(anchor, extra, spacing_val)
-                            if extra_points and len(extra_points) == extra:
-                                extra_rows = pd.DataFrame(
-                                    {col: [pd.NA] * extra for col in gdf_sup_local.columns}
-                                )
-                                gdf_sup_local = pd.concat(
-                                    [gdf_sup_local, extra_rows],
-                                    ignore_index=True,
-                                )
-                                if geom_name:
-                                    gdf_sup_local = gpd.GeoDataFrame(
-                                        gdf_sup_local,
-                                        geometry=geom_name,
-                                        crs=geom_crs,
-                                    )
-                                gdf_sup_local = gdf_sup_local.copy()
-                                gdf_sup_local.geometry.iloc[-extra:] = extra_points
-                fm_local = field_map
-                order_local = field_order or []
-                if fm_local is None and match_column is None:
-                    parsed = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
-                    if not parsed:
-                        raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
-                    # keep parsed instances available for fallback sequential assignment
-                    parsed_instances = parsed
-                    fm_local = parsed[0].get("fields", {})
-                    order_local = parsed[0].get("order", [])
-                    if not type_map_local:
-                        type_map_local = _extract_type_map(parsed)
-                if fm_local is None and match_column is None:
-                    raise ValueError(f"No field values available for device '{device_name}'.")
-                out_cols: dict[str, Any] = {}
-                if geom_name:
-                    out_cols[geom_name] = gdf_sup_local.geometry
-                n = len(gdf_sup_local)
-                filled_fields: list[str] = []
-                if match_column and match_column in gdf_sup_local.columns:
-                    out_cols[match_column] = gdf_sup_local[match_column].copy()
-                if preserve_all_cols:
-                    for col in gdf_sup_local.columns:
-                        if col == geom_name:
-                            continue
-                        if col not in out_cols:
-                            out_cols[col] = gdf_sup_local[col].copy()
-
-                seq_row_indices = list(range(n))
-                if hasattr(gdf_sup_local, "geometry"):
-                    try:
-                        seq_row_indices = order_indices_by_location(gdf_sup_local.geometry)
-                    except Exception:
-                        seq_row_indices = list(range(n))
-                seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
-                seq_group_map = None
-                if block_assign and seq_entries and hasattr(gdf_sup_local, "geometry"):
-                    try:
-                        seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
-                    except Exception:
-                        seq_group_map = None
-                prefix_assignment_map: dict[int, dict[str, Any]] | None = None
-                if (
-                    seq_entries
-                    and hasattr(gdf_sup_local, "geometry")
-                    and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
-                ):
-                    prefix_groups: dict[str, list[tuple[int | None, dict[str, Any]]]] = {}
-                    prefix_order: list[str] = []
-                    for inst in seq_entries:
-                        ident = inst.get("id") or inst.get("name")
-                        res = split_instance_prefix_suffix(ident)
-                        if not isinstance(res, tuple) or len(res) != 2:
-                            continue
-                        prefix, suffix = res
-                        if not prefix:
-                            continue
-                        key = normalize_for_compare(prefix)
-                        if key not in prefix_groups:
-                            prefix_groups[key] = []
-                            prefix_order.append(key)
-                        prefix_groups[key].append((suffix, inst))
-                    if prefix_groups:
-                        for key, items in prefix_groups.items():
-                            prefix_groups[key] = sorted(
-                                items,
-                                key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
-                            )
-                        prefix_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(prefix_groups))
-                        group_ids = sorted(set(prefix_group_map.values()))
-                        prefix_by_group: dict[int, str] = {}
-                        for idx, gid in enumerate(group_ids):
-                            prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
-                        prefix_assignment_map = {}
-                        for gid in group_ids:
-                            pref_key = prefix_by_group.get(gid)
-                            if not pref_key:
-                                continue
-                            entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
-                            if not entries:
-                                continue
-                            row_indices = [idx for idx in seq_row_indices if prefix_group_map.get(idx) == gid]
-                            for j, idx_row in enumerate(row_indices):
-                                prefix_assignment_map[idx_row] = entries[j % len(entries)]
-                spatial_norm_target = None
-                if (
-                    instance_map
-                    and line_bay_info
-                    and normalize_for_compare(device_name) in LINE_BAY_SPATIAL_DEVICES
-                    and hasattr(gdf_sup_local, "geometry")
-                ):
-                    try:
-                        spatial_norm_target = build_spatial_match_targets(
-                            gdf_sup_local,
-                            line_bay_info.get("path"),
-                            line_bay_info.get("layer"),
-                            line_bay_info.get("field"),
-                        )
-                    except Exception:
-                        spatial_norm_target = None
-
-                def _maybe_fill_match_id(idx_row: int, entry: dict[str, Any]) -> None:
-                    if not match_column:
-                        return
-                    if match_column not in out_cols:
-                        return
-                    try:
-                        current_val = out_cols[match_column].iat[idx_row]
-                    except Exception:
-                        return
-                    if pd.isna(current_val) or (isinstance(current_val, str) and current_val.strip() == ""):
-                        new_id = entry.get("id") or entry.get("name")
-                        if new_id:
-                            out_cols[match_column].iat[idx_row] = new_id
-
-                if instance_map and (match_column or spatial_norm_target is not None or layout_applied):
-                    match_norm_target = None
-                    if match_column:
-                        if match_column in gdf_sup_local.columns:
-                            match_norm_target = gdf_sup_local[match_column].map(normalize_value_for_compare)
-                        elif spatial_norm_target is None:
-                            raise ValueError(f"Match column '{match_column}' not found in layer '{layer}'.")
-                    if match_norm_target is not None:
-                        match_norm_target = match_norm_target.reindex(gdf_sup_local.index)
-                    if spatial_norm_target is not None:
-                        spatial_norm_target = spatial_norm_target.reindex(gdf_sup_local.index)
-
-                    norm_target = match_norm_target
-                    if spatial_norm_target is not None:
-                        if norm_target is None:
-                            norm_target = spatial_norm_target
-                        else:
-                            norm_target = spatial_norm_target.copy()
-                            missing = norm_target.isna() | (norm_target == "")
-                            norm_target.loc[missing] = match_norm_target.loc[missing]
-                    if norm_target is None:
-                        norm_target = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-
-                    # initialize output columns for all fields we might fill
-                    all_fields_ordered: list[str] = []
-                    all_fields_seen: set[str] = set()
-                    # honor order from the first instance if available
-                    for _, (fields, order) in instance_map.items():
-                        for f in order:
-                            if f not in all_fields_seen:
-                                all_fields_seen.add(f)
-                                all_fields_ordered.append(f)
-                        for f in fields.keys():
-                            if f not in all_fields_seen:
-                                all_fields_seen.add(f)
-                                all_fields_ordered.append(f)
-                    if default_fields:
-                        for f in default_fields.keys():
-                            if f not in all_fields_seen:
-                                all_fields_seen.add(f)
-                                all_fields_ordered.append(f)
-
-                    for f in all_fields_ordered:
-                        if f == geom_name or _is_preserved_field(f):
-                            continue
-                        out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-
-                    # Preserve selected Substation fields from the uploaded layer.
-                    for col in preserve_cols:
-                        out_cols[col] = gdf_sup_local[col].copy()
-
-                    matched_hits = 0
-                    matched_indices: set[int] = set()
-                    for idx_val, norm_val in norm_target.items():
-                        payload = instance_map.get(norm_val)
-                        if payload is None:
-                            # If we have multiple instances to distribute, defer filling to the sequential pass.
-                            if seq_entries:
-                                payload = (None, [])
-                            else:
-                                payload = (default_fields, [])
-                        fields, _order = payload
-                        if not fields:
-                            continue
-                        matched_hits += 1
-                        matched_indices.add(idx_val)
-                        for f, val in fields.items():
-                            if f == geom_name or _is_preserved_field(f):
-                                continue
-                            if f not in out_cols:
-                                out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                            out_cols[f].iat[idx_val] = fill_val
-
-                    # If single feature and nothing matched, fill with default or first instance.
-                    if matched_hits == 0 and n == 1 and not strict_line_bay:
-                        fallback_fields = default_fields
-                        if fallback_fields is None and instance_map:
-                            # take first instance_map entry
-                            first_payload = next(iter(instance_map.values()), (None, []))
-                            fallback_fields = first_payload[0]
-                        if fallback_fields:
-                            for f, val in fallback_fields.items():
-                                if f == geom_name or _is_preserved_field(f):
-                                    continue
-                                if f not in out_cols:
-                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                                out_cols[f].iat[0] = fill_val
-                    # If multi-feature and no matches at all but we have defaults, fill all rows with defaults.
-                    if matched_hits == 0 and n > 1 and default_fields and not strict_line_bay:
-                        for f, val in default_fields.items():
-                            if f == geom_name or _is_preserved_field(f):
-                                continue
-                            if f not in out_cols:
-                                out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                            out_cols[f] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
-                    # If still no matches and sequential instances are provided, distribute them across rows.
-                    if matched_hits == 0 and seq_entries and not strict_line_bay:
-                        for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(
-                                idx_row,
-                                row_rank,
-                                gdf_sup_local,
-                                seq_entry_order,
-                                seq_group_map,
-                                prefix_assignment_map,
-                            )
-                            inst_fields = entry.get("fields", {})
-                            for f, val in inst_fields.items():
-                                if f == geom_name or _is_preserved_field(f):
-                                    continue
-                                if f not in out_cols:
-                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                                out_cols[f].iat[idx_row] = fill_val
-                            _maybe_fill_match_id(idx_row, entry)
-
-                    # If some rows remain unmatched, fill those rows using sequential instances (feeder-aware) without overwriting matched rows.
-                    if (not strict_line_bay) and (
-                        (seq_entries and len(matched_indices) < n) or (
-                            not seq_entries
-                            and 'parsed_instances' in locals()
-                            and len(parsed_instances) > 1
-                            and len(matched_indices) < n
-                            and seq_assign_fallback
-                        )
-                    ):
-                        # ensure we have seq_entries list to consume
-                        if not seq_entries and 'parsed_instances' in locals() and len(parsed_instances) > 1:
-                            # build seq_entries from parsed_instances (fields + optional id/name)
-                            for inst in parsed_instances:
-                                if isinstance(inst, dict) and "fields" in inst:
-                                    seq_entries.append({
-                                        "fields": inst.get("fields", {}) or {},
-                                        "id": inst.get("id_value"),
-                                        "name": inst.get("name_value"),
-                                        "type_map": inst.get("type_map"),
-                                    })
-                                else:
-                                    seq_entries.append(
-                                        {"fields": inst if isinstance(inst, dict) else {}, "id": None, "name": None, "type_map": None}
-                                    )
-                            if not type_map_local:
-                                type_map_local = _extract_type_map(seq_entries)
-                            seq_entry_order = _build_seq_entry_order(n, len(seq_entries))
-                            if block_assign and hasattr(gdf_sup_local, "geometry"):
-                                try:
-                                    seq_group_map = group_indices_by_perp_gap(gdf_sup_local.geometry, len(seq_entries))
-                                except Exception:
-                                    seq_group_map = None
-                            if (
-                                seq_entries
-                                and hasattr(gdf_sup_local, "geometry")
-                                and normalize_for_compare(device_name) in PREFIX_GROUP_DEVICES
-                            ):
-                                prefix_groups = {}
-                                prefix_order = []
-                                for inst in seq_entries:
-                                    ident = inst.get("id") or inst.get("name")
-                                    res = split_instance_prefix_suffix(ident)
-                                    if not isinstance(res, tuple) or len(res) != 2:
-                                        continue
-                                    prefix, suffix = res
-                                    if not prefix:
-                                        continue
-                                    key = normalize_for_compare(prefix)
-                                    if key not in prefix_groups:
-                                        prefix_groups[key] = []
-                                        prefix_order.append(key)
-                                    prefix_groups[key].append((suffix, inst))
-                                if prefix_groups:
-                                    for key, items in prefix_groups.items():
-                                        prefix_groups[key] = sorted(
-                                            items,
-                                            key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0),
-                                        )
-                                    prefix_group_map = group_indices_by_perp_gap(
-                                        gdf_sup_local.geometry, len(prefix_groups)
-                                    )
-                                    group_ids = sorted(set(prefix_group_map.values()))
-                                    prefix_by_group = {}
-                                    for idx, gid in enumerate(group_ids):
-                                        prefix_by_group[gid] = prefix_order[idx % len(prefix_order)]
-                                    prefix_assignment_map = {}
-                                    for gid in group_ids:
-                                        pref_key = prefix_by_group.get(gid)
-                                        if not pref_key:
-                                            continue
-                                        entries = [inst for _, inst in prefix_groups.get(pref_key, [])]
-                                        if not entries:
-                                            continue
-                                        row_indices = [
-                                            idx
-                                            for idx in seq_row_indices
-                                            if prefix_group_map.get(idx) == gid
-                                        ]
-                                        for j, idx_row in enumerate(row_indices):
-                                            prefix_assignment_map[idx_row] = entries[j % len(entries)]
-
-                        for row_rank, idx_row in enumerate(seq_row_indices):
-                            if idx_row in matched_indices:
-                                continue
-                            entry = _pick_seq_entry_by_feeder(
-                                idx_row,
-                                row_rank,
-                                gdf_sup_local,
-                                seq_entry_order,
-                                seq_group_map,
-                                prefix_assignment_map,
-                            )
-                            inst_fields = entry.get("fields", {})
-                            for f, val in inst_fields.items():
-                                if f == geom_name or _is_preserved_field(f):
-                                    continue
-                                if f not in out_cols:
-                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                                if pd.isna(out_cols[f].iat[idx_row]):
-                                    fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                                    out_cols[f].iat[idx_row] = fill_val
-                            _maybe_fill_match_id(idx_row, entry)
-
-                    filled_fields = [f for f in out_cols.keys() if f != geom_name]
-                else:
-                    if strict_line_bay:
-                        # Preserve existing attributes for Line Bay when no matching is available; avoid auto-fill.
-                        for col in gdf_sup_local.columns:
-                            if col == geom_name:
-                                continue
-                            out_cols[col] = gdf_sup_local[col]
-                        filled_fields = [c for c in gdf_sup_local.columns if c != geom_name]
-                    elif preserve_cols and not preserve_all_cols:
-                        # Preserve selected Substation fields but allow other fields to fill normally.
-                        for col in preserve_cols:
-                            out_cols[col] = gdf_sup_local[col].copy()
-                        filled_fields = [f for f in out_cols.keys() if f != geom_name]
-                    elif seq_entries:
-                        for row_rank, idx_row in enumerate(seq_row_indices):
-                            entry = _pick_seq_entry_by_feeder(
-                                idx_row,
-                                row_rank,
-                                gdf_sup_local,
-                                seq_entry_order,
-                                seq_group_map,
-                                prefix_assignment_map,
-                            )
-                            inst_fields = entry.get("fields", {})
-                            for f, val in inst_fields.items():
-                                if f == geom_name or _is_preserved_field(f):
-                                    continue
-                                if f not in out_cols:
-                                    out_cols[f] = pd.Series([pd.NA] * n, index=gdf_sup_local.index)
-                                fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
-                                out_cols[f].iat[idx_row] = fill_val
-                            _maybe_fill_match_id(idx_row, entry)
-                        filled_fields = [f for f in out_cols.keys() if f != geom_name]
-                    else:
-                        ordered_keys = order_local if order_local else list(fm_local.keys())
-                        for f in ordered_keys:
-                            val = fm_local.get(f)
-                            if val is None:
-                                continue
-                            if _is_preserved_field(f):
-                                continue
-                            target_col = f
-                            if target_col not in out_cols:
-                                out_cols[target_col] = pd.NA
-                            if isinstance(val, pd.Series):
-                                fill_val = val.iloc[0] if not val.empty else pd.NA
-                            else:
-                                fill_val = val
-                            out_cols[target_col] = pd.Series([fill_val] * n, index=gdf_sup_local.index)
-                            filled_fields.append(target_col)
-
-                if type_map_local:
-                    norm_type_lookup = {
-                        normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
-                    }
-                    for col_name, series in list(out_cols.items()):
-                        if col_name == geom_name:
-                            continue
-                        norm_col = normalize_for_compare(col_name)
-                        t_str = preserve_type_map.get(norm_col)
-                        if t_str is None:
-                            t_str = type_map_local.get(col_name)
-                        if t_str is None:
-                            t_str = norm_type_lookup.get(norm_col)
-                        if t_str:
-                            try:
-                                out_cols[col_name] = coerce_series_to_type(series, t_str)
-                            except Exception:
-                                pass
-
-                keep_cols = filled_fields.copy()
-                if match_column and match_column in out_cols:
-                    norm_keep = {normalize_for_compare(c) for c in keep_cols}
-                    if normalize_for_compare(match_column) not in norm_keep:
-                        keep_cols.append(match_column)
-                for col in preserve_cols:
-                    if col not in keep_cols and col in out_cols:
-                        keep_cols.append(col)
-                if geom_name and geom_name not in keep_cols:
-                    keep_cols.append(geom_name)
-
-                if preserve_all_cols:
-                    for col in gdf_sup_local.columns:
-                        if col != geom_name and col in out_cols and col not in keep_cols:
-                            keep_cols.append(col)
-                else:
-                    # Drop utility columns (e.g., Composite_ID) from the output.
-                    keep_cols = [c for c in keep_cols if normalize_for_compare(c) not in DROP_OUTPUT_COLUMNS]
-
-                if preserve_all_cols:
-                    # Reorder attributes to match supervisor sheet order, then original column order.
-                    norm_out_lookup = {normalize_for_compare(c): c for c in out_cols.keys()}
-                    if order_local:
-                        sheet_order = order_local
-                    elif type_map_local:
-                        sheet_order = list(type_map_local.keys())
-                    else:
-                        sheet_order = []
-                    ordered_cols: list[str] = []
-                    # Ensure preserved Substation fields keep their preferred ordering.
-                    for pref in SUBSTATION_PRESERVE_ORDER:
-                        col = norm_out_lookup.get(normalize_for_compare(pref))
-                        if col and col not in ordered_cols:
-                            ordered_cols.append(col)
-                    for f in sheet_order:
-                        col = norm_out_lookup.get(normalize_for_compare(f))
-                        if col and col not in ordered_cols:
-                            ordered_cols.append(col)
-                    for col in gdf_sup_local.columns:
-                        if col == geom_name:
-                            continue
-                        if col in out_cols and col not in ordered_cols:
-                            ordered_cols.append(col)
-                    for col in out_cols.keys():
-                        if col == geom_name:
-                            continue
-                        if col not in ordered_cols:
-                            ordered_cols.append(col)
-                    if match_column and match_column in out_cols and match_column not in ordered_cols:
-                        ordered_cols.append(match_column)
-                    if geom_name and geom_name in out_cols:
-                        ordered_cols.append(geom_name)
-                    keep_cols = ordered_cols
-
-                # preserve column order where possible
-                out_gdf = gpd.GeoDataFrame(
-                    {c: out_cols[c] for c in keep_cols if c in out_cols},
-                    geometry=gdf_sup_local.geometry if hasattr(gdf_sup_local, "geometry") else None,
-                    crs=gdf_sup_local.crs,
-                )
-
-                # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
-                hv_name_norm = normalize_for_compare("High Voltage Line")
-                hv_match = normalize_for_compare(device_name) == hv_name_norm
-                if not hv_match:
-                    try:
-                        layer_norm = normalize_for_compare(layer or "")
-                        hv_match = hv_name_norm in layer_norm or layer_norm == hv_name_norm
-                    except Exception:
-                        hv_match = False
-                if not hv_match:
-                    try:
-                        file_norm = normalize_for_compare(Path(file_name).stem)
-                        hv_match = hv_name_norm in file_norm or file_norm == hv_name_norm
-                    except Exception:
-                        hv_match = False
-                if hv_match and geom_name and hasattr(out_gdf, "geometry"):
-                    # Fall back to the Line Bay library folder if no Line Bay info was provided.
-                    lb_info = line_bay_info
-                    if lb_info is None and LINE_BAY_LIBRARY_PATH.exists():
-                        lb_info = {
-                            "path": LINE_BAY_LIBRARY_PATH,
-                            "layer": None,
-                            "field": None,
-                            "id_name_map": {},
-                        }
-                    if lb_info:
-                        out_gdf = apply_line_bay_names(out_gdf, lb_info, geom_name)
-                        id_name_map = lb_info.get("id_name_map") if isinstance(lb_info, dict) else {}
-                    else:
-                        id_name_map = {}
-                    if isinstance(id_name_map, dict) and id_name_map:
-                        out_gdf = replace_line_name_ids(out_gdf, id_name_map)
-
-                out_gdf = sanitize_gdf_for_gpkg(out_gdf)
-                # Re-apply declared types after sanitization to preserve int widths (e.g., Short Integer).
-                if type_map_local:
-                    norm_type_lookup = {
-                        normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None
-                    }
-                    geom_name_out = out_gdf.geometry.name if hasattr(out_gdf, "geometry") else None
-                    for col_name in out_gdf.columns:
-                        if col_name == geom_name_out:
-                            continue
-                        norm_col = normalize_for_compare(col_name)
-                        t_str = preserve_type_map.get(norm_col)
-                        if t_str is None:
-                            t_str = type_map_local.get(col_name)
-                        if t_str is None:
-                            t_str = norm_type_lookup.get(norm_col)
-                        if t_str:
-                            try:
-                                out_gdf[col_name] = coerce_series_to_type(out_gdf[col_name], t_str)
-                            except Exception:
-                                pass
-                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                    out_path = Path(tmpout.name)
-                out_gdf.to_file(out_path, driver="GPKG", layer=layer)
-                return out_path, layer
 
             def _fill_supervisor_batch_local(
                 files: list[Any],
@@ -5615,6 +5627,9 @@ def run_app() -> None:
                             line_bay_info=line_bay_info,
                             ups_anchor_info=ups_anchor_info,
                             type_map=type_map_device,
+                            sup_wb_path=sup_wb_path,
+                            sup_sheet=sup_sheet,
+                            seq_assign_fallback=seq_assign_fallback,
                         )
                         _record_output(file_name, out_path)
                         log_instances = [inst] if inst else cached_instances
@@ -6067,6 +6082,9 @@ def run_app() -> None:
                                     line_bay_info=line_bay_info,
                                     ups_anchor_info=ups_anchor_info,
                                     type_map=inst.get("type_map") or device_type_map,
+                                    sup_wb_path=sup_wb_path,
+                                    sup_sheet=sup_sheet,
+                                    seq_assign_fallback=seq_assign_fallback,
                                 )
                                 # create a friendly name per instance
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
@@ -6153,6 +6171,9 @@ def run_app() -> None:
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
                                 type_map=device_type_map,
+                                sup_wb_path=sup_wb_path,
+                                sup_sheet=sup_sheet,
+                                seq_assign_fallback=seq_assign_fallback,
                             )
                             run_domain_rows = append_domain_code_log(
                                 _collect_domain_log_entries(device_instances),
@@ -6194,6 +6215,9 @@ def run_app() -> None:
                                 line_bay_info=line_bay_info,
                                 ups_anchor_info=ups_anchor_info,
                                 type_map=device_type_map,
+                                sup_wb_path=sup_wb_path,
+                                sup_sheet=sup_sheet,
+                                seq_assign_fallback=seq_assign_fallback,
                             )
                             log_instances = [selected_instance] if selected_instance else device_instances
                             run_domain_rows = append_domain_code_log(
@@ -6240,6 +6264,7 @@ def run_app() -> None:
                         line_bay_info,
                         ups_anchor_info,
                         fill_one_gpkg,
+                        seq_assign_fallback=seq_assign_fallback,
                     )
 
                     if outputs:
