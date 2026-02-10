@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).parent
 REFERENCE_DATA_DIR = BASE_DIR / "reference_data"
 SUPERVISOR_WORKBOOK_DIR = BASE_DIR / "supervisor_workbooks"
 NEW_DATA_DIR = BASE_DIR / "New Data"
+SUPERVISOR_WORKBOOK_DIRS = [NEW_DATA_DIR, SUPERVISOR_WORKBOOK_DIR]
 # Preferred workbook order: newest first; falls back to any available in reference_data.
 WORKBOOK_PRIORITY = [
     "SUBSTATION 1-25102025.xlsx",
@@ -148,12 +149,13 @@ def list_reference_workbooks() -> dict[str, Path]:
 def list_supervisor_workbooks() -> dict[str, Path]:
     """Return mapping of display label -> supervisor workbook path."""
     workbooks = {}
-    search_dirs = [NEW_DATA_DIR, SUPERVISOR_WORKBOOK_DIR]
-    for base_dir in search_dirs:
+    for base_dir in SUPERVISOR_WORKBOOK_DIRS:
         if not base_dir.exists():
             continue
         for p in sorted(base_dir.glob("**/*")):
             if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS:
+                if p.name.startswith("~$"):
+                    continue
                 rel = p.relative_to(base_dir).as_posix()
                 label = f"{base_dir.name}/{rel}" if rel != "." else base_dir.name
                 workbooks[label] = p
@@ -267,6 +269,23 @@ def pick_supervisor_sheet(excel_file: pd.ExcelFile) -> str | None:
         return None
     for sheet in excel_file.sheet_names:
         if normalize_for_compare(sheet) == normalize_for_compare("Electric device"):
+            return sheet
+    def _looks_like_device_sheet(sheet_name: str) -> bool:
+        try:
+            preview = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, dtype=str, nrows=8)
+        except Exception:
+            return False
+        if preview.empty or preview.shape[1] < 2:
+            return False
+        for _, row in preview.iterrows():
+            v0 = row.iloc[0]
+            v1 = row.iloc[1]
+            if normalize_for_compare(v0) == "device" and normalize_for_compare(v1) == "field":
+                return True
+        return False
+
+    for sheet in excel_file.sheet_names:
+        if _looks_like_device_sheet(sheet):
             return sheet
     return excel_file.sheet_names[0]
 
@@ -3474,15 +3493,31 @@ def load_domain_code_lookup() -> dict[str, Any]:
                 lookup.update(data)
         except Exception:
             pass
-    if not SUPERVISOR_WORKBOOK_DIR.exists():
+    def _is_new_data_path(path: Path) -> bool:
+        try:
+            return NEW_DATA_DIR in path.parents
+        except Exception:
+            return False
+
+    workbooks: list[Path] = []
+    for base_dir in SUPERVISOR_WORKBOOK_DIRS:
+        if not base_dir.exists():
+            continue
+        for p in base_dir.glob("**/*"):
+            if not p.is_file() or p.suffix.lower() not in REFERENCE_EXTENSIONS:
+                continue
+            if p.name.startswith("~$"):
+                continue
+            workbooks.append(p)
+    if not workbooks:
         return lookup
-    workbooks = [p for p in SUPERVISOR_WORKBOOK_DIR.glob("**/*") if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS]
     updated = False
     for wb_path in sorted(workbooks):
         try:
             xl = pd.ExcelFile(wb_path)
         except Exception:
             continue
+        prefer_new_data = _is_new_data_path(wb_path)
         for sheet in xl.sheet_names:
             try:
                 raw = pd.read_excel(wb_path, sheet_name=sheet, dtype=str, header=None)
@@ -3496,7 +3531,9 @@ def load_domain_code_lookup() -> dict[str, Any]:
                 if pd.isna(dom_val) or pd.isna(code_val):
                     continue
                 dom_norm = normalize_value_for_compare(dom_val)
-                if dom_norm and dom_norm not in lookup:
+                if not dom_norm:
+                    continue
+                if dom_norm not in lookup or prefer_new_data:
                     lookup[dom_norm] = code_val
                     updated = True
     if updated:
@@ -5501,17 +5538,20 @@ def run_app() -> None:
     sup_wb_files = list_supervisor_workbooks()
     sup_wb_path = None
     if sup_wb_files:
-        st.caption(f"Supervisor workbooks folder: {SUPERVISOR_WORKBOOK_DIR}")
+        folders_label = ", ".join(str(p) for p in SUPERVISOR_WORKBOOK_DIRS)
+        st.caption(f"Supervisor workbooks folders (New Data preferred): {folders_label}")
         sup_wb_label = st.selectbox("Supervisor workbook (Electric device format)", list(sup_wb_files.keys()), key="sup_wb_select")
         sup_wb_path = sup_wb_files[sup_wb_label]
     else:
-        st.info(f"Add supervisor workbooks to: {SUPERVISOR_WORKBOOK_DIR}")
+        folders_label = ", ".join(str(p) for p in SUPERVISOR_WORKBOOK_DIRS)
+        st.info(f"Add supervisor workbooks to: {folders_label}")
 
     if sup_gpkg_zip:
         if st.button("Fill all substation folders (zip)", key="sup_fill_zip"):
             wb_map = list_supervisor_workbooks()
             if not wb_map:
-                st.error(f"No supervisor workbooks found in {SUPERVISOR_WORKBOOK_DIR}.")
+                folders_label = ", ".join(str(p) for p in SUPERVISOR_WORKBOOK_DIRS)
+                st.error(f"No supervisor workbooks found in {folders_label}.")
             else:
                 tmp_in_dir = Path(tempfile.mkdtemp())
                 logs: list[str] = []
