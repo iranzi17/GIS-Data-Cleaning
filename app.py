@@ -25,6 +25,7 @@ import streamlit as st
 BASE_DIR = Path(__file__).parent
 REFERENCE_DATA_DIR = BASE_DIR / "reference_data"
 SUPERVISOR_WORKBOOK_DIR = BASE_DIR / "supervisor_workbooks"
+NEW_DATA_DIR = BASE_DIR / "New Data"
 # Preferred workbook order: newest first; falls back to any available in reference_data.
 WORKBOOK_PRIORITY = [
     "SUBSTATION 1-25102025.xlsx",
@@ -51,6 +52,8 @@ MAX_GPKG_NAME_LENGTH = 254
 # Curated equipment names from the "Electric device" schema sheet (hard-coded for stability/order).
 ELECTRIC_DEVICE_EQUIPMENT = [
     "Power Transformer/ Stepup Transformer",
+    "Power Transformer",
+    "Distribution Transformer",
     "Earthing Transformer",
     "High Voltage Busbar/Medium Voltage Busbar",
     "MV Switch gear",
@@ -61,6 +64,8 @@ ELECTRIC_DEVICE_EQUIPMENT = [
     "High Voltage Switch/High Voltage Switch",
     "Uninterruptable power supply(UPS)",
     "Substation/Cabin",
+    "Optical Telecommunication Equipment (Telecom)",
+    "ODF",
     "Lightning Arrester",
     "DC Supply 48 VDC Battery",
     "DC Supply 110 VDC Battery",
@@ -143,10 +148,14 @@ def list_reference_workbooks() -> dict[str, Path]:
 def list_supervisor_workbooks() -> dict[str, Path]:
     """Return mapping of display label -> supervisor workbook path."""
     workbooks = {}
-    if SUPERVISOR_WORKBOOK_DIR.exists():
-        for p in sorted(SUPERVISOR_WORKBOOK_DIR.glob("**/*")):
+    search_dirs = [NEW_DATA_DIR, SUPERVISOR_WORKBOOK_DIR]
+    for base_dir in search_dirs:
+        if not base_dir.exists():
+            continue
+        for p in sorted(base_dir.glob("**/*")):
             if p.is_file() and p.suffix.lower() in REFERENCE_EXTENSIONS:
-                label = p.relative_to(SUPERVISOR_WORKBOOK_DIR).as_posix()
+                rel = p.relative_to(base_dir).as_posix()
+                label = f"{base_dir.name}/{rel}" if rel != "." else base_dir.name
                 workbooks[label] = p
     return workbooks
 
@@ -199,11 +208,27 @@ def _build_supervisor_workbook_index(
     workbooks: dict[str, Path],
 ) -> dict[str, tuple[str, Path]]:
     index: dict[str, tuple[str, Path]] = {}
+
+    def _is_new_data_label(label: str, path: Path) -> bool:
+        try:
+            if normalize_for_compare(NEW_DATA_DIR.name) in normalize_for_compare(label):
+                return True
+        except Exception:
+            pass
+        try:
+            return NEW_DATA_DIR in path.parents
+        except Exception:
+            return False
+
     for label, path in workbooks.items():
         stem = Path(label).stem
         norm = _normalize_substation_key(stem)
         if norm and norm not in index:
             index[norm] = (label, path)
+        elif norm:
+            existing_label, existing_path = index[norm]
+            if _is_new_data_label(label, path) and not _is_new_data_label(existing_label, existing_path):
+                index[norm] = (label, path)
     return index
 
 
@@ -461,12 +486,20 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "lightning arrestor": "Lightning Arrester",
         "line bay": "Line Bay",
         "power cable to transformer": "Transformer Bay",
-        "transformers": "Transformer Bay",
+        "transformers": "Power Transformer/ Stepup Transformer",
+        "distribution transformer": "Distribution Transformer",
+        "distribution_transformer": "Distribution Transformer",
+        "dist transformer": "Distribution Transformer",
+        "dist_transformer": "Distribution Transformer",
+        "aux transformer": "Distribution Transformer",
+        "aux_transformer": "Distribution Transformer",
         "voltage transformer": "Voltage Transformer",
         "vt indor switchgear": "Indoor Voltage Transformer",
         "ups": "Uninterruptable power supply(UPS)",
         "trans_system prot1": "Distance Protection",
-        "telecom": "Control and Protection Panels",
+        "telecom": "Optical Telecommunication Equipment (Telecom)",
+        "odf": "ODF",
+        "control and protection panels": "Control and Protection Panels",
         # Additional aliases from provided mapping
         "high_voltage_circuit_breaker": "High Voltage Circuit Breaker/High Voltage Circuit Breaker",
         "high_voltage_circuit_breaker_high_voltage_circuit_breaker": "High Voltage Circuit Breaker/High Voltage Circuit Breaker",
@@ -478,14 +511,14 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "indoor_current_transformer": "Indoor Current Transformer",
         "indoor_voltage_transformer": "Indoor Voltage Transformer",
         "indoorcircuitbreaker": "Indoor Circuit Breaker/30kv/15kb",
-        "telecom_sdh": "Control and Protection Panels",
-        "telecom_odf": "Control and Protection Panels",
+        "telecom_sdh": "Optical Telecommunication Equipment (Telecom)",
+        "telecom_odf": "ODF",
         "highvoltage_line": "Line Bay",
         "transformer_bay": "Transformer Bay",
         "power_transformer": "Power Transformer/ Stepup Transformer",
         "powertransformer": "Power Transformer/ Stepup Transformer",
-        "telecom": "Control and Protection Panels",
-        "telecom_odf": "Control and Protection Panels",
+        "telecom": "Optical Telecommunication Equipment (Telecom)",
+        "telecom_odf": "ODF",
         "cb_indoor_switch_gear": "Indoor Circuit Breaker/30kv/15kb",
         "ct_indoor_switch_gear": "Indoor Current Transformer",
         "vt_indoor_switch_gear": "Indoor Voltage Transformer",
@@ -579,10 +612,38 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
     # Heuristic substring overrides for common indoor switchgear and power transformer stems with suffixes.
     norm_file_sub = norm_file
     if "powertransformer" in norm_file_sub or "power_transformer" in norm_file_sub or "powertransfomer" in norm_file_sub:
+        for preferred in ("Power Transformer", "Power Transformer/ Stepup Transformer"):
+            for opt in equipment_options:
+                if normalize_for_compare(opt) == normalize_for_compare(preferred):
+                    return opt
+        return "Power Transformer" if equipment_options else ""
+    if (
+        "distributiontransformer" in norm_file_sub
+        or "distribution_transformer" in norm_file_sub
+        or "disttransformer" in norm_file_sub
+        or "dist_transformer" in norm_file_sub
+        or "auxtransformer" in norm_file_sub
+        or "aux_transformer" in norm_file_sub
+    ):
         for opt in equipment_options:
-            if normalize_for_compare(opt) == normalize_for_compare("Power Transformer/ Stepup Transformer"):
+            if normalize_for_compare(opt) == normalize_for_compare("Distribution Transformer"):
                 return opt
-        return "Power Transformer/ Stepup Transformer" if equipment_options else ""
+        return "Distribution Transformer" if equipment_options else ""
+    if "odf" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("ODF"):
+                return opt
+        return "ODF" if equipment_options else ""
+    if "telecom" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Optical Telecommunication Equipment (Telecom)"):
+                return opt
+        return "Optical Telecommunication Equipment (Telecom)" if equipment_options else ""
+    if "control" in norm_file_sub and "protection" in norm_file_sub:
+        for opt in equipment_options:
+            if normalize_for_compare(opt) == normalize_for_compare("Control and Protection Panels"):
+                return opt
+        return "Control and Protection Panels" if equipment_options else ""
     if "cbindoor" in norm_file_sub or "cb_indoor_switch" in norm_file_sub or "indoorcircuitbreaker" in norm_file_sub:
         for opt in equipment_options:
             if normalize_for_compare(opt) == normalize_for_compare("Indoor Circuit Breaker/30kv/15kb"):
@@ -611,6 +672,15 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
         return "High Voltage Switch/High Voltage Switch" if equipment_options else ""
     mapped = equip_map.get(norm_file)
     if mapped:
+        mapped_norm = normalize_for_compare(mapped)
+        if mapped_norm in {
+            normalize_for_compare("Power Transformer/ Stepup Transformer"),
+            normalize_for_compare("Power Transformer"),
+        }:
+            for preferred in ("Power Transformer", "Power Transformer/ Stepup Transformer"):
+                for opt in equipment_options:
+                    if normalize_for_compare(opt) == normalize_for_compare(preferred):
+                        return opt
         if mapped in equipment_options:
             return mapped
         try:
@@ -1671,6 +1741,294 @@ def build_protection_layout_points(anchor: Any, count: int, spacing: float) -> l
     return points
 
 
+def _normalize_length_to_meters(value: Any, field_name: str | None = None) -> float | None:
+    if value is None:
+        return None
+    num = _extract_first_number(value)
+    if num is None:
+        return None
+    norm = normalize_for_compare(field_name or "")
+    if "mm" in norm:
+        return num / 1000.0
+    if "cm" in norm:
+        return num / 100.0
+    if "meter" in norm or norm.endswith("m"):
+        return num
+    # Heuristic: large values likely in mm.
+    if num > 20:
+        return num / 1000.0
+    return num
+
+
+def _extract_length_from_fields(fields: dict[str, Any], keywords: list[str]) -> tuple[float | None, str | None]:
+    for key, val in (fields or {}).items():
+        norm_key = normalize_for_compare(key)
+        if any(k in norm_key for k in keywords):
+            num = _extract_first_number(val)
+            if num is not None:
+                return num, key
+    return None, None
+
+
+def _default_panel_size_from_poly(poly: Any) -> tuple[float, float]:
+    default_w = 1.5
+    default_d = 1.0
+    if poly is None or getattr(poly, "is_empty", True):
+        return default_w, default_d
+    try:
+        minx, miny, maxx, maxy = poly.bounds
+        bbox_w = maxx - minx
+        bbox_h = maxy - miny
+        if bbox_w > 0:
+            default_w = max(default_w, bbox_w * 0.2)
+        if bbox_h > 0:
+            default_d = max(default_d, bbox_h * 0.2)
+    except Exception:
+        pass
+    return default_w, default_d
+
+
+def _layout_points_in_cabins(
+    cabins_gdf: gpd.GeoDataFrame | None,
+    count: int,
+    anchors: list[Any] | None = None,
+) -> list[tuple[Any, Any]]:
+    """Return (point, cabin_polygon) pairs for placing cabin-interior devices."""
+    if count <= 0 or cabins_gdf is None or cabins_gdf.empty:
+        return []
+    try:
+        from shapely.geometry import Point
+    except Exception:
+        return []
+    cabin_polys = list(cabins_gdf.geometry)
+    if not cabin_polys:
+        return []
+    n_cabins = len(cabin_polys)
+    base = count // n_cabins
+    remainder = count % n_cabins
+    counts = [base + (1 if i < remainder else 0) for i in range(n_cabins)]
+    out: list[tuple[Any, Any]] = []
+    for idx, poly in enumerate(cabin_polys):
+        c = counts[idx]
+        if c <= 0:
+            continue
+        anchor = None
+        if anchors and idx < len(anchors):
+            anchor = anchors[idx]
+        if anchor is None and poly is not None:
+            try:
+                anchor = poly.centroid
+            except Exception:
+                anchor = None
+        if anchor is None and poly is not None:
+            try:
+                anchor = poly.representative_point()
+            except Exception:
+                anchor = None
+        if c == 1:
+            if anchor is not None:
+                out.append((anchor, poly))
+            continue
+        try:
+            minx, miny, maxx, maxy = poly.bounds
+            bbox_w = maxx - minx
+            bbox_h = maxy - miny
+        except Exception:
+            bbox_w = bbox_h = 0.0
+        if bbox_w <= 0 or bbox_h <= 0:
+            if anchor is not None:
+                out.extend([(anchor, poly)] * c)
+            continue
+        cols = int(math.ceil(math.sqrt(c)))
+        rows = int(math.ceil(c / cols))
+        dx = bbox_w / (cols + 1)
+        dy = bbox_h / (rows + 1)
+        points: list[Any] = []
+        for r in range(rows):
+            for col in range(cols):
+                if len(points) >= c:
+                    break
+                x = minx + (col + 1) * dx
+                y = maxy - (r + 1) * dy
+                pt = Point(x, y)
+                try:
+                    if poly is not None and not poly.contains(pt):
+                        try:
+                            pt = poly.representative_point()
+                        except Exception:
+                            pt = anchor if anchor is not None else pt
+                except Exception:
+                    pt = anchor if anchor is not None else pt
+                points.append(pt)
+        out.extend([(pt, poly) for pt in points])
+    return out
+
+
+def layout_points_in_cabins(
+    cabins_gdf: gpd.GeoDataFrame | None,
+    count: int,
+    anchors: list[Any] | None = None,
+) -> list[Any]:
+    return [pt for pt, _ in _layout_points_in_cabins(cabins_gdf, count, anchors)]
+
+
+def build_cabin_anchor_points(
+    files: list[Any] | None,
+    cabins_gdf: gpd.GeoDataFrame | None,
+    device_options: list[str],
+    equip_map: dict[str, str],
+) -> list[Any]:
+    """Find anchor points inside each cabin (prefer switchgear points, fall back to centroids)."""
+    if cabins_gdf is None or cabins_gdf.empty:
+        return []
+    switchgear_norms = {
+        normalize_for_compare("MV Switch gear"),
+        normalize_for_compare("INDOR SWITCHGEAR TABLE"),
+    }
+    switchgear_pts = collect_device_points_from_uploads(
+        files,
+        cabins_gdf.crs,
+        device_options,
+        equip_map,
+        switchgear_norms,
+    )
+    try:
+        if (
+            switchgear_pts is not None
+            and not switchgear_pts.empty
+            and switchgear_pts.crs is not None
+            and cabins_gdf.crs is not None
+            and switchgear_pts.crs != cabins_gdf.crs
+        ):
+            switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
+    except Exception:
+        pass
+    anchors: list[Any] = []
+    for _, cabin in cabins_gdf.iterrows():
+        poly = cabin.geometry
+        anchor = None
+        if switchgear_pts is not None and not switchgear_pts.empty:
+            try:
+                pts_inside = switchgear_pts[switchgear_pts.within(poly)]
+            except Exception:
+                pts_inside = gpd.GeoDataFrame()
+            if not pts_inside.empty:
+                try:
+                    anchor = pts_inside.unary_union.centroid
+                except Exception:
+                    anchor = pts_inside.iloc[0].geometry
+        if anchor is None:
+            try:
+                anchor = poly.centroid
+            except Exception:
+                anchor = None
+        anchors.append(anchor)
+    return anchors
+
+
+def _build_panel_rectangle(
+    center: Any,
+    width_m: float,
+    depth_m: float,
+    cabin_poly: Any | None = None,
+) -> Any:
+    try:
+        from shapely.geometry import Polygon
+    except Exception:
+        return None
+    if center is None or getattr(center, "is_empty", True):
+        if cabin_poly is not None:
+            try:
+                center = cabin_poly.centroid
+            except Exception:
+                return None
+        else:
+            return None
+    try:
+        x = float(center.x)
+        y = float(center.y)
+    except Exception:
+        return None
+    half_w = max(width_m, 0.2) / 2.0
+    half_d = max(depth_m, 0.2) / 2.0
+    rect = Polygon(
+        [
+            (x - half_w, y - half_d),
+            (x + half_w, y - half_d),
+            (x + half_w, y + half_d),
+            (x - half_w, y + half_d),
+        ]
+    )
+    if cabin_poly is None:
+        return rect
+    try:
+        if cabin_poly.contains(rect):
+            return rect
+    except Exception:
+        return rect
+    for factor in (0.9, 0.8, 0.6, 0.4):
+        rect_try = Polygon(
+            [
+                (x - half_w * factor, y - half_d * factor),
+                (x + half_w * factor, y - half_d * factor),
+                (x + half_w * factor, y + half_d * factor),
+                (x - half_w * factor, y + half_d * factor),
+            ]
+        )
+        try:
+            if cabin_poly.contains(rect_try):
+                return rect_try
+        except Exception:
+            continue
+    return rect
+
+
+def build_control_panel_polygons(
+    instances: list[dict[str, Any]],
+    cabins_gdf: gpd.GeoDataFrame | None,
+    anchors: list[Any] | None = None,
+) -> list[Any]:
+    """Build panel polygons using per-instance sizes, placed inside cabin polygons."""
+    layout = _layout_points_in_cabins(cabins_gdf, len(instances), anchors)
+    if not layout:
+        return []
+    if len(layout) < len(instances):
+        last = layout[-1]
+        while len(layout) < len(instances):
+            layout.append(last)
+    polys: list[Any] = []
+    for inst, (center, cabin_poly) in zip(instances, layout):
+        fields = inst.get("fields", {}) or {}
+        width_val, width_key = _extract_length_from_fields(fields, ["width"])
+        depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
+        width_m = _normalize_length_to_meters(width_val, width_key)
+        depth_m = _normalize_length_to_meters(depth_val, depth_key)
+        default_w, default_d = _default_panel_size_from_poly(cabin_poly)
+        if width_m is None or width_m <= 0:
+            width_m = default_w
+        if depth_m is None or depth_m <= 0:
+            depth_m = default_d
+        try:
+            if cabin_poly is not None:
+                minx, miny, maxx, maxy = cabin_poly.bounds
+                bbox_w = maxx - minx
+                bbox_h = maxy - miny
+                if bbox_w > 0:
+                    width_m = min(width_m, bbox_w * 0.8)
+                if bbox_h > 0:
+                    depth_m = min(depth_m, bbox_h * 0.8)
+        except Exception:
+            pass
+        poly = _build_panel_rectangle(center, width_m, depth_m, cabin_poly)
+        if poly is None and cabin_poly is not None:
+            try:
+                poly = cabin_poly.centroid
+            except Exception:
+                poly = None
+        polys.append(poly)
+    return polys
+
+
 def build_device_gdf_from_instances(
     instances: list[dict[str, Any]],
     points: list[Any],
@@ -2463,6 +2821,95 @@ def _fill_supervisor_batch(
                 )
                 logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
 
+    cabin_point_devices = [
+        "Distribution Transformer",
+        "Optical Telecommunication Equipment (Telecom)",
+        "ODF",
+    ]
+    cabin_polygon_devices = [
+        "Control and Protection Panels",
+    ]
+    cabin_devices_all = cabin_point_devices + cabin_polygon_devices
+    if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_devices_all):
+        cabin_norms = {normalize_for_compare("Substation/Cabin")}
+        cabins_gdf = collect_device_polygons_from_uploads(
+            files, None, device_options, equip_map_sup, cabin_norms
+        )
+        if cabins_gdf is None or cabins_gdf.empty:
+            for dev_name in cabin_devices_all:
+                if normalize_for_compare(dev_name) in uploaded_device_norms:
+                    continue
+                logs.append(f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded).")
+        else:
+            cabin_anchor_points = build_cabin_anchor_points(
+                files,
+                cabins_gdf,
+                device_options,
+                equip_map_sup,
+            )
+            for dev_name in cabin_point_devices:
+                if normalize_for_compare(dev_name) in uploaded_device_norms:
+                    continue
+                instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                if not instances:
+                    logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                    continue
+                points = layout_points_in_cabins(cabins_gdf, len(instances), cabin_anchor_points)
+                points = expand_geometries(points, len(instances))
+                if not points:
+                    logs.append(f"{prefix_label}{dev_name}: cabin layout failed (no points).")
+                    continue
+                out_gdf = build_device_gdf_from_instances(instances, points, cabins_gdf.crs)
+                layer_name = derive_layer_name_from_filename(dev_name)
+                file_name = f"{dev_name}.gpkg"
+                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                    out_path = Path(tmpout.name)
+                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                _record_output(file_name, out_path)
+                run_domain_rows.extend(
+                    append_domain_code_log(
+                        _collect_domain_log_entries(instances),
+                        {
+                            "workbook": sup_wb_path.name if sup_wb_path else None,
+                            "sheet": sup_sheet,
+                            "device": dev_name,
+                            "output": f"{prefix_label}{file_name}",
+                        },
+                    )
+                )
+                logs.append(f"{prefix_label}{dev_name}: auto-created inside cabins ({len(points)} feature(s)).")
+
+            for dev_name in cabin_polygon_devices:
+                if normalize_for_compare(dev_name) in uploaded_device_norms:
+                    continue
+                instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                if not instances:
+                    logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                    continue
+                polygons = build_control_panel_polygons(instances, cabins_gdf, cabin_anchor_points)
+                if not polygons or len(polygons) != len(instances):
+                    logs.append(f"{prefix_label}{dev_name}: cabin panel layout failed (no polygons).")
+                    continue
+                out_gdf = build_device_gdf_from_instances(instances, polygons, cabins_gdf.crs)
+                layer_name = derive_layer_name_from_filename(dev_name)
+                file_name = f"{dev_name}.gpkg"
+                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                    out_path = Path(tmpout.name)
+                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                _record_output(file_name, out_path)
+                run_domain_rows.extend(
+                    append_domain_code_log(
+                        _collect_domain_log_entries(instances),
+                        {
+                            "workbook": sup_wb_path.name if sup_wb_path else None,
+                            "sheet": sup_sheet,
+                            "device": dev_name,
+                            "output": f"{prefix_label}{file_name}",
+                        },
+                    )
+                )
+                logs.append(f"{prefix_label}{dev_name}: auto-created inside cabins ({len(polygons)} feature(s)).")
+
     template_devices = [
         ("High Voltage Line", HV_LINE_TEMPLATE_PATH),
         ("Earthing Transformer", EARTHING_TRANSFORMER_TEMPLATE_PATH),
@@ -2622,49 +3069,13 @@ def _fill_supervisor_batch(
             cabins_gdf = collect_device_polygons_from_uploads(
                 files, None, device_options, equip_map_sup, cabin_norms
             )
-            switchgear_norms = {
-                normalize_for_compare("MV Switch gear"),
-                normalize_for_compare("INDOR SWITCHGEAR TABLE"),
-            }
-            switchgear_pts = collect_device_points_from_uploads(
+            cabin_anchor_points = build_cabin_anchor_points(
                 files,
-                cabins_gdf.crs if cabins_gdf is not None else None,
+                cabins_gdf,
                 device_options,
                 equip_map_sup,
-                switchgear_norms,
             )
-            geoms: list[Any] = []
-            if cabins_gdf is not None and not cabins_gdf.empty:
-                try:
-                    if (
-                        switchgear_pts is not None
-                        and not switchgear_pts.empty
-                        and switchgear_pts.crs != cabins_gdf.crs
-                    ):
-                        switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
-                except Exception:
-                    pass
-                for _, cabin in cabins_gdf.iterrows():
-                    poly = cabin.geometry
-                    anchor = None
-                    if switchgear_pts is not None and not switchgear_pts.empty:
-                        try:
-                            pts_inside = switchgear_pts[switchgear_pts.within(poly)]
-                        except Exception:
-                            pts_inside = gpd.GeoDataFrame()
-                        if not pts_inside.empty:
-                            try:
-                                anchor = pts_inside.unary_union.centroid
-                            except Exception:
-                                anchor = pts_inside.iloc[0].geometry
-                    if anchor is None:
-                        try:
-                            anchor = poly.centroid
-                        except Exception:
-                            anchor = None
-                    if anchor is not None:
-                        geoms.append(anchor)
-                        cabin_anchor_points.append(anchor)
+            geoms = [pt for pt in cabin_anchor_points if pt is not None]
             if geoms:
                 target_count = len(instances)
                 geoms = expand_geometries(geoms, target_count)
@@ -3362,8 +3773,15 @@ FILE_DEVICE_OVERRIDES = {
     normalize_for_compare("TRANS_SYSTEM PROT2"): "Distance Protection",
     normalize_for_compare("POWER_TRANSFORMER"): "Power Transformer/ Stepup Transformer",
     normalize_for_compare("power_transformer"): "Power Transformer/ Stepup Transformer",
-    normalize_for_compare("TELECOM"): "Control and Protection Panels",
-    normalize_for_compare("TELECOM_ODF"): "Control and Protection Panels",
+    normalize_for_compare("TELECOM"): "Optical Telecommunication Equipment (Telecom)",
+    normalize_for_compare("TELECOM_SDH"): "Optical Telecommunication Equipment (Telecom)",
+    normalize_for_compare("TELECOM_ODF"): "ODF",
+    normalize_for_compare("ODF"): "ODF",
+    normalize_for_compare("OPTICAL TELECOMMUNICATION EQUIPMENT (TELECOM)"): "Optical Telecommunication Equipment (Telecom)",
+    normalize_for_compare("DISTRIBUTION TRANSFORMER"): "Distribution Transformer",
+    normalize_for_compare("DIST TRANSFORMER"): "Distribution Transformer",
+    normalize_for_compare("AUX TRANSFORMER"): "Distribution Transformer",
+    normalize_for_compare("CONTROL AND PROTECTION PANELS"): "Control and Protection Panels",
     normalize_for_compare("CB_INDOOR_SWITCH_GEAR"): "Indoor Circuit Breaker/30kv/15kb",
     normalize_for_compare("CT_INDOOR_SWITCH_GEAR"): "Indoor Current Transformer",
     normalize_for_compare("VT_INDOOR_SWITCH_GEAR"): "Indoor Voltage Transformer",
@@ -3422,7 +3840,6 @@ SUBSTATION_FORCE_TYPES = {
 
 PROTECTION_LAYOUT_DEVICES = {
     normalize_for_compare("Distance Protection"),
-    normalize_for_compare("Control and Protection Panels"),
     normalize_for_compare("Transformer Protection"),
     normalize_for_compare("Line Overcurrent Protection"),
 }
@@ -4034,6 +4451,12 @@ def preferred_match_columns(device_name: str) -> list[str]:
             "SUBSTATION NAMES",
         ],
         normalize_for_compare("Earthing Transformer"): [
+            "transfomerID",
+            "TransformerID",
+            "Transformer ID",
+            "transfomer ID",
+        ],
+        normalize_for_compare("Distribution Transformer"): [
             "transfomerID",
             "TransformerID",
             "Transformer ID",
@@ -5698,6 +6121,107 @@ def run_app() -> None:
                             )
                             logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
 
+                cabin_point_devices = [
+                    "Distribution Transformer",
+                    "Optical Telecommunication Equipment (Telecom)",
+                    "ODF",
+                ]
+                cabin_polygon_devices = [
+                    "Control and Protection Panels",
+                ]
+                cabin_devices_all = cabin_point_devices + cabin_polygon_devices
+                if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_devices_all):
+                    cabin_norms = {normalize_for_compare("Substation/Cabin")}
+                    cabins_gdf = collect_device_polygons_from_uploads(
+                        files, None, device_options, equip_map_sup, cabin_norms
+                    )
+                    if cabins_gdf is None or cabins_gdf.empty:
+                        for dev_name in cabin_devices_all:
+                            if normalize_for_compare(dev_name) in uploaded_device_norms:
+                                continue
+                            logs.append(
+                                f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded)."
+                            )
+                    else:
+                        cabin_anchor_points = build_cabin_anchor_points(
+                            files,
+                            cabins_gdf,
+                            device_options,
+                            equip_map_sup,
+                        )
+                        for dev_name in cabin_point_devices:
+                            if normalize_for_compare(dev_name) in uploaded_device_norms:
+                                continue
+                            instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                            if not instances:
+                                logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                                continue
+                            points = layout_points_in_cabins(
+                                cabins_gdf, len(instances), cabin_anchor_points
+                            )
+                            points = expand_geometries(points, len(instances))
+                            if not points:
+                                logs.append(f"{prefix_label}{dev_name}: cabin layout failed (no points).")
+                                continue
+                            out_gdf = build_device_gdf_from_instances(instances, points, cabins_gdf.crs)
+                            layer_name = derive_layer_name_from_filename(dev_name)
+                            file_name = f"{dev_name}.gpkg"
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            _record_output(file_name, out_path)
+                            run_domain_rows.extend(
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": f"{prefix_label}{file_name}",
+                                    },
+                                )
+                            )
+                            logs.append(
+                                f"{prefix_label}{dev_name}: auto-created inside cabins ({len(points)} feature(s))."
+                            )
+
+                        for dev_name in cabin_polygon_devices:
+                            if normalize_for_compare(dev_name) in uploaded_device_norms:
+                                continue
+                            instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                            if not instances:
+                                logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                                continue
+                            polygons = build_control_panel_polygons(
+                                instances, cabins_gdf, cabin_anchor_points
+                            )
+                            if not polygons or len(polygons) != len(instances):
+                                logs.append(
+                                    f"{prefix_label}{dev_name}: cabin panel layout failed (no polygons)."
+                                )
+                                continue
+                            out_gdf = build_device_gdf_from_instances(instances, polygons, cabins_gdf.crs)
+                            layer_name = derive_layer_name_from_filename(dev_name)
+                            file_name = f"{dev_name}.gpkg"
+                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                                out_path = Path(tmpout.name)
+                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                            _record_output(file_name, out_path)
+                            run_domain_rows.extend(
+                                append_domain_code_log(
+                                    _collect_domain_log_entries(instances),
+                                    {
+                                        "workbook": sup_wb_path.name if sup_wb_path else None,
+                                        "sheet": sup_sheet,
+                                        "device": dev_name,
+                                        "output": f"{prefix_label}{file_name}",
+                                    },
+                                )
+                            )
+                            logs.append(
+                                f"{prefix_label}{dev_name}: auto-created inside cabins ({len(polygons)} feature(s))."
+                            )
+
                 template_devices = [
                     ("High Voltage Line", HV_LINE_TEMPLATE_PATH),
                     ("Earthing Transformer", EARTHING_TRANSFORMER_TEMPLATE_PATH),
@@ -5857,49 +6381,13 @@ def run_app() -> None:
                         cabins_gdf = collect_device_polygons_from_uploads(
                             files, None, device_options, equip_map_sup, cabin_norms
                         )
-                        switchgear_norms = {
-                            normalize_for_compare("MV Switch gear"),
-                            normalize_for_compare("INDOR SWITCHGEAR TABLE"),
-                        }
-                        switchgear_pts = collect_device_points_from_uploads(
+                        cabin_anchor_points = build_cabin_anchor_points(
                             files,
-                            cabins_gdf.crs if cabins_gdf is not None else None,
+                            cabins_gdf,
                             device_options,
                             equip_map_sup,
-                            switchgear_norms,
                         )
-                        geoms: list[Any] = []
-                        if cabins_gdf is not None and not cabins_gdf.empty:
-                            try:
-                                if (
-                                    switchgear_pts is not None
-                                    and not switchgear_pts.empty
-                                    and switchgear_pts.crs != cabins_gdf.crs
-                                ):
-                                    switchgear_pts = switchgear_pts.to_crs(cabins_gdf.crs)
-                            except Exception:
-                                pass
-                            for _, cabin in cabins_gdf.iterrows():
-                                poly = cabin.geometry
-                                anchor = None
-                                if switchgear_pts is not None and not switchgear_pts.empty:
-                                    try:
-                                        pts_inside = switchgear_pts[switchgear_pts.within(poly)]
-                                    except Exception:
-                                        pts_inside = gpd.GeoDataFrame()
-                                    if not pts_inside.empty:
-                                        try:
-                                            anchor = pts_inside.unary_union.centroid
-                                        except Exception:
-                                            anchor = pts_inside.iloc[0].geometry
-                                if anchor is None:
-                                    try:
-                                        anchor = poly.centroid
-                                    except Exception:
-                                        anchor = None
-                                if anchor is not None:
-                                    geoms.append(anchor)
-                                    cabin_anchor_points.append(anchor)
+                        geoms = [pt for pt in cabin_anchor_points if pt is not None]
                         if geoms:
                             target_count = len(instances)
                             geoms = expand_geometries(geoms, target_count)
