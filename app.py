@@ -608,6 +608,9 @@ def save_mapping_cache(cache: dict[str, dict[str, str]]) -> None:
 def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_map: dict[str, str]) -> str:
     """Pick equipment/device name for a given file using explicit map then similarity."""
     norm_file = normalize_for_compare(Path(file_name).stem)
+    # Hard guard: do not map earthing transformers to power transformers via fuzzy matching.
+    if "earthingtransformer" in norm_file or ("earthing" in norm_file and "transformer" in norm_file):
+        return "Earthing Transformer" if equipment_options else "Earthing Transformer"
     override = FILE_DEVICE_OVERRIDES.get(norm_file)
     if override:
         if override in equipment_options:
