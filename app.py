@@ -2810,8 +2810,6 @@ def _fill_supervisor_batch(
                 continue
             device_for_file = resolve_equipment_name(file_name, device_options, equip_map_sup)
             if device_for_file not in device_options:
-                out_path = _write_original_file(file_obj)
-                _record_output(file_name, out_path)
                 logs.append(
                     f"{prefix_label}{file_name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
                 )
@@ -6131,8 +6129,6 @@ def run_app() -> None:
                             continue
                         device_for_file = resolve_equipment_name(file_name, device_options, equip_map_sup)
                         if device_for_file not in device_options:
-                            out_path = _write_original_file(file_obj)
-                            _record_output(file_name, out_path)
                             logs.append(
                                 f"{prefix_label}{file_name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
                             )
