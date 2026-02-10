@@ -2007,45 +2007,138 @@ def build_control_panel_polygons(
     cabins_gdf: gpd.GeoDataFrame | None,
     anchors: list[Any] | None = None,
 ) -> list[Any]:
-    """Build panel polygons using per-instance sizes, placed inside cabin polygons."""
-    layout = _layout_points_in_cabins(cabins_gdf, len(instances), anchors)
-    if not layout:
+    """Build panel polygons using per-instance sizes, aligned side-by-side inside cabins."""
+    if cabins_gdf is None or cabins_gdf.empty or not instances:
         return []
-    if len(layout) < len(instances):
-        last = layout[-1]
-        while len(layout) < len(instances):
-            layout.append(last)
-    polys: list[Any] = []
-    for inst, (center, cabin_poly) in zip(instances, layout):
-        fields = inst.get("fields", {}) or {}
-        width_val, width_key = _extract_length_from_fields(fields, ["width"])
-        depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
-        width_m = _normalize_length_to_meters(width_val, width_key)
-        depth_m = _normalize_length_to_meters(depth_val, depth_key)
-        default_w, default_d = _default_panel_size_from_poly(cabin_poly)
-        if width_m is None or width_m <= 0:
-            width_m = default_w
-        if depth_m is None or depth_m <= 0:
-            depth_m = default_d
-        try:
-            if cabin_poly is not None:
-                minx, miny, maxx, maxy = cabin_poly.bounds
-                bbox_w = maxx - minx
-                bbox_h = maxy - miny
-                if bbox_w > 0:
-                    width_m = min(width_m, bbox_w * 0.8)
-                if bbox_h > 0:
-                    depth_m = min(depth_m, bbox_h * 0.8)
-        except Exception:
-            pass
-        poly = _build_panel_rectangle(center, width_m, depth_m, cabin_poly)
-        if poly is None and cabin_poly is not None:
+
+    def _fallback_layout() -> list[Any]:
+        layout = _layout_points_in_cabins(cabins_gdf, len(instances), anchors)
+        if not layout:
+            return []
+        if len(layout) < len(instances):
+            last = layout[-1]
+            while len(layout) < len(instances):
+                layout.append(last)
+        fallback_polys: list[Any] = []
+        for inst, (center, cabin_poly) in zip(instances, layout):
+            fields = inst.get("fields", {}) or {}
+            width_val, width_key = _extract_length_from_fields(fields, ["width"])
+            depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
+            width_m = _normalize_length_to_meters(width_val, width_key)
+            depth_m = _normalize_length_to_meters(depth_val, depth_key)
+            default_w, default_d = _default_panel_size_from_poly(cabin_poly)
+            if width_m is None or width_m <= 0:
+                width_m = default_w
+            if depth_m is None or depth_m <= 0:
+                depth_m = default_d
             try:
-                poly = cabin_poly.centroid
+                if cabin_poly is not None:
+                    minx, miny, maxx, maxy = cabin_poly.bounds
+                    bbox_w = maxx - minx
+                    bbox_h = maxy - miny
+                    if bbox_w > 0:
+                        width_m = min(width_m, bbox_w * 0.8)
+                    if bbox_h > 0:
+                        depth_m = min(depth_m, bbox_h * 0.8)
             except Exception:
-                poly = None
-        polys.append(poly)
-    return polys
+                pass
+            poly = _build_panel_rectangle(center, width_m, depth_m, cabin_poly)
+            if poly is None and cabin_poly is not None:
+                try:
+                    poly = cabin_poly.centroid
+                except Exception:
+                    poly = None
+            fallback_polys.append(poly)
+        return fallback_polys
+
+    cabin_polys = list(cabins_gdf.geometry)
+    if not cabin_polys:
+        return _fallback_layout()
+
+    total = len(instances)
+    n_cabins = len(cabin_polys)
+    base = total // n_cabins
+    remainder = total % n_cabins
+    counts = [base + (1 if i < remainder else 0) for i in range(n_cabins)]
+
+    panel_gap = 0.0  # snap panels directly against each other
+    min_size = 0.2
+
+    out_polys: list[Any] = []
+    inst_idx = 0
+    for idx, cabin_poly in enumerate(cabin_polys):
+        c = counts[idx]
+        if c <= 0:
+            continue
+        inst_slice = instances[inst_idx : inst_idx + c]
+        inst_idx += c
+
+        try:
+            minx, miny, maxx, maxy = cabin_poly.bounds
+            bbox_w = maxx - minx
+            bbox_h = maxy - miny
+        except Exception:
+            return _fallback_layout()
+
+        if bbox_w <= 0 or bbox_h <= 0:
+            return _fallback_layout()
+
+        margin_x = max(bbox_w * 0.05, 0.2)
+        margin_y = max(bbox_h * 0.05, 0.2)
+        usable_w = max(bbox_w - 2 * margin_x, min_size * c)
+        usable_h = max(bbox_h - 2 * margin_y, min_size)
+
+        dims: list[tuple[float, float]] = []
+        max_depth = 0.0
+        for inst in inst_slice:
+            fields = inst.get("fields", {}) or {}
+            width_val, width_key = _extract_length_from_fields(fields, ["width"])
+            depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
+            width_m = _normalize_length_to_meters(width_val, width_key)
+            depth_m = _normalize_length_to_meters(depth_val, depth_key)
+            default_w, default_d = _default_panel_size_from_poly(cabin_poly)
+            if width_m is None or width_m <= 0:
+                width_m = default_w
+            if depth_m is None or depth_m <= 0:
+                depth_m = default_d
+            width_m = max(width_m, min_size)
+            depth_m = max(depth_m, min_size)
+            dims.append((width_m, depth_m))
+            if depth_m > max_depth:
+                max_depth = depth_m
+
+        # Scale depths to fit cabin height (keep common top alignment).
+        if usable_h > 0 and max_depth > usable_h * 0.8:
+            depth_scale = (usable_h * 0.8) / max_depth
+            dims = [(w, max(min_size, d * depth_scale)) for w, d in dims]
+            max_depth = max(d for _, d in dims) if dims else max_depth
+
+        total_w = sum(w for w, _ in dims) + panel_gap * max(c - 1, 0)
+        if total_w > usable_w and total_w > 0:
+            scale = usable_w / total_w
+            dims = [(max(min_size, w * scale), d) for w, d in dims]
+            total_w = sum(w for w, _ in dims) + panel_gap * max(c - 1, 0)
+
+        top_y = maxy - margin_y
+        current_x = minx + margin_x
+        for (width_m, depth_m) in dims:
+            center_x = current_x + width_m / 2.0
+            center_y = top_y - depth_m / 2.0
+            try:
+                from shapely.geometry import Point
+
+                center = Point(center_x, center_y)
+            except Exception:
+                center = None
+            poly = _build_panel_rectangle(center, width_m, depth_m, cabin_poly)
+            if poly is None:
+                return _fallback_layout()
+            out_polys.append(poly)
+            current_x += width_m + panel_gap
+
+    if len(out_polys) != len(instances):
+        return _fallback_layout()
+    return out_polys
 
 
 def build_device_gdf_from_instances(
