@@ -538,6 +538,8 @@ def load_gpkg_equipment_map() -> dict[str, str]:
         "powertransformer": "Power Transformer/ Stepup Transformer",
         "telecom": "Optical Telecommunication Equipment (Telecom)",
         "telecom_odf": "ODF",
+        "standby generator": "Standby Generator",
+        "standby_generator": "Standby Generator",
         "cb_indoor_switch_gear": "Indoor Circuit Breaker/30kv/15kb",
         "ct_indoor_switch_gear": "Indoor Current Transformer",
         "vt_indoor_switch_gear": "Indoor Voltage Transformer",
@@ -778,7 +780,10 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 text = value.strip()
                 if text == "":
                     return True
-                if text.lower() == "not existing":
+                norm = normalize_for_compare(text)
+                if norm in {"notexisting", "notexist", "notavailable"}:
+                    return True
+                if "locatedinthepowerplant" in norm or "locatedinpowerplant" in norm:
                     return True
             return False
 
@@ -842,6 +847,8 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
 
     def _finalize_instance(fields: dict[str, Any], order: list[str]) -> None:
         if not fields:
+            return
+        if all(_is_blank(v) for v in fields.values()):
             return
         idx = len(instances) + 1
         id_value = _get_by_alias(
@@ -2826,6 +2833,9 @@ def _fill_supervisor_batch(
             seq_arg = None
             cached_instances = instance_cache.get(device_for_file, [])
             type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
+            if not cached_instances:
+                logs.append(f"{prefix_label}{file_name}: skipped (no instances in sheet).")
+                continue
             if len(cached_instances) > 1:
                 seq_arg = cached_instances
             elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
@@ -2938,6 +2948,7 @@ def _fill_supervisor_batch(
         "Distribution Transformer",
         "Optical Telecommunication Equipment (Telecom)",
         "ODF",
+        "Standby Generator",
     ]
     cabin_polygon_devices = [
         "Control and Protection Panels",
@@ -6145,6 +6156,9 @@ def run_app() -> None:
                         seq_arg = None
                         cached_instances = instance_cache.get(device_for_file, [])
                         type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
+                        if not cached_instances:
+                            logs.append(f"{prefix_label}{file_name}: skipped (no instances in sheet).")
+                            continue
                         if len(cached_instances) > 1:
                             seq_arg = cached_instances
                         elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
@@ -6257,6 +6271,7 @@ def run_app() -> None:
                     "Distribution Transformer",
                     "Optical Telecommunication Equipment (Telecom)",
                     "ODF",
+                    "Standby Generator",
                 ]
                 cabin_polygon_devices = [
                     "Control and Protection Panels",

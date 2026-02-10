@@ -21,6 +21,7 @@
   "telecom_sdh": "OpticalTelecommunicationEquipment(Telecom)",
   "telecom_odf": "ODF",
   "odf": "ODF",
+  "standby generator": "StandbyGenerator",
   "voltage transformer": "VoltageTransformer",
   "vt indor switchgear": "IndoorVoltageTransformer",
   "ups": "Uninterruptablepowersupply(UPS)",
