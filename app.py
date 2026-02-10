@@ -767,25 +767,26 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     type_map_device: dict[str, str] = {}
     current_domain_log: list[dict[str, Any]] = []
 
-    def _extract_value(row: pd.Series, dtype: str, field_name: str) -> tuple[Any, dict[str, Any] | None]:
-        def _is_blank(value: Any) -> bool:
-            try:
-                if pd.isna(value):
-                    return True
-            except Exception:
-                pass
-            if value is None:
+    def _is_blank(value: Any) -> bool:
+        try:
+            if pd.isna(value):
                 return True
-            if isinstance(value, str):
-                text = value.strip()
-                if text == "":
-                    return True
-                norm = normalize_for_compare(text)
-                if norm in {"notexisting", "notexist", "notavailable"}:
-                    return True
-                if "locatedinthepowerplant" in norm or "locatedinpowerplant" in norm:
-                    return True
-            return False
+        except Exception:
+            pass
+        if value is None:
+            return True
+        if isinstance(value, str):
+            text = value.strip()
+            if text == "":
+                return True
+            norm = normalize_for_compare(text)
+            if norm in {"notexisting", "notexist", "notavailable"}:
+                return True
+            if "locatedinthepowerplant" in norm or "locatedinpowerplant" in norm:
+                return True
+        return False
+
+    def _extract_value(row: pd.Series, dtype: str, field_name: str) -> tuple[Any, dict[str, Any] | None]:
 
         def _looks_like_unit_value(value: Any) -> bool:
             if value is None:
