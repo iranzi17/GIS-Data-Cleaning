@@ -2947,6 +2947,7 @@ def _fill_supervisor_batch(
 
     cabin_point_devices = [
         "Distribution Transformer",
+        "Transformer Bay",
         "Optical Telecommunication Equipment (Telecom)",
         "ODF",
         "Standby Generator",
@@ -6379,6 +6380,7 @@ def run_app() -> None:
 
                 cabin_point_devices = [
                     "Distribution Transformer",
+                    "Transformer Bay",
                     "Optical Telecommunication Equipment (Telecom)",
                     "ODF",
                     "Standby Generator",
