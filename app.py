@@ -3045,6 +3045,91 @@ def _fill_supervisor_batch(
         if len(control_panel_polygons_cached) != len(control_panel_instances_cached):
             control_panel_polygons_cached = []
 
+    if isinstance(line_bay_info, dict):
+        line_bay_info = dict(line_bay_info)
+        try:
+            bay_ref_gdf = load_line_bay_layer(
+                line_bay_info.get("path"),
+                line_bay_info.get("layer"),
+                line_bay_info.get("field"),
+            )
+        except Exception:
+            bay_ref_gdf = None
+        if bay_ref_gdf is not None and not bay_ref_gdf.empty:
+            geom_col_ref = bay_ref_gdf.geometry.name if hasattr(bay_ref_gdf, "geometry") else None
+            bay_val_cols = [c for c in bay_ref_gdf.columns if c != geom_col_ref]
+            bay_val_col = bay_val_cols[0] if bay_val_cols else None
+
+            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+            reverse_name_to_id: dict[str, str] = {}
+            if isinstance(id_name_map, dict):
+                for k, v in id_name_map.items():
+                    k_norm = normalize_value_for_compare(k)
+                    v_norm = normalize_value_for_compare(v)
+                    if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                        reverse_name_to_id[v_norm] = k_norm
+
+            def _canon_bay_key(raw_val: Any) -> str:
+                norm_val = normalize_value_for_compare(raw_val)
+                if not norm_val:
+                    return ""
+                return reverse_name_to_id.get(norm_val, norm_val)
+
+            bay_centroid_by_key: dict[str, Any] = {}
+            if bay_val_col and geom_col_ref:
+                for _, row in bay_ref_gdf.iterrows():
+                    key = _canon_bay_key(row.get(bay_val_col))
+                    geom = row.get(geom_col_ref)
+                    if not key or geom is None or getattr(geom, "is_empty", True):
+                        continue
+                    try:
+                        bay_centroid_by_key[key] = geom.centroid
+                    except Exception:
+                        try:
+                            bay_centroid_by_key[key] = geom.representative_point()
+                        except Exception:
+                            continue
+            line_bay_info["bay_centroid_by_key"] = bay_centroid_by_key
+
+            vt_ref_by_key: dict[str, Any] = {}
+            if bay_val_col:
+                vt_norms = {normalize_for_compare("Voltage Transformer")}
+                vt_points = collect_device_points_from_uploads(
+                    files,
+                    bay_ref_gdf.crs,
+                    device_options,
+                    equip_map_sup,
+                    vt_norms,
+                )
+                if vt_points is not None and not vt_points.empty:
+                    points_by_bay = map_points_to_bays(vt_points, bay_ref_gdf)
+                    grouped_pts: dict[str, list[Any]] = {}
+                    for bay_idx, pts in points_by_bay.items():
+                        if not pts:
+                            continue
+                        try:
+                            bay_row = bay_ref_gdf.iloc[int(bay_idx)]
+                        except Exception:
+                            continue
+                        key = _canon_bay_key(bay_row.get(bay_val_col))
+                        if not key:
+                            continue
+                        grouped_pts.setdefault(key, []).extend(pts)
+                    for key, pts in grouped_pts.items():
+                        valid_pts = [p for p in pts if p is not None and not getattr(p, "is_empty", True)]
+                        if not valid_pts:
+                            continue
+                        if len(valid_pts) == 1:
+                            vt_ref_by_key[key] = valid_pts[0]
+                            continue
+                        try:
+                            from shapely.geometry import MultiPoint
+
+                            vt_ref_by_key[key] = MultiPoint(valid_pts).centroid
+                        except Exception:
+                            vt_ref_by_key[key] = valid_pts[0]
+            line_bay_info["vt_ref_by_key"] = vt_ref_by_key
+
     for file_obj in files:
         file_name = _get_file_name(file_obj)
         try:
@@ -5796,6 +5881,313 @@ def fill_one_gpkg(
         id_prefix="CT",
     )
 
+    def _matches_device_targets(targets: set[str]) -> bool:
+        hit = normalize_for_compare(device_name) in targets
+        if not hit:
+            try:
+                layer_norm = normalize_for_compare(layer or "")
+                hit = any(target in layer_norm or layer_norm == target for target in targets)
+            except Exception:
+                hit = False
+        if not hit:
+            try:
+                file_norm = normalize_for_compare(Path(file_name).stem)
+                hit = any(target in file_norm or file_norm == target for target in targets)
+            except Exception:
+                hit = False
+        return hit
+
+    def _resolve_bay_keys_and_base() -> tuple[list[str], dict[str, int]]:
+        if len(out_gdf) <= 0:
+            return [], {}
+        norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
+        line_bay_aliases = [
+            "Line_Bay_ID",
+            "Line Bay ID",
+            "LineBayID",
+            "LineBay_ID",
+            "Line_Bay_Name",
+            "Line Bay Name",
+            "LineBayName",
+            "Line Bay",
+            "Line_Bay",
+        ]
+        line_bay_col = None
+        for alias in line_bay_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col:
+                line_bay_col = col
+                break
+        bay_keys_raw: list[str] = []
+        if (
+            line_bay_info is not None
+            and hasattr(out_gdf, "geometry")
+            and out_gdf.geometry is not None
+        ):
+            try:
+                spatial_series = build_spatial_match_targets(
+                    out_gdf,
+                    line_bay_info.get("path"),
+                    line_bay_info.get("layer"),
+                    line_bay_info.get("field"),
+                )
+                if spatial_series is not None and len(spatial_series) == len(out_gdf):
+                    vals = [normalize_value_for_compare(v) for v in spatial_series.tolist()]
+                    if any(vals):
+                        bay_keys_raw = vals
+            except Exception:
+                pass
+        if not bay_keys_raw and line_bay_col:
+            bay_keys_raw = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
+        if not bay_keys_raw:
+            return [], {}
+
+        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+        reverse_name_to_id: dict[str, str] = {}
+        if isinstance(id_name_map, dict):
+            for k, v in id_name_map.items():
+                k_norm = normalize_value_for_compare(k)
+                v_norm = normalize_value_for_compare(v)
+                if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                    reverse_name_to_id[v_norm] = k_norm
+
+        def _canon(raw_val: Any) -> str:
+            norm_val = normalize_value_for_compare(raw_val)
+            if not norm_val:
+                return ""
+            return reverse_name_to_id.get(norm_val, norm_val)
+
+        def _extract_base(raw_val: Any) -> int | None:
+            norm_val = _canon(raw_val)
+            if not norm_val:
+                return None
+            try:
+                m = re.search(r"e0*(\d+)", norm_val)
+                if m:
+                    return int(m.group(1))
+                nums = re.findall(r"\d+", norm_val)
+                if nums:
+                    return int(nums[-1])
+            except Exception:
+                return None
+            return None
+
+        bay_keys = [_canon(v) for v in bay_keys_raw]
+        unique = []
+        seen = set()
+        for k in bay_keys:
+            if k not in seen:
+                seen.add(k)
+                unique.append(k)
+        bay_base: dict[str, int] = {}
+        used: set[int] = set()
+        for k in unique:
+            b = _extract_base(k)
+            if b is not None and b > 0:
+                bay_base[k] = b
+                used.add(b)
+        nxt = max(used) + 1 if used else 1
+        for k in unique:
+            if k in bay_base:
+                continue
+            while nxt in used:
+                nxt += 1
+            bay_base[k] = nxt
+            used.add(nxt)
+            nxt += 1
+        return bay_keys, bay_base
+
+    # Post-fill: keep one middle HV CB per bay and rename to CB{bay} (E01 -> CB1, E02 -> CB2).
+    if _matches_device_targets({normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker")}):
+        bay_keys, bay_base = _resolve_bay_keys_and_base()
+        if bay_keys and len(bay_keys) == len(out_gdf):
+            norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
+            cb_id_aliases = ["CircuitBreakerID", "CircuitBreaker_ID", "Circuit Breaker ID", "Circuit BreakerID"]
+            cb_name_aliases = ["Circuit Breaker Name", "CircuitBreakerName", "Name", "name"]
+            cb_id_col = None
+            for alias in cb_id_aliases:
+                col = norm_lookup.get(normalize_for_compare(alias))
+                if col:
+                    cb_id_col = col
+                    break
+            if cb_id_col is None:
+                cb_id_col = "CircuitBreakerID"
+                out_gdf[cb_id_col] = pd.NA
+
+            bay_centroids = line_bay_info.get("bay_centroid_by_key", {}) if isinstance(line_bay_info, dict) else {}
+
+            def _point_dist(idx_val: Any, ref_pt: Any) -> float:
+                if ref_pt is None:
+                    return float("inf")
+                if not hasattr(out_gdf, "geometry"):
+                    return float("inf")
+                try:
+                    geom = out_gdf.loc[idx_val, out_gdf.geometry.name]
+                except Exception:
+                    return float("inf")
+                if geom is None or getattr(geom, "is_empty", True):
+                    return float("inf")
+                try:
+                    pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+                    return float(pt.distance(ref_pt))
+                except Exception:
+                    return float("inf")
+
+            groups: dict[str, list[Any]] = {}
+            for idx_val, key in zip(list(out_gdf.index), bay_keys):
+                groups.setdefault(key, []).append(idx_val)
+
+            selected: list[Any] = []
+            cb_new_ids: dict[Any, str] = {}
+            for key, idxs in groups.items():
+                if not idxs:
+                    continue
+                if not key:
+                    selected.extend(idxs)
+                    continue
+                base = bay_base.get(key)
+                if base is None:
+                    selected.extend(idxs)
+                    continue
+                chosen = None
+                ref_center = bay_centroids.get(key) if isinstance(bay_centroids, dict) else None
+                if ref_center is not None:
+                    try:
+                        chosen = min(idxs, key=lambda i: _point_dist(i, ref_center))
+                    except Exception:
+                        chosen = None
+                if chosen is None:
+                    try:
+                        ordered = order_indices_by_location(out_gdf.loc[idxs].geometry)
+                        if ordered:
+                            chosen = ordered[len(ordered) // 2]
+                    except Exception:
+                        chosen = None
+                if chosen is None:
+                    chosen = idxs[len(idxs) // 2]
+                selected.append(chosen)
+                cb_new_ids[chosen] = f"CB{base}"
+
+            selected_set = set(selected)
+            ordered_selected = [idx_val for idx_val in out_gdf.index if idx_val in selected_set]
+            if ordered_selected:
+                out_gdf = out_gdf.loc[ordered_selected].copy()
+                cb_name_cols: list[str] = []
+                for alias in cb_name_aliases:
+                    col = norm_lookup.get(normalize_for_compare(alias))
+                    if col and col not in cb_name_cols:
+                        cb_name_cols.append(col)
+                for idx_val, newid in cb_new_ids.items():
+                    if idx_val not in out_gdf.index:
+                        continue
+                    out_gdf.at[idx_val, cb_id_col] = newid
+                    for col in cb_name_cols:
+                        out_gdf.at[idx_val, col] = newid
+
+    # Post-fill: keep 2 disconnector switches per bay, Q9-{bay} near VT and Q1-{bay} for the other.
+    if _matches_device_targets({normalize_for_compare("High Voltage Switch/High Voltage Switch")}):
+        bay_keys, bay_base = _resolve_bay_keys_and_base()
+        if bay_keys and len(bay_keys) == len(out_gdf):
+            norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
+            sw_id_aliases = [
+                "HV_Switch_ID",
+                "HV Switch ID",
+                "HVSwitchID",
+                "Disconnector_ID",
+                "Disconnector ID",
+            ]
+            sw_name_aliases = ["HV Switch Name", "HVSwitchName", "Disconnector Switch Name", "Name", "name"]
+            sw_id_col = None
+            for alias in sw_id_aliases:
+                col = norm_lookup.get(normalize_for_compare(alias))
+                if col:
+                    sw_id_col = col
+                    break
+            if sw_id_col is None:
+                sw_id_col = "HV_Switch_ID"
+                out_gdf[sw_id_col] = pd.NA
+
+            bay_centroids = line_bay_info.get("bay_centroid_by_key", {}) if isinstance(line_bay_info, dict) else {}
+            vt_refs = line_bay_info.get("vt_ref_by_key", {}) if isinstance(line_bay_info, dict) else {}
+
+            def _point_dist(idx_val: Any, ref_pt: Any) -> float:
+                if ref_pt is None:
+                    return float("inf")
+                if not hasattr(out_gdf, "geometry"):
+                    return float("inf")
+                try:
+                    geom = out_gdf.loc[idx_val, out_gdf.geometry.name]
+                except Exception:
+                    return float("inf")
+                if geom is None or getattr(geom, "is_empty", True):
+                    return float("inf")
+                try:
+                    pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+                    return float(pt.distance(ref_pt))
+                except Exception:
+                    return float("inf")
+
+            groups: dict[str, list[Any]] = {}
+            for idx_val, key in zip(list(out_gdf.index), bay_keys):
+                groups.setdefault(key, []).append(idx_val)
+
+            selected: list[Any] = []
+            sw_new_ids: dict[Any, str] = {}
+            for key, idxs in groups.items():
+                if not idxs:
+                    continue
+                if not key:
+                    selected.extend(idxs)
+                    continue
+                base = bay_base.get(key)
+                if base is None:
+                    selected.extend(idxs)
+                    continue
+
+                ref_vt = vt_refs.get(key) if isinstance(vt_refs, dict) else None
+                ref_center = bay_centroids.get(key) if isinstance(bay_centroids, dict) else None
+
+                if ref_vt is not None:
+                    q9_idx = min(idxs, key=lambda i: _point_dist(i, ref_vt))
+                elif ref_center is not None:
+                    q9_idx = min(idxs, key=lambda i: _point_dist(i, ref_center))
+                else:
+                    try:
+                        ordered = order_indices_by_location(out_gdf.loc[idxs].geometry)
+                        q9_idx = ordered[len(ordered) // 2] if ordered else idxs[0]
+                    except Exception:
+                        q9_idx = idxs[0]
+
+                selected.append(q9_idx)
+                sw_new_ids[q9_idx] = f"Q9-{base}"
+
+                remaining = [i for i in idxs if i != q9_idx]
+                if remaining:
+                    if ref_vt is not None:
+                        q1_idx = max(remaining, key=lambda i: _point_dist(i, ref_vt))
+                    elif ref_center is not None:
+                        q1_idx = max(remaining, key=lambda i: _point_dist(i, ref_center))
+                    else:
+                        q1_idx = remaining[0]
+                    selected.append(q1_idx)
+                    sw_new_ids[q1_idx] = f"Q1-{base}"
+
+            selected_set = set(selected)
+            ordered_selected = [idx_val for idx_val in out_gdf.index if idx_val in selected_set]
+            if ordered_selected:
+                out_gdf = out_gdf.loc[ordered_selected].copy()
+                sw_name_cols: list[str] = []
+                for alias in sw_name_aliases:
+                    col = norm_lookup.get(normalize_for_compare(alias))
+                    if col and col not in sw_name_cols:
+                        sw_name_cols.append(col)
+                for idx_val, newid in sw_new_ids.items():
+                    if idx_val not in out_gdf.index:
+                        continue
+                    out_gdf.at[idx_val, sw_id_col] = newid
+                    for col in sw_name_cols:
+                        out_gdf.at[idx_val, col] = newid
+
     # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
     hv_name_norm = normalize_for_compare("High Voltage Line")
     hv_match = normalize_for_compare(device_name) == hv_name_norm
@@ -6689,6 +7081,91 @@ def run_app() -> None:
                     )
                     if len(control_panel_polygons_cached) != len(control_panel_instances_cached):
                         control_panel_polygons_cached = []
+
+                if isinstance(line_bay_info, dict):
+                    line_bay_info = dict(line_bay_info)
+                    try:
+                        bay_ref_gdf = load_line_bay_layer(
+                            line_bay_info.get("path"),
+                            line_bay_info.get("layer"),
+                            line_bay_info.get("field"),
+                        )
+                    except Exception:
+                        bay_ref_gdf = None
+                    if bay_ref_gdf is not None and not bay_ref_gdf.empty:
+                        geom_col_ref = bay_ref_gdf.geometry.name if hasattr(bay_ref_gdf, "geometry") else None
+                        bay_val_cols = [c for c in bay_ref_gdf.columns if c != geom_col_ref]
+                        bay_val_col = bay_val_cols[0] if bay_val_cols else None
+
+                        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+                        reverse_name_to_id: dict[str, str] = {}
+                        if isinstance(id_name_map, dict):
+                            for k, v in id_name_map.items():
+                                k_norm = normalize_value_for_compare(k)
+                                v_norm = normalize_value_for_compare(v)
+                                if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                                    reverse_name_to_id[v_norm] = k_norm
+
+                        def _canon_bay_key(raw_val: Any) -> str:
+                            norm_val = normalize_value_for_compare(raw_val)
+                            if not norm_val:
+                                return ""
+                            return reverse_name_to_id.get(norm_val, norm_val)
+
+                        bay_centroid_by_key: dict[str, Any] = {}
+                        if bay_val_col and geom_col_ref:
+                            for _, row in bay_ref_gdf.iterrows():
+                                key = _canon_bay_key(row.get(bay_val_col))
+                                geom = row.get(geom_col_ref)
+                                if not key or geom is None or getattr(geom, "is_empty", True):
+                                    continue
+                                try:
+                                    bay_centroid_by_key[key] = geom.centroid
+                                except Exception:
+                                    try:
+                                        bay_centroid_by_key[key] = geom.representative_point()
+                                    except Exception:
+                                        continue
+                        line_bay_info["bay_centroid_by_key"] = bay_centroid_by_key
+
+                        vt_ref_by_key: dict[str, Any] = {}
+                        if bay_val_col:
+                            vt_norms = {normalize_for_compare("Voltage Transformer")}
+                            vt_points = collect_device_points_from_uploads(
+                                files,
+                                bay_ref_gdf.crs,
+                                device_options,
+                                equip_map_sup,
+                                vt_norms,
+                            )
+                            if vt_points is not None and not vt_points.empty:
+                                points_by_bay = map_points_to_bays(vt_points, bay_ref_gdf)
+                                grouped_pts: dict[str, list[Any]] = {}
+                                for bay_idx, pts in points_by_bay.items():
+                                    if not pts:
+                                        continue
+                                    try:
+                                        bay_row = bay_ref_gdf.iloc[int(bay_idx)]
+                                    except Exception:
+                                        continue
+                                    key = _canon_bay_key(bay_row.get(bay_val_col))
+                                    if not key:
+                                        continue
+                                    grouped_pts.setdefault(key, []).extend(pts)
+                                for key, pts in grouped_pts.items():
+                                    valid_pts = [p for p in pts if p is not None and not getattr(p, "is_empty", True)]
+                                    if not valid_pts:
+                                        continue
+                                    if len(valid_pts) == 1:
+                                        vt_ref_by_key[key] = valid_pts[0]
+                                        continue
+                                    try:
+                                        from shapely.geometry import MultiPoint
+
+                                        vt_ref_by_key[key] = MultiPoint(valid_pts).centroid
+                                    except Exception:
+                                        vt_ref_by_key[key] = valid_pts[0]
+                        line_bay_info["vt_ref_by_key"] = vt_ref_by_key
 
                 for file_obj in files:
                     file_name = _get_file_name(file_obj)
