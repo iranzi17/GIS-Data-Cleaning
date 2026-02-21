@@ -2017,10 +2017,22 @@ def build_control_panel_polygons(
     instances: list[dict[str, Any]],
     cabins_gdf: gpd.GeoDataFrame | None,
     anchors: list[Any] | None = None,
+    fixed_width_m: float | None = None,
+    fixed_depth_m: float | None = None,
 ) -> list[Any]:
-    """Build panel polygons using per-instance sizes, aligned side-by-side inside cabins."""
+    """Build cabin-interior polygons; optionally force a fixed rectangle size for every instance."""
     if cabins_gdf is None or cabins_gdf.empty or not instances:
         return []
+
+    fixed_w = None
+    fixed_d = None
+    if fixed_width_m is not None and fixed_depth_m is not None:
+        try:
+            fixed_w = max(float(fixed_width_m), 0.2)
+            fixed_d = max(float(fixed_depth_m), 0.2)
+        except Exception:
+            fixed_w = None
+            fixed_d = None
 
     def _fallback_layout() -> list[Any]:
         layout = _layout_points_in_cabins(cabins_gdf, len(instances), anchors)
@@ -2032,16 +2044,20 @@ def build_control_panel_polygons(
                 layout.append(last)
         fallback_polys: list[Any] = []
         for inst, (center, cabin_poly) in zip(instances, layout):
-            fields = inst.get("fields", {}) or {}
-            width_val, width_key = _extract_length_from_fields(fields, ["width"])
-            depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
-            width_m = _normalize_length_to_meters(width_val, width_key)
-            depth_m = _normalize_length_to_meters(depth_val, depth_key)
-            default_w, default_d = _default_panel_size_from_poly(cabin_poly)
-            if width_m is None or width_m <= 0:
-                width_m = default_w
-            if depth_m is None or depth_m <= 0:
-                depth_m = default_d
+            if fixed_w is not None and fixed_d is not None:
+                width_m = fixed_w
+                depth_m = fixed_d
+            else:
+                fields = inst.get("fields", {}) or {}
+                width_val, width_key = _extract_length_from_fields(fields, ["width"])
+                depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
+                width_m = _normalize_length_to_meters(width_val, width_key)
+                depth_m = _normalize_length_to_meters(depth_val, depth_key)
+                default_w, default_d = _default_panel_size_from_poly(cabin_poly)
+                if width_m is None or width_m <= 0:
+                    width_m = default_w
+                if depth_m is None or depth_m <= 0:
+                    depth_m = default_d
             try:
                 if cabin_poly is not None:
                     minx, miny, maxx, maxy = cabin_poly.bounds
@@ -2102,16 +2118,20 @@ def build_control_panel_polygons(
         dims: list[tuple[float, float]] = []
         max_depth = 0.0
         for inst in inst_slice:
-            fields = inst.get("fields", {}) or {}
-            width_val, width_key = _extract_length_from_fields(fields, ["width"])
-            depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
-            width_m = _normalize_length_to_meters(width_val, width_key)
-            depth_m = _normalize_length_to_meters(depth_val, depth_key)
-            default_w, default_d = _default_panel_size_from_poly(cabin_poly)
-            if width_m is None or width_m <= 0:
-                width_m = default_w
-            if depth_m is None or depth_m <= 0:
-                depth_m = default_d
+            if fixed_w is not None and fixed_d is not None:
+                width_m = fixed_w
+                depth_m = fixed_d
+            else:
+                fields = inst.get("fields", {}) or {}
+                width_val, width_key = _extract_length_from_fields(fields, ["width"])
+                depth_val, depth_key = _extract_length_from_fields(fields, ["depth", "length"])
+                width_m = _normalize_length_to_meters(width_val, width_key)
+                depth_m = _normalize_length_to_meters(depth_val, depth_key)
+                default_w, default_d = _default_panel_size_from_poly(cabin_poly)
+                if width_m is None or width_m <= 0:
+                    width_m = default_w
+                if depth_m is None or depth_m <= 0:
+                    depth_m = default_d
             width_m = max(width_m, min_size)
             depth_m = max(depth_m, min_size)
             dims.append((width_m, depth_m))
@@ -2201,6 +2221,60 @@ def build_device_gdf_from_instances(
                 except Exception:
                     pass
     return sanitize_gdf_for_gpkg(out_gdf)
+
+
+def build_device_table_from_instances(instances: list[dict[str, Any]]) -> pd.DataFrame:
+    """Build a non-spatial attribute table from supervisor instances."""
+    count = len(instances)
+    if count <= 0:
+        return pd.DataFrame()
+    type_map_local: dict[str, str] = {}
+    for inst in instances:
+        tm = inst.get("type_map") if isinstance(inst, dict) else None
+        if isinstance(tm, dict) and tm:
+            type_map_local = dict(tm)
+            break
+    fields_ordered: list[str] = []
+    fields_seen: set[str] = set()
+    for inst in instances:
+        for f in inst.get("order", []) or []:
+            if f not in fields_seen:
+                fields_seen.add(f)
+                fields_ordered.append(f)
+        for f in (inst.get("fields", {}) or {}).keys():
+            if f not in fields_seen:
+                fields_seen.add(f)
+                fields_ordered.append(f)
+    data: dict[str, list[Any]] = {f: [pd.NA] * count for f in fields_ordered}
+    for idx, inst in enumerate(instances):
+        fields = inst.get("fields", {}) or {}
+        for f, val in fields.items():
+            if f not in data:
+                data[f] = [pd.NA] * count
+            fill_val = val.iloc[0] if isinstance(val, pd.Series) else val
+            data[f][idx] = fill_val
+    out_df = pd.DataFrame(data)
+    if type_map_local:
+        norm_lookup = {normalize_for_compare(k): v for k, v in type_map_local.items() if v is not None}
+        for col in out_df.columns:
+            t_str = type_map_local.get(col) or norm_lookup.get(normalize_for_compare(col))
+            if t_str:
+                try:
+                    out_df[col] = coerce_series_to_type(out_df[col], t_str)
+                except Exception:
+                    pass
+    return out_df
+
+
+def write_aspatial_gpkg_layer(df: pd.DataFrame, out_path: Path, layer_name: str) -> None:
+    """Write a pandas DataFrame as an aspatial GeoPackage layer."""
+    if df is None or df.empty and len(df.columns) == 0:
+        raise ValueError("Cannot write an empty aspatial table with no columns.")
+    safe_df = df.copy()
+    safe_df = safe_df.where(pd.notna(safe_df), None)
+    import pyogrio
+
+    pyogrio.write_dataframe(safe_df, out_path, driver="GPKG", layer=layer_name)
 
 
 def repeat_instances(instances: list[dict[str, Any]], repeat_count: int) -> list[dict[str, Any]]:
@@ -2945,24 +3019,56 @@ def _fill_supervisor_batch(
                 )
                 logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
 
-    cabin_point_devices = [
-        "Distribution Transformer",
-        "Transformer Bay",
+    cabin_aspatial_devices = [
         "Optical Telecommunication Equipment (Telecom)",
         "ODF",
+    ]
+    for dev_name in cabin_aspatial_devices:
+        if normalize_for_compare(dev_name) in uploaded_device_norms:
+            continue
+        instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+        if not instances:
+            logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+            continue
+        out_df = build_device_table_from_instances(instances)
+        if out_df.empty and len(out_df.columns) == 0:
+            logs.append(f"{prefix_label}{dev_name}: skipped (no attributes to write).")
+            continue
+        layer_name = derive_layer_name_from_filename(dev_name)
+        file_name = f"{dev_name}.gpkg"
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+            out_path = Path(tmpout.name)
+        write_aspatial_gpkg_layer(out_df, out_path, layer_name)
+        _record_output(file_name, out_path)
+        run_domain_rows.extend(
+            append_domain_code_log(
+                _collect_domain_log_entries(instances),
+                {
+                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                    "sheet": sup_sheet,
+                    "device": dev_name,
+                    "output": f"{prefix_label}{file_name}",
+                },
+            )
+        )
+        logs.append(f"{prefix_label}{dev_name}: auto-created as non-spatial table ({len(out_df)} record(s)).")
+
+    cabin_point_devices = [
+        "Distribution Transformer",
         "Standby Generator",
     ]
     cabin_polygon_devices = [
         "Control and Protection Panels",
+        "Transformer Bay",
     ]
-    cabin_devices_all = cabin_point_devices + cabin_polygon_devices
-    if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_devices_all):
+    cabin_spatial_devices = cabin_point_devices + cabin_polygon_devices
+    if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_spatial_devices):
         cabin_norms = {normalize_for_compare("Substation/Cabin")}
         cabins_gdf = collect_device_polygons_from_uploads(
             files, None, device_options, equip_map_sup, cabin_norms
         )
         if cabins_gdf is None or cabins_gdf.empty:
-            for dev_name in cabin_devices_all:
+            for dev_name in cabin_spatial_devices:
                 if normalize_for_compare(dev_name) in uploaded_device_norms:
                     continue
                 logs.append(f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded).")
@@ -3012,9 +3118,18 @@ def _fill_supervisor_batch(
                 if not instances:
                     logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
                     continue
-                polygons = build_control_panel_polygons(instances, cabins_gdf, cabin_anchor_points)
+                if normalize_for_compare(dev_name) == normalize_for_compare("Transformer Bay"):
+                    polygons = build_control_panel_polygons(
+                        instances,
+                        cabins_gdf,
+                        cabin_anchor_points,
+                        fixed_width_m=0.8,
+                        fixed_depth_m=1.0,
+                    )
+                else:
+                    polygons = build_control_panel_polygons(instances, cabins_gdf, cabin_anchor_points)
                 if not polygons or len(polygons) != len(instances):
-                    logs.append(f"{prefix_label}{dev_name}: cabin panel layout failed (no polygons).")
+                    logs.append(f"{prefix_label}{dev_name}: cabin polygon layout failed (no polygons).")
                     continue
                 out_gdf = build_device_gdf_from_instances(instances, polygons, cabins_gdf.crs)
                 layer_name = derive_layer_name_from_filename(dev_name)
@@ -3961,6 +4076,11 @@ LINE_BAY_SPATIAL_DEVICES = {
 
 PREFIX_GROUP_DEVICES = {
     normalize_for_compare("High Voltage Switch/High Voltage Switch"),
+}
+
+ASPATIAL_DEVICES = {
+    normalize_for_compare("Optical Telecommunication Equipment (Telecom)"),
+    normalize_for_compare("ODF"),
 }
 
 # Substation fields to preserve from uploaded GPKG (do not overwrite).
@@ -5438,6 +5558,13 @@ def fill_one_gpkg(
                     out_gdf[col_name] = coerce_series_to_type(out_gdf[col_name], t_str)
                 except Exception:
                     pass
+    if normalize_for_compare(device_name) in ASPATIAL_DEVICES:
+        geom_name_out = out_gdf.geometry.name if hasattr(out_gdf, "geometry") else None
+        out_df = pd.DataFrame(out_gdf.drop(columns=[geom_name_out], errors="ignore"))
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+            out_path = Path(tmpout.name)
+        write_aspatial_gpkg_layer(out_df, out_path, layer)
+        return out_path, layer
     with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
         out_path = Path(tmpout.name)
     out_gdf.to_file(out_path, driver="GPKG", layer=layer)
@@ -6378,24 +6505,58 @@ def run_app() -> None:
                             )
                             logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
 
-                cabin_point_devices = [
-                    "Distribution Transformer",
-                    "Transformer Bay",
+                cabin_aspatial_devices = [
                     "Optical Telecommunication Equipment (Telecom)",
                     "ODF",
+                ]
+                for dev_name in cabin_aspatial_devices:
+                    if normalize_for_compare(dev_name) in uploaded_device_norms:
+                        continue
+                    instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                    if not instances:
+                        logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
+                        continue
+                    out_df = build_device_table_from_instances(instances)
+                    if out_df.empty and len(out_df.columns) == 0:
+                        logs.append(f"{prefix_label}{dev_name}: skipped (no attributes to write).")
+                        continue
+                    layer_name = derive_layer_name_from_filename(dev_name)
+                    file_name = f"{dev_name}.gpkg"
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                        out_path = Path(tmpout.name)
+                    write_aspatial_gpkg_layer(out_df, out_path, layer_name)
+                    _record_output(file_name, out_path)
+                    run_domain_rows.extend(
+                        append_domain_code_log(
+                            _collect_domain_log_entries(instances),
+                            {
+                                "workbook": sup_wb_path.name if sup_wb_path else None,
+                                "sheet": sup_sheet,
+                                "device": dev_name,
+                                "output": f"{prefix_label}{file_name}",
+                            },
+                        )
+                    )
+                    logs.append(
+                        f"{prefix_label}{dev_name}: auto-created as non-spatial table ({len(out_df)} record(s))."
+                    )
+
+                cabin_point_devices = [
+                    "Distribution Transformer",
                     "Standby Generator",
                 ]
                 cabin_polygon_devices = [
                     "Control and Protection Panels",
+                    "Transformer Bay",
                 ]
-                cabin_devices_all = cabin_point_devices + cabin_polygon_devices
-                if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_devices_all):
+                cabin_spatial_devices = cabin_point_devices + cabin_polygon_devices
+                if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_spatial_devices):
                     cabin_norms = {normalize_for_compare("Substation/Cabin")}
                     cabins_gdf = collect_device_polygons_from_uploads(
                         files, None, device_options, equip_map_sup, cabin_norms
                     )
                     if cabins_gdf is None or cabins_gdf.empty:
-                        for dev_name in cabin_devices_all:
+                        for dev_name in cabin_spatial_devices:
                             if normalize_for_compare(dev_name) in uploaded_device_norms:
                                 continue
                             logs.append(
@@ -6451,12 +6612,21 @@ def run_app() -> None:
                             if not instances:
                                 logs.append(f"{prefix_label}{dev_name}: skipped (no instances in sheet).")
                                 continue
-                            polygons = build_control_panel_polygons(
-                                instances, cabins_gdf, cabin_anchor_points
-                            )
+                            if normalize_for_compare(dev_name) == normalize_for_compare("Transformer Bay"):
+                                polygons = build_control_panel_polygons(
+                                    instances,
+                                    cabins_gdf,
+                                    cabin_anchor_points,
+                                    fixed_width_m=0.8,
+                                    fixed_depth_m=1.0,
+                                )
+                            else:
+                                polygons = build_control_panel_polygons(
+                                    instances, cabins_gdf, cabin_anchor_points
+                                )
                             if not polygons or len(polygons) != len(instances):
                                 logs.append(
-                                    f"{prefix_label}{dev_name}: cabin panel layout failed (no polygons)."
+                                    f"{prefix_label}{dev_name}: cabin polygon layout failed (no polygons)."
                                 )
                                 continue
                             out_gdf = build_device_gdf_from_instances(instances, polygons, cabins_gdf.crs)
