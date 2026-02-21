@@ -5615,6 +5615,9 @@ def fill_one_gpkg(
             "Line Bay ID",
             "LineBayID",
             "LineBay_ID",
+            "Line_Bay_Name",
+            "Line Bay Name",
+            "LineBayName",
             "Line Bay",
             "Line_Bay",
         ]
@@ -5625,13 +5628,43 @@ def fill_one_gpkg(
             "Voltage Transformer Id",
             "VoltageTransformerID",
         ]
+        vt_name_aliases = [
+            "Voltage Transformer Name",
+            "VoltageTransfomer_Name",
+            "VoltageTransformerName",
+            "Name",
+            "name",
+        ]
         line_bay_col = None
         for alias in line_bay_aliases:
             col = norm_lookup.get(normalize_for_compare(alias))
             if col:
                 line_bay_col = col
                 break
-        if line_bay_col:
+
+        bay_keys: list[str] = []
+        if (
+            line_bay_info is not None
+            and hasattr(out_gdf, "geometry")
+            and out_gdf.geometry is not None
+        ):
+            try:
+                spatial_series = build_spatial_match_targets(
+                    out_gdf,
+                    line_bay_info.get("path"),
+                    line_bay_info.get("layer"),
+                    line_bay_info.get("field"),
+                )
+                if spatial_series is not None and len(spatial_series) == len(out_gdf):
+                    spatial_keys = [normalize_value_for_compare(v) for v in spatial_series.tolist()]
+                    if any(spatial_keys):
+                        bay_keys = spatial_keys
+            except Exception:
+                pass
+        if not bay_keys and line_bay_col:
+            bay_keys = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
+
+        if bay_keys:
             vt_id_col = None
             for alias in vt_id_aliases:
                 col = norm_lookup.get(normalize_for_compare(alias))
@@ -5642,34 +5675,55 @@ def fill_one_gpkg(
                 vt_id_col = "VoltageTransfomer_ID"
                 out_gdf[vt_id_col] = pd.NA
 
-            bay_series = out_gdf[line_bay_col]
-            unique_bays: list[tuple[str, Any]] = []
+            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+            reverse_name_to_id: dict[str, str] = {}
+            if isinstance(id_name_map, dict):
+                for k, v in id_name_map.items():
+                    k_norm = normalize_value_for_compare(k)
+                    v_norm = normalize_value_for_compare(v)
+                    if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                        reverse_name_to_id[v_norm] = k_norm
+
+            def _canonical_bay_key(raw_val: Any) -> str:
+                norm_val = normalize_value_for_compare(raw_val)
+                if not norm_val:
+                    return ""
+                return reverse_name_to_id.get(norm_val, norm_val)
+
+            unique_bays: list[str] = []
             seen_bays: set[str] = set()
-            for raw in bay_series:
-                key = normalize_value_for_compare(raw)
+            for raw in bay_keys:
+                key = _canonical_bay_key(raw)
                 if key not in seen_bays:
                     seen_bays.add(key)
-                    unique_bays.append((key, raw))
+                    unique_bays.append(key)
 
             def _extract_base(raw_val: Any) -> int | None:
+                norm_val = _canonical_bay_key(raw_val)
+                if not norm_val:
+                    return None
                 try:
-                    digits = re.findall(r"\d+", str(raw_val))
+                    match = re.search(r"e0*(\d+)", norm_val)
+                    if match:
+                        return int(match.group(1))
+                    digits = re.findall(r"\d+", norm_val)
                     if digits:
-                        return int(digits[0])
+                        # Prefer the trailing numeric token (e.g., "line5e03" -> 3).
+                        return int(digits[-1])
                 except Exception:
                     return None
                 return None
 
             bay_base: dict[str, int] = {}
             used_bases: set[int] = set()
-            for key, raw in unique_bays:
-                base = _extract_base(raw)
+            for key in unique_bays:
+                base = _extract_base(key)
                 if base is not None and base > 0:
                     bay_base[key] = base
                     used_bases.add(base)
 
             next_base = max(used_bases) + 1 if used_bases else 1
-            for key, _raw in unique_bays:
+            for key in unique_bays:
                 if key in bay_base:
                     continue
                 while next_base in used_bases:
@@ -5680,8 +5734,8 @@ def fill_one_gpkg(
 
             bay_counts: dict[str, int] = {}
             new_ids: list[str] = []
-            for raw in bay_series:
-                key = normalize_value_for_compare(raw)
+            for raw in bay_keys:
+                key = _canonical_bay_key(raw)
                 base = bay_base.get(key)
                 if base is None:
                     while next_base in used_bases:
@@ -5694,6 +5748,14 @@ def fill_one_gpkg(
                 seq = bay_counts[key]
                 new_ids.append(f"VT{base}-{seq}")
             out_gdf[vt_id_col] = new_ids
+
+            vt_name_cols: list[str] = []
+            for alias in vt_name_aliases:
+                col = norm_lookup.get(normalize_for_compare(alias))
+                if col and col not in vt_name_cols:
+                    vt_name_cols.append(col)
+            for col in vt_name_cols:
+                out_gdf[col] = new_ids
 
     # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
     hv_name_norm = normalize_for_compare("High Voltage Line")
