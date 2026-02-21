@@ -2023,6 +2023,89 @@ def _build_panel_rectangle(
     return rect
 
 
+def _build_oriented_panel_rectangle(
+    center_along: float,
+    center_perp: float,
+    width_m: float,
+    depth_m: float,
+    ux: float,
+    uy: float,
+    px: float,
+    py: float,
+    cx: float,
+    cy: float,
+    cabin_poly: Any | None = None,
+) -> Any:
+    """Build a rectangle oriented by cabin dominant axis, shrinking if needed to stay inside."""
+    try:
+        from shapely.geometry import Polygon
+    except Exception:
+        return None
+
+    half_w = max(width_m, 0.2) / 2.0
+    half_d = max(depth_m, 0.2) / 2.0
+
+    def _to_world(along: float, perp: float) -> tuple[float, float]:
+        x = cx + along * ux + perp * px
+        y = cy + along * uy + perp * py
+        return float(x), float(y)
+
+    rect = Polygon(
+        [
+            _to_world(center_along - half_w, center_perp - half_d),
+            _to_world(center_along + half_w, center_perp - half_d),
+            _to_world(center_along + half_w, center_perp + half_d),
+            _to_world(center_along - half_w, center_perp + half_d),
+        ]
+    )
+    if cabin_poly is None:
+        return rect
+    try:
+        if cabin_poly.contains(rect):
+            return rect
+    except Exception:
+        return rect
+
+    for factor in (0.9, 0.8, 0.7, 0.6, 0.5, 0.4):
+        w_try = half_w * factor
+        d_try = half_d * factor
+        rect_try = Polygon(
+            [
+                _to_world(center_along - w_try, center_perp - d_try),
+                _to_world(center_along + w_try, center_perp - d_try),
+                _to_world(center_along + w_try, center_perp + d_try),
+                _to_world(center_along - w_try, center_perp + d_try),
+            ]
+        )
+        try:
+            if cabin_poly.contains(rect_try):
+                return rect_try
+        except Exception:
+            continue
+    return rect
+
+
+def build_points_in_panel_polygons(panel_polygons: list[Any] | None, count: int) -> list[Any]:
+    """Create point(s) inside panel polygons, cycling when counts differ."""
+    if count <= 0 or not panel_polygons:
+        return []
+    points: list[Any] = []
+    usable = [poly for poly in panel_polygons if poly is not None and not getattr(poly, "is_empty", True)]
+    if not usable:
+        return []
+    for i in range(count):
+        poly = usable[i % len(usable)]
+        try:
+            pt = poly.representative_point()
+        except Exception:
+            try:
+                pt = poly.centroid
+            except Exception:
+                continue
+        points.append(pt)
+    return points
+
+
 def build_control_panel_polygons(
     instances: list[dict[str, Any]],
     cabins_gdf: gpd.GeoDataFrame | None,
@@ -2030,7 +2113,7 @@ def build_control_panel_polygons(
     fixed_width_m: float | None = None,
     fixed_depth_m: float | None = None,
 ) -> list[Any]:
-    """Build cabin-interior polygons; optionally force a fixed rectangle size for every instance."""
+    """Build cabin-interior panel polygons arranged along the long side of each cabin."""
     if cabins_gdf is None or cabins_gdf.empty or not instances:
         return []
 
@@ -2098,9 +2181,8 @@ def build_control_panel_polygons(
     remainder = total % n_cabins
     counts = [base + (1 if i < remainder else 0) for i in range(n_cabins)]
 
-    panel_gap = 0.0  # snap panels directly against each other
+    panel_gap = 0.0
     min_size = 0.2
-
     out_polys: list[Any] = []
     inst_idx = 0
     for idx, cabin_poly in enumerate(cabin_polys):
@@ -2110,20 +2192,32 @@ def build_control_panel_polygons(
         inst_slice = instances[inst_idx : inst_idx + c]
         inst_idx += c
 
-        try:
-            minx, miny, maxx, maxy = cabin_poly.bounds
-            bbox_w = maxx - minx
-            bbox_h = maxy - miny
-        except Exception:
+        coords = _get_polygon_coords(cabin_poly)
+        if not coords:
+            return _fallback_layout()
+        ux, uy, cx, cy = _dominant_axis_from_coords(coords)
+        px, py = -uy, ux
+
+        alongs: list[float] = []
+        perps: list[float] = []
+        for x, y in coords:
+            dx = x - cx
+            dy = y - cy
+            alongs.append(dx * ux + dy * uy)
+            perps.append(-dx * uy + dy * ux)
+        min_along = min(alongs)
+        max_along = max(alongs)
+        min_perp = min(perps)
+        max_perp = max(perps)
+        span_along = max_along - min_along
+        span_perp = max_perp - min_perp
+        if span_along <= 0 or span_perp <= 0:
             return _fallback_layout()
 
-        if bbox_w <= 0 or bbox_h <= 0:
-            return _fallback_layout()
-
-        margin_x = max(bbox_w * 0.05, 0.2)
-        margin_y = max(bbox_h * 0.05, 0.2)
-        usable_w = max(bbox_w - 2 * margin_x, min_size * c)
-        usable_h = max(bbox_h - 2 * margin_y, min_size)
+        margin_along = max(span_along * 0.05, 0.2)
+        margin_perp = max(span_perp * 0.08, 0.2)
+        usable_along = max(span_along - 2 * margin_along, min_size * c)
+        usable_perp = max(span_perp - 2 * margin_perp, min_size)
 
         dims: list[tuple[float, float]] = []
         max_depth = 0.0
@@ -2148,34 +2242,62 @@ def build_control_panel_polygons(
             if depth_m > max_depth:
                 max_depth = depth_m
 
-        # Scale depths to fit cabin height (keep common top alignment).
-        if usable_h > 0 and max_depth > usable_h * 0.8:
-            depth_scale = (usable_h * 0.8) / max_depth
-            dims = [(w, max(min_size, d * depth_scale)) for w, d in dims]
+        if usable_perp > 0 and max_depth > usable_perp * 0.8:
+            scale_d = (usable_perp * 0.8) / max_depth
+            dims = [(w, max(min_size, d * scale_d)) for w, d in dims]
             max_depth = max(d for _, d in dims) if dims else max_depth
 
         total_w = sum(w for w, _ in dims) + panel_gap * max(c - 1, 0)
-        if total_w > usable_w and total_w > 0:
-            scale = usable_w / total_w
-            dims = [(max(min_size, w * scale), d) for w, d in dims]
+        if total_w > usable_along and total_w > 0:
+            scale_w = usable_along / total_w
+            dims = [(max(min_size, w * scale_w), d) for w, d in dims]
             total_w = sum(w for w, _ in dims) + panel_gap * max(c - 1, 0)
 
-        top_y = maxy - margin_y
-        current_x = minx + margin_x
-        for (width_m, depth_m) in dims:
-            center_x = current_x + width_m / 2.0
-            center_y = top_y - depth_m / 2.0
+        anchor = anchors[idx] if anchors and idx < len(anchors) else None
+        anchor_perp = None
+        if anchor is not None:
             try:
-                from shapely.geometry import Point
-
-                center = Point(center_x, center_y)
+                adx = float(anchor.x) - cx
+                ady = float(anchor.y) - cy
+                anchor_perp = -adx * uy + ady * ux
             except Exception:
-                center = None
-            poly = _build_panel_rectangle(center, width_m, depth_m, cabin_poly)
+                anchor_perp = None
+
+        if anchor_perp is not None:
+            dist_to_max = abs(anchor_perp - max_perp)
+            dist_to_min = abs(anchor_perp - min_perp)
+            use_max_side = dist_to_max <= dist_to_min
+        else:
+            use_max_side = True
+
+        if use_max_side:
+            side_perp = max_perp - margin_perp
+            inward_sign = -1.0
+        else:
+            side_perp = min_perp + margin_perp
+            inward_sign = 1.0
+
+        current_along = min_along + margin_along
+        for width_m, depth_m in dims:
+            center_along = current_along + width_m / 2.0
+            center_perp = side_perp + inward_sign * (depth_m / 2.0)
+            poly = _build_oriented_panel_rectangle(
+                center_along,
+                center_perp,
+                width_m,
+                depth_m,
+                ux,
+                uy,
+                px,
+                py,
+                cx,
+                cy,
+                cabin_poly,
+            )
             if poly is None:
                 return _fallback_layout()
             out_polys.append(poly)
-            current_x += width_m + panel_gap
+            current_along += width_m + panel_gap
 
     if len(out_polys) != len(instances):
         return _fallback_layout()
@@ -2894,6 +3016,35 @@ def _fill_supervisor_batch(
                     return inst
         return instances[0]
 
+    cabin_norms = {normalize_for_compare("Substation/Cabin")}
+    cabins_gdf_cached = collect_device_polygons_from_uploads(
+        files, None, device_options, equip_map_sup, cabin_norms
+    )
+    cabin_anchor_points_cached: list[Any] = []
+    if cabins_gdf_cached is not None and not cabins_gdf_cached.empty:
+        cabin_anchor_points_cached = build_cabin_anchor_points(
+            files,
+            cabins_gdf_cached,
+            device_options,
+            equip_map_sup,
+        )
+    control_panel_instances_cached = parse_supervisor_device_table(
+        sup_wb_path, sup_sheet, "Control and Protection Panels"
+    )
+    control_panel_polygons_cached: list[Any] = []
+    if (
+        cabins_gdf_cached is not None
+        and not cabins_gdf_cached.empty
+        and control_panel_instances_cached
+    ):
+        control_panel_polygons_cached = build_control_panel_polygons(
+            control_panel_instances_cached,
+            cabins_gdf_cached,
+            cabin_anchor_points_cached,
+        )
+        if len(control_panel_polygons_cached) != len(control_panel_instances_cached):
+            control_panel_polygons_cached = []
+
     for file_obj in files:
         file_name = _get_file_name(file_obj)
         try:
@@ -2910,12 +3061,8 @@ def _fill_supervisor_batch(
                 )
                 continue
             device_norm = normalize_for_compare(device_for_file)
-            if device_norm in FORCED_CABIN_AUTO_CREATE_DEVICES:
-                logs.append(
-                    f"{prefix_label}{file_name}: skipped uploaded fill for '{device_for_file}' (forced cabin auto-create)."
-                )
-                continue
-            uploaded_device_norms.add(device_norm)
+            if device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
+                uploaded_device_norms.add(device_norm)
             if device_for_file not in instance_cache:
                 instance_cache[device_for_file] = parse_supervisor_device_table(
                     sup_wb_path, sup_sheet, device_for_file
@@ -2967,6 +3114,7 @@ def _fill_supervisor_batch(
                 sup_wb_path=sup_wb_path,
                 sup_sheet=sup_sheet,
                 seq_assign_fallback=seq_assign_fallback,
+                control_panel_polygons=control_panel_polygons_cached,
             )
             _record_output(file_name, out_path)
             log_instances = [inst] if inst else cached_instances
@@ -2990,10 +3138,13 @@ def _fill_supervisor_batch(
             _record_output(file_name, out_path)
             logs.append(f"{prefix_label}{file_name}: failed ({exc}); kept original file.")
 
+    protection_devices = [
+        dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
+    ]
+    anchor = None
+    anchor_crs = None
+    spacing_val = PROTECTION_LAYOUT_SPACING
     if ups_anchor_info:
-        protection_devices = [
-            dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
-        ]
         anchor, anchor_crs = load_ups_anchor_and_crs(
             ups_anchor_info.get("path"),
             ups_anchor_info.get("layer"),
@@ -3002,38 +3153,46 @@ def _fill_supervisor_batch(
             spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
         except Exception:
             spacing_val = PROTECTION_LAYOUT_SPACING
-        if anchor is None:
-            logs.append(f"{prefix_label}Protection auto-create skipped: UPS anchor could not be resolved.")
-        else:
-            for dev_name in protection_devices:
-                if normalize_for_compare(dev_name) in uploaded_device_norms:
-                    continue
-                instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
-                if not instances:
-                    continue
-                points = build_protection_layout_points(anchor, len(instances), spacing_val)
-                if not points or len(points) != len(instances):
-                    logs.append(f"{prefix_label}{dev_name}: protection layout failed (no points).")
-                    continue
-                out_gdf = build_device_gdf_from_instances(instances, points, anchor_crs)
-                layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
-                with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                    out_path = Path(tmpout.name)
-                out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                file_name = f"{layer_name}.gpkg"
-                _record_output(file_name, out_path)
-                run_domain_rows.extend(
-                    append_domain_code_log(
-                        _collect_domain_log_entries(instances),
-                        {
-                            "workbook": sup_wb_path.name if sup_wb_path else None,
-                            "sheet": sup_sheet,
-                            "device": dev_name,
-                            "output": f"{prefix_label}{file_name}",
-                        },
-                    )
-                )
-                logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
+    if protection_devices and not control_panel_polygons_cached and ups_anchor_info and anchor is None:
+        logs.append(f"{prefix_label}Protection auto-create skipped: UPS anchor could not be resolved.")
+    for dev_name in protection_devices:
+        if normalize_for_compare(dev_name) in uploaded_device_norms:
+            continue
+        instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+        if not instances:
+            continue
+        points: list[Any] = []
+        points_crs = anchor_crs
+        if control_panel_polygons_cached:
+            points = build_points_in_panel_polygons(control_panel_polygons_cached, len(instances))
+            if cabins_gdf_cached is not None:
+                points_crs = cabins_gdf_cached.crs
+        if (not points or len(points) != len(instances)) and anchor is not None:
+            points = build_protection_layout_points(anchor, len(instances), spacing_val)
+            points_crs = anchor_crs
+        if not points or len(points) != len(instances):
+            logs.append(f"{prefix_label}{dev_name}: protection layout failed (no points).")
+            continue
+        out_gdf = build_device_gdf_from_instances(instances, points, points_crs)
+        layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+            out_path = Path(tmpout.name)
+        out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+        file_name = f"{layer_name}.gpkg"
+        _record_output(file_name, out_path)
+        run_domain_rows.extend(
+            append_domain_code_log(
+                _collect_domain_log_entries(instances),
+                {
+                    "workbook": sup_wb_path.name if sup_wb_path else None,
+                    "sheet": sup_sheet,
+                    "device": dev_name,
+                    "output": f"{prefix_label}{file_name}",
+                },
+            )
+        )
+        src_label = "control panels" if control_panel_polygons_cached else "UPS anchor"
+        logs.append(f"{prefix_label}{dev_name}: auto-created protection points from {src_label} ({len(points)}).")
 
     cabin_aspatial_devices = [
         "Optical Telecommunication Equipment (Telecom)",
@@ -3079,22 +3238,14 @@ def _fill_supervisor_batch(
     ]
     cabin_spatial_devices = cabin_point_devices + cabin_polygon_devices
     if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_spatial_devices):
-        cabin_norms = {normalize_for_compare("Substation/Cabin")}
-        cabins_gdf = collect_device_polygons_from_uploads(
-            files, None, device_options, equip_map_sup, cabin_norms
-        )
+        cabins_gdf = cabins_gdf_cached
         if cabins_gdf is None or cabins_gdf.empty:
             for dev_name in cabin_spatial_devices:
                 if normalize_for_compare(dev_name) in uploaded_device_norms:
                     continue
                 logs.append(f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded).")
         else:
-            cabin_anchor_points = build_cabin_anchor_points(
-                files,
-                cabins_gdf,
-                device_options,
-                equip_map_sup,
-            )
+            cabin_anchor_points = cabin_anchor_points_cached
             for dev_name in cabin_point_devices:
                 if normalize_for_compare(dev_name) in uploaded_device_norms:
                     continue
@@ -4796,6 +4947,7 @@ def fill_one_gpkg(
     sup_wb_path: Path | None = None,
     sup_sheet: str | None = None,
     seq_assign_fallback: bool = True,
+    control_panel_polygons: list[Any] | None = None,
 ) -> tuple[Path, str]:
     # normalize sequential_instances to a list of entries with fields + optional ids
     seq_entries: list[dict[str, Any]] = []
@@ -4922,44 +5074,50 @@ def fill_one_gpkg(
     def _is_preserved_field(field_name: Any) -> bool:
         return normalize_for_compare(field_name) in preserve_norms
     layout_applied = False
-    if (
-        ups_anchor_info
-        and normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES
-        and hasattr(gdf_sup_local, "geometry")
-    ):
+    if normalize_for_compare(device_name) in PROTECTION_LAYOUT_DEVICES and hasattr(gdf_sup_local, "geometry"):
         desired_count = len(gdf_sup_local)
         if seq_entries and len(seq_entries) > desired_count:
             desired_count = len(seq_entries)
-        anchor = resolve_ups_anchor_point(
-            ups_anchor_info.get("path"),
-            ups_anchor_info.get("layer"),
-            gdf_sup_local.crs,
-        )
-        try:
-            spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
-        except Exception:
-            spacing_val = PROTECTION_LAYOUT_SPACING
-        if anchor is not None:
-            layout_applied = True
+
+        def _apply_layout_points(points: list[Any]) -> bool:
+            nonlocal gdf_sup_local
+            if not points or len(points) != desired_count:
+                return False
             if desired_count > len(gdf_sup_local):
                 extra = desired_count - len(gdf_sup_local)
-                extra_points = build_protection_layout_points(anchor, extra, spacing_val)
-                if extra_points and len(extra_points) == extra:
-                    extra_rows = pd.DataFrame(
-                        {col: [pd.NA] * extra for col in gdf_sup_local.columns}
+                extra_rows = pd.DataFrame({col: [pd.NA] * extra for col in gdf_sup_local.columns})
+                gdf_sup_local = pd.concat([gdf_sup_local, extra_rows], ignore_index=True)
+                if geom_name:
+                    gdf_sup_local = gpd.GeoDataFrame(
+                        gdf_sup_local,
+                        geometry=geom_name,
+                        crs=geom_crs,
                     )
-                    gdf_sup_local = pd.concat(
-                        [gdf_sup_local, extra_rows],
-                        ignore_index=True,
-                    )
-                    if geom_name:
-                        gdf_sup_local = gpd.GeoDataFrame(
-                            gdf_sup_local,
-                            geometry=geom_name,
-                            crs=geom_crs,
-                        )
-                    gdf_sup_local = gdf_sup_local.copy()
-                    gdf_sup_local.geometry.iloc[-extra:] = extra_points
+            gdf_sup_local = gdf_sup_local.copy()
+            for idx_pt, pt in enumerate(points):
+                try:
+                    gdf_sup_local.geometry.iat[idx_pt] = pt
+                except Exception:
+                    continue
+            return True
+
+        panel_points = build_points_in_panel_polygons(control_panel_polygons, desired_count)
+        if panel_points and _apply_layout_points(panel_points):
+            layout_applied = True
+        elif ups_anchor_info:
+            anchor = resolve_ups_anchor_point(
+                ups_anchor_info.get("path"),
+                ups_anchor_info.get("layer"),
+                gdf_sup_local.crs,
+            )
+            try:
+                spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
+            except Exception:
+                spacing_val = PROTECTION_LAYOUT_SPACING
+            if anchor is not None:
+                layout_points = build_protection_layout_points(anchor, desired_count, spacing_val)
+                if _apply_layout_points(layout_points):
+                    layout_applied = True
     fm_local = field_map
     order_local = field_order or []
     if fm_local is None and match_column is None:
@@ -6402,6 +6560,34 @@ def run_app() -> None:
                     return instances[0]
 
                 prefix_label = f"{output_prefix}/" if output_prefix else ""
+                cabin_norms = {normalize_for_compare("Substation/Cabin")}
+                cabins_gdf_cached = collect_device_polygons_from_uploads(
+                    files, None, device_options, equip_map_sup, cabin_norms
+                )
+                cabin_anchor_points_cached: list[Any] = []
+                if cabins_gdf_cached is not None and not cabins_gdf_cached.empty:
+                    cabin_anchor_points_cached = build_cabin_anchor_points(
+                        files,
+                        cabins_gdf_cached,
+                        device_options,
+                        equip_map_sup,
+                    )
+                control_panel_instances_cached = parse_supervisor_device_table(
+                    sup_wb_path, sup_sheet, "Control and Protection Panels"
+                )
+                control_panel_polygons_cached: list[Any] = []
+                if (
+                    cabins_gdf_cached is not None
+                    and not cabins_gdf_cached.empty
+                    and control_panel_instances_cached
+                ):
+                    control_panel_polygons_cached = build_control_panel_polygons(
+                        control_panel_instances_cached,
+                        cabins_gdf_cached,
+                        cabin_anchor_points_cached,
+                    )
+                    if len(control_panel_polygons_cached) != len(control_panel_instances_cached):
+                        control_panel_polygons_cached = []
 
                 for file_obj in files:
                     file_name = _get_file_name(file_obj)
@@ -6419,12 +6605,8 @@ def run_app() -> None:
                             )
                             continue
                         device_norm = normalize_for_compare(device_for_file)
-                        if device_norm in FORCED_CABIN_AUTO_CREATE_DEVICES:
-                            logs.append(
-                                f"{prefix_label}{file_name}: skipped uploaded fill for '{device_for_file}' (forced cabin auto-create)."
-                            )
-                            continue
-                        uploaded_device_norms.add(device_norm)
+                        if device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
+                            uploaded_device_norms.add(device_norm)
                         if device_for_file not in instance_cache:
                             instance_cache[device_for_file] = parse_supervisor_device_table(
                                 sup_wb_path, sup_sheet, device_for_file
@@ -6476,6 +6658,7 @@ def run_app() -> None:
                             sup_wb_path=sup_wb_path,
                             sup_sheet=sup_sheet,
                             seq_assign_fallback=seq_assign_fallback,
+                            control_panel_polygons=control_panel_polygons_cached,
                         )
                         _record_output(file_name, out_path)
                         log_instances = [inst] if inst else cached_instances
@@ -6499,10 +6682,13 @@ def run_app() -> None:
                         _record_output(file_name, out_path)
                         logs.append(f"{prefix_label}{file_name}: failed ({exc}); kept original file.")
 
+                protection_devices = [
+                    dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
+                ]
+                anchor = None
+                anchor_crs = None
+                spacing_val = PROTECTION_LAYOUT_SPACING
                 if ups_anchor_info:
-                    protection_devices = [
-                        dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
-                    ]
                     anchor, anchor_crs = load_ups_anchor_and_crs(
                         ups_anchor_info.get("path"),
                         ups_anchor_info.get("layer"),
@@ -6511,38 +6697,46 @@ def run_app() -> None:
                         spacing_val = float(ups_anchor_info.get("spacing", PROTECTION_LAYOUT_SPACING))
                     except Exception:
                         spacing_val = PROTECTION_LAYOUT_SPACING
-                    if anchor is None:
-                        logs.append(f"{prefix_label}Protection auto-create skipped: UPS anchor could not be resolved.")
-                    else:
-                        for dev_name in protection_devices:
-                            if normalize_for_compare(dev_name) in uploaded_device_norms:
-                                continue
-                            instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
-                            if not instances:
-                                continue
-                            points = build_protection_layout_points(anchor, len(instances), spacing_val)
-                            if not points or len(points) != len(instances):
-                                logs.append(f"{prefix_label}{dev_name}: protection layout failed (no points).")
-                                continue
-                            out_gdf = build_device_gdf_from_instances(instances, points, anchor_crs)
-                            layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
-                            with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
-                                out_path = Path(tmpout.name)
-                            out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
-                            file_name = f"{layer_name}.gpkg"
-                            _record_output(file_name, out_path)
-                            run_domain_rows.extend(
-                                append_domain_code_log(
-                                    _collect_domain_log_entries(instances),
-                                    {
-                                        "workbook": sup_wb_path.name if sup_wb_path else None,
-                                        "sheet": sup_sheet,
-                                        "device": dev_name,
-                                        "output": f"{prefix_label}{file_name}",
-                                    },
-                                )
-                            )
-                            logs.append(f"{prefix_label}{dev_name}: auto-created protection points ({len(points)}).")
+                if protection_devices and not control_panel_polygons_cached and ups_anchor_info and anchor is None:
+                    logs.append(f"{prefix_label}Protection auto-create skipped: UPS anchor could not be resolved.")
+                for dev_name in protection_devices:
+                    if normalize_for_compare(dev_name) in uploaded_device_norms:
+                        continue
+                    instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+                    if not instances:
+                        continue
+                    points: list[Any] = []
+                    points_crs = anchor_crs
+                    if control_panel_polygons_cached:
+                        points = build_points_in_panel_polygons(control_panel_polygons_cached, len(instances))
+                        if cabins_gdf_cached is not None:
+                            points_crs = cabins_gdf_cached.crs
+                    if (not points or len(points) != len(instances)) and anchor is not None:
+                        points = build_protection_layout_points(anchor, len(instances), spacing_val)
+                        points_crs = anchor_crs
+                    if not points or len(points) != len(instances):
+                        logs.append(f"{prefix_label}{dev_name}: protection layout failed (no points).")
+                        continue
+                    out_gdf = build_device_gdf_from_instances(instances, points, points_crs)
+                    layer_name = derive_layer_name_from_filename(f"{dev_name}.gpkg")
+                    with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+                        out_path = Path(tmpout.name)
+                    out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                    file_name = f"{layer_name}.gpkg"
+                    _record_output(file_name, out_path)
+                    run_domain_rows.extend(
+                        append_domain_code_log(
+                            _collect_domain_log_entries(instances),
+                            {
+                                "workbook": sup_wb_path.name if sup_wb_path else None,
+                                "sheet": sup_sheet,
+                                "device": dev_name,
+                                "output": f"{prefix_label}{file_name}",
+                            },
+                        )
+                    )
+                    src_label = "control panels" if control_panel_polygons_cached else "UPS anchor"
+                    logs.append(f"{prefix_label}{dev_name}: auto-created protection points from {src_label} ({len(points)}).")
 
                 cabin_aspatial_devices = [
                     "Optical Telecommunication Equipment (Telecom)",
@@ -6590,10 +6784,7 @@ def run_app() -> None:
                 ]
                 cabin_spatial_devices = cabin_point_devices + cabin_polygon_devices
                 if any(normalize_for_compare(d) not in uploaded_device_norms for d in cabin_spatial_devices):
-                    cabin_norms = {normalize_for_compare("Substation/Cabin")}
-                    cabins_gdf = collect_device_polygons_from_uploads(
-                        files, None, device_options, equip_map_sup, cabin_norms
-                    )
+                    cabins_gdf = cabins_gdf_cached
                     if cabins_gdf is None or cabins_gdf.empty:
                         for dev_name in cabin_spatial_devices:
                             if normalize_for_compare(dev_name) in uploaded_device_norms:
@@ -6602,12 +6793,7 @@ def run_app() -> None:
                                 f"{prefix_label}{dev_name}: skipped auto-create (no cabin polygons uploaded)."
                             )
                     else:
-                        cabin_anchor_points = build_cabin_anchor_points(
-                            files,
-                            cabins_gdf,
-                            device_options,
-                            equip_map_sup,
-                        )
+                        cabin_anchor_points = cabin_anchor_points_cached
                         for dev_name in cabin_point_devices:
                             if normalize_for_compare(dev_name) in uploaded_device_norms:
                                 continue
