@@ -5274,6 +5274,111 @@ def fill_one_gpkg(
         crs=gdf_sup_local.crs,
     )
 
+    # Post-fill: overwrite Voltage Transformer IDs using Line Bay IDs (e.g., E01 -> VT1-1, VT1-2, ...).
+    vt_targets = {
+        normalize_for_compare("Voltage Transformer"),
+        normalize_for_compare("Indoor Voltage Transformer"),
+    }
+    vt_match = normalize_for_compare(device_name) in vt_targets
+    if not vt_match:
+        try:
+            layer_norm = normalize_for_compare(layer or "")
+            vt_match = any(target in layer_norm or layer_norm == target for target in vt_targets)
+        except Exception:
+            vt_match = False
+    if not vt_match:
+        try:
+            file_norm = normalize_for_compare(Path(file_name).stem)
+            vt_match = any(target in file_norm or file_norm == target for target in vt_targets)
+        except Exception:
+            vt_match = False
+    if vt_match and len(out_gdf) > 0:
+        norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
+        line_bay_aliases = [
+            "Line_Bay_ID",
+            "Line Bay ID",
+            "LineBayID",
+            "LineBay_ID",
+            "Line Bay",
+            "Line_Bay",
+        ]
+        vt_id_aliases = [
+            "VoltageTransfomer_ID",
+            "Voltage Transformer ID",
+            "VoltageTransfomerID",
+            "Voltage Transformer Id",
+            "VoltageTransformerID",
+        ]
+        line_bay_col = None
+        for alias in line_bay_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col:
+                line_bay_col = col
+                break
+        if line_bay_col:
+            vt_id_col = None
+            for alias in vt_id_aliases:
+                col = norm_lookup.get(normalize_for_compare(alias))
+                if col:
+                    vt_id_col = col
+                    break
+            if vt_id_col is None:
+                vt_id_col = "VoltageTransfomer_ID"
+                out_gdf[vt_id_col] = pd.NA
+
+            bay_series = out_gdf[line_bay_col]
+            unique_bays: list[tuple[str, Any]] = []
+            seen_bays: set[str] = set()
+            for raw in bay_series:
+                key = normalize_value_for_compare(raw)
+                if key not in seen_bays:
+                    seen_bays.add(key)
+                    unique_bays.append((key, raw))
+
+            def _extract_base(raw_val: Any) -> int | None:
+                try:
+                    digits = re.findall(r"\d+", str(raw_val))
+                    if digits:
+                        return int(digits[0])
+                except Exception:
+                    return None
+                return None
+
+            bay_base: dict[str, int] = {}
+            used_bases: set[int] = set()
+            for key, raw in unique_bays:
+                base = _extract_base(raw)
+                if base is not None and base > 0:
+                    bay_base[key] = base
+                    used_bases.add(base)
+
+            next_base = max(used_bases) + 1 if used_bases else 1
+            for key, _raw in unique_bays:
+                if key in bay_base:
+                    continue
+                while next_base in used_bases:
+                    next_base += 1
+                bay_base[key] = next_base
+                used_bases.add(next_base)
+                next_base += 1
+
+            bay_counts: dict[str, int] = {}
+            new_ids: list[str] = []
+            for raw in bay_series:
+                key = normalize_value_for_compare(raw)
+                base = bay_base.get(key)
+                if base is None:
+                    while next_base in used_bases:
+                        next_base += 1
+                    base = next_base
+                    used_bases.add(base)
+                    next_base += 1
+                    bay_base[key] = base
+                bay_counts[key] = bay_counts.get(key, 0) + 1
+                seq = bay_counts[key]
+                new_ids.append(f"VT{base}-{seq}")
+            out_gdf[vt_id_col] = new_ids
+
     # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
     hv_name_norm = normalize_for_compare("High Voltage Line")
     hv_match = normalize_for_compare(device_name) == hv_name_norm
