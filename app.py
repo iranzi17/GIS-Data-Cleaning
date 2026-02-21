@@ -747,6 +747,16 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
     raw = pd.read_excel(workbook_path, sheet_name=sheet_name, dtype=str, header=None)
 
     target_norm = normalize_for_compare(device_name)
+    present_device_norms = set(
+        raw.iloc[:, 0].dropna().map(normalize_for_compare)
+    ) if raw.shape[1] > 0 else set()
+    target_norms = {target_norm}
+    if target_norm not in present_device_norms:
+        for cand in SUPERVISOR_DEVICE_FALLBACKS.get(target_norm, []):
+            cand_norm = normalize_for_compare(cand)
+            if cand_norm in present_device_norms:
+                target_norms.add(cand_norm)
+                break
     is_protection = target_norm in PROTECTION_LAYOUT_DEVICES
     domain_code_map: dict[str, Any] = {}
     if raw.shape[1] > 4:
@@ -949,7 +959,7 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
         dev_norm = normalize_for_compare(dev_cell) if pd.notna(dev_cell) else ""
         row_blank = row.iloc[1:].isna().all()
 
-        if dev_norm == target_norm:
+        if dev_norm in target_norms:
             if current_fields is not None and current_fields:
                 _finalize_instance(current_fields, current_order)
             current_fields = {}
@@ -4081,6 +4091,18 @@ PREFIX_GROUP_DEVICES = {
 ASPATIAL_DEVICES = {
     normalize_for_compare("Optical Telecommunication Equipment (Telecom)"),
     normalize_for_compare("ODF"),
+}
+
+# Supervisor sheets are not always consistent with device labels.
+# Use these fallbacks only when an exact device block is missing.
+SUPERVISOR_DEVICE_FALLBACKS = {
+    normalize_for_compare("Transformer Bay"): [
+        "Power cable to transformer",
+        "Power cable to transfomer",
+        "Transformer_Bay",
+        "Transformer Bay",
+        "Transformer",
+    ],
 }
 
 # Substation fields to preserve from uploaded GPKG (do not overwrite).
