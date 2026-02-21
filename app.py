@@ -5590,25 +5590,31 @@ def fill_one_gpkg(
         crs=gdf_sup_local.crs,
     )
 
-    # Post-fill: overwrite Voltage Transformer IDs using Line Bay IDs (e.g., E01 -> VT1-1, VT1-2, ...).
-    vt_targets = {
-        normalize_for_compare("Voltage Transformer"),
-        normalize_for_compare("Indoor Voltage Transformer"),
-    }
-    vt_match = normalize_for_compare(device_name) in vt_targets
-    if not vt_match:
-        try:
-            layer_norm = normalize_for_compare(layer or "")
-            vt_match = any(target in layer_norm or layer_norm == target for target in vt_targets)
-        except Exception:
-            vt_match = False
-    if not vt_match:
-        try:
-            file_norm = normalize_for_compare(Path(file_name).stem)
-            vt_match = any(target in file_norm or file_norm == target for target in vt_targets)
-        except Exception:
-            vt_match = False
-    if vt_match and len(out_gdf) > 0:
+    def _overwrite_device_ids_from_line_bay(
+        device_targets: set[str],
+        id_aliases: list[str],
+        name_aliases: list[str],
+        default_id_col: str,
+        id_prefix: str,
+    ) -> None:
+        if len(out_gdf) <= 0:
+            return
+        dev_match = normalize_for_compare(device_name) in device_targets
+        if not dev_match:
+            try:
+                layer_norm = normalize_for_compare(layer or "")
+                dev_match = any(target in layer_norm or layer_norm == target for target in device_targets)
+            except Exception:
+                dev_match = False
+        if not dev_match:
+            try:
+                file_norm = normalize_for_compare(Path(file_name).stem)
+                dev_match = any(target in file_norm or file_norm == target for target in device_targets)
+            except Exception:
+                dev_match = False
+        if not dev_match:
+            return
+
         norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
         line_bay_aliases = [
             "Line_Bay_ID",
@@ -5620,20 +5626,6 @@ def fill_one_gpkg(
             "LineBayName",
             "Line Bay",
             "Line_Bay",
-        ]
-        vt_id_aliases = [
-            "VoltageTransfomer_ID",
-            "Voltage Transformer ID",
-            "VoltageTransfomerID",
-            "Voltage Transformer Id",
-            "VoltageTransformerID",
-        ]
-        vt_name_aliases = [
-            "Voltage Transformer Name",
-            "VoltageTransfomer_Name",
-            "VoltageTransformerName",
-            "Name",
-            "name",
         ]
         line_bay_col = None
         for alias in line_bay_aliases:
@@ -5663,99 +5655,146 @@ def fill_one_gpkg(
                 pass
         if not bay_keys and line_bay_col:
             bay_keys = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
+        if not bay_keys:
+            return
 
-        if bay_keys:
-            vt_id_col = None
-            for alias in vt_id_aliases:
-                col = norm_lookup.get(normalize_for_compare(alias))
-                if col:
-                    vt_id_col = col
-                    break
-            if vt_id_col is None:
-                vt_id_col = "VoltageTransfomer_ID"
-                out_gdf[vt_id_col] = pd.NA
+        id_col = None
+        for alias in id_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col:
+                id_col = col
+                break
+        if id_col is None:
+            id_col = default_id_col
+            out_gdf[id_col] = pd.NA
 
-            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-            reverse_name_to_id: dict[str, str] = {}
-            if isinstance(id_name_map, dict):
-                for k, v in id_name_map.items():
-                    k_norm = normalize_value_for_compare(k)
-                    v_norm = normalize_value_for_compare(v)
-                    if k_norm and v_norm and v_norm not in reverse_name_to_id:
-                        reverse_name_to_id[v_norm] = k_norm
+        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+        reverse_name_to_id: dict[str, str] = {}
+        if isinstance(id_name_map, dict):
+            for k, v in id_name_map.items():
+                k_norm = normalize_value_for_compare(k)
+                v_norm = normalize_value_for_compare(v)
+                if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                    reverse_name_to_id[v_norm] = k_norm
 
-            def _canonical_bay_key(raw_val: Any) -> str:
-                norm_val = normalize_value_for_compare(raw_val)
-                if not norm_val:
-                    return ""
-                return reverse_name_to_id.get(norm_val, norm_val)
+        def _canonical_bay_key(raw_val: Any) -> str:
+            norm_val = normalize_value_for_compare(raw_val)
+            if not norm_val:
+                return ""
+            return reverse_name_to_id.get(norm_val, norm_val)
 
-            unique_bays: list[str] = []
-            seen_bays: set[str] = set()
-            for raw in bay_keys:
-                key = _canonical_bay_key(raw)
-                if key not in seen_bays:
-                    seen_bays.add(key)
-                    unique_bays.append(key)
+        unique_bays: list[str] = []
+        seen_bays: set[str] = set()
+        for raw in bay_keys:
+            key = _canonical_bay_key(raw)
+            if key not in seen_bays:
+                seen_bays.add(key)
+                unique_bays.append(key)
 
-            def _extract_base(raw_val: Any) -> int | None:
-                norm_val = _canonical_bay_key(raw_val)
-                if not norm_val:
-                    return None
-                try:
-                    match = re.search(r"e0*(\d+)", norm_val)
-                    if match:
-                        return int(match.group(1))
-                    digits = re.findall(r"\d+", norm_val)
-                    if digits:
-                        # Prefer the trailing numeric token (e.g., "line5e03" -> 3).
-                        return int(digits[-1])
-                except Exception:
-                    return None
+        def _extract_base(raw_val: Any) -> int | None:
+            norm_val = _canonical_bay_key(raw_val)
+            if not norm_val:
                 return None
+            try:
+                match = re.search(r"e0*(\d+)", norm_val)
+                if match:
+                    return int(match.group(1))
+                digits = re.findall(r"\d+", norm_val)
+                if digits:
+                    return int(digits[-1])
+            except Exception:
+                return None
+            return None
 
-            bay_base: dict[str, int] = {}
-            used_bases: set[int] = set()
-            for key in unique_bays:
-                base = _extract_base(key)
-                if base is not None and base > 0:
-                    bay_base[key] = base
-                    used_bases.add(base)
+        bay_base: dict[str, int] = {}
+        used_bases: set[int] = set()
+        for key in unique_bays:
+            base = _extract_base(key)
+            if base is not None and base > 0:
+                bay_base[key] = base
+                used_bases.add(base)
 
-            next_base = max(used_bases) + 1 if used_bases else 1
-            for key in unique_bays:
-                if key in bay_base:
-                    continue
+        next_base = max(used_bases) + 1 if used_bases else 1
+        for key in unique_bays:
+            if key in bay_base:
+                continue
+            while next_base in used_bases:
+                next_base += 1
+            bay_base[key] = next_base
+            used_bases.add(next_base)
+            next_base += 1
+
+        bay_counts: dict[str, int] = {}
+        new_ids: list[str] = []
+        for raw in bay_keys:
+            key = _canonical_bay_key(raw)
+            base = bay_base.get(key)
+            if base is None:
                 while next_base in used_bases:
                     next_base += 1
-                bay_base[key] = next_base
-                used_bases.add(next_base)
+                base = next_base
+                used_bases.add(base)
                 next_base += 1
+                bay_base[key] = base
+            bay_counts[key] = bay_counts.get(key, 0) + 1
+            seq = bay_counts[key]
+            new_ids.append(f"{id_prefix}{base}-{seq}")
+        out_gdf[id_col] = new_ids
 
-            bay_counts: dict[str, int] = {}
-            new_ids: list[str] = []
-            for raw in bay_keys:
-                key = _canonical_bay_key(raw)
-                base = bay_base.get(key)
-                if base is None:
-                    while next_base in used_bases:
-                        next_base += 1
-                    base = next_base
-                    used_bases.add(base)
-                    next_base += 1
-                    bay_base[key] = base
-                bay_counts[key] = bay_counts.get(key, 0) + 1
-                seq = bay_counts[key]
-                new_ids.append(f"VT{base}-{seq}")
-            out_gdf[vt_id_col] = new_ids
+        name_cols: list[str] = []
+        for alias in name_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col and col not in name_cols:
+                name_cols.append(col)
+        for col in name_cols:
+            out_gdf[col] = new_ids
 
-            vt_name_cols: list[str] = []
-            for alias in vt_name_aliases:
-                col = norm_lookup.get(normalize_for_compare(alias))
-                if col and col not in vt_name_cols:
-                    vt_name_cols.append(col)
-            for col in vt_name_cols:
-                out_gdf[col] = new_ids
+    # Post-fill: overwrite Voltage Transformer IDs using Line Bay IDs (E03 -> VT3-1, VT3-2, ...).
+    _overwrite_device_ids_from_line_bay(
+        {
+            normalize_for_compare("Voltage Transformer"),
+        },
+        [
+            "VoltageTransfomer_ID",
+            "Voltage Transformer ID",
+            "VoltageTransfomerID",
+            "Voltage Transformer Id",
+            "VoltageTransformerID",
+        ],
+        [
+            "Voltage Transformer Name",
+            "VoltageTransfomer_Name",
+            "VoltageTransformerName",
+            "Name",
+            "name",
+        ],
+        default_id_col="VoltageTransfomer_ID",
+        id_prefix="VT",
+    )
+
+    # Post-fill: overwrite Current Transformer IDs using Line Bay IDs (E03 -> CT3-1, CT3-2, ...).
+    _overwrite_device_ids_from_line_bay(
+        {
+            normalize_for_compare("Current Transformer"),
+        },
+        [
+            "CurrentTransfomer_ID",
+            "CurrentTransformer_ID",
+            "Current Transformer ID",
+            "Current Transformer Id",
+            "CurrentTransfomerID",
+            "CurrentTransformerID",
+        ],
+        [
+            "Current Transformer Name",
+            "CurrentTransfomer_Name",
+            "CurrentTransformerName",
+            "Name",
+            "name",
+        ],
+        default_id_col="CurrentTransfomerID",
+        id_prefix="CT",
+    )
 
     # Post-fill: align High Voltage Line names to intersecting/nearest Line Bay (uploaded HV lines).
     hv_name_norm = normalize_for_compare("High Voltage Line")
