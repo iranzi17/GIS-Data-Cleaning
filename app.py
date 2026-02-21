@@ -3784,6 +3784,10 @@ def load_schema_fields(
     ]
     fields = schema_df["field"].tolist()
     type_map = dict(zip(schema_df["field"], schema_df["type"]))
+    # Force Manufacturer fields to Text regardless of workbook type entry (sheets may list Short Integer).
+    for fld in list(type_map.keys()):
+        if normalize_for_compare(fld) == normalize_for_compare("Manufacturer"):
+            type_map[fld] = "Text"
     return fields, type_map
 
 
