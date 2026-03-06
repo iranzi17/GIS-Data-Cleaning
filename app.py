@@ -3073,7 +3073,14 @@ def _fill_supervisor_batch(
                 norm_val = normalize_value_for_compare(raw_val)
                 if not norm_val:
                     return ""
-                return reverse_name_to_id.get(norm_val, norm_val)
+                mapped = reverse_name_to_id.get(norm_val, norm_val)
+                try:
+                    match = re.search(r"e0*(\d+)", mapped)
+                    if match:
+                        return f"e{int(match.group(1))}"
+                except Exception:
+                    pass
+                return mapped
 
             bay_centroid_by_key: dict[str, Any] = {}
             if bay_val_col and geom_col_ref:
@@ -4031,13 +4038,36 @@ def build_spatial_match_targets(
         bay_gdf = gpd.read_file(bay_path, layer=bay_layer)
     except Exception:
         return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-    if bay_field not in bay_gdf.columns or not hasattr(bay_gdf, "geometry"):
+    if not hasattr(bay_gdf, "geometry"):
         return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
 
     geom_name = bay_gdf.geometry.name
-    bay = bay_gdf[[bay_field, geom_name]].copy()
+    norm_lookup = {normalize_for_compare(c): c for c in bay_gdf.columns}
+    key_col = None
+    for alias in ["Line_Bay_ID", "Line Bay ID", "LineBayID", "LineBay_ID", "Line_BayID", "line_bay_id"]:
+        col = norm_lookup.get(normalize_for_compare(alias))
+        if col:
+            key_col = col
+            break
+    if key_col is None and bay_field in bay_gdf.columns:
+        key_col = bay_field
+    if key_col is None:
+        fallback_cols = [c for c in bay_gdf.columns if c != geom_name]
+        key_col = fallback_cols[0] if fallback_cols else None
+    if key_col is None:
+        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
+
+    keep_cols = [geom_name, key_col]
+    if bay_field in bay_gdf.columns and bay_field not in keep_cols:
+        keep_cols.append(bay_field)
+    bay = bay_gdf[keep_cols].copy()
     try:
         bay = bay[bay[geom_name].notna() & ~bay[geom_name].is_empty]
+    except Exception:
+        pass
+    try:
+        bay_keys_norm = bay[key_col].map(normalize_value_for_compare)
+        bay = bay[bay_keys_norm != ""]
     except Exception:
         pass
     if line_gdf.crs is not None and bay.crs is not None and line_gdf.crs != bay.crs:
@@ -4053,10 +4083,10 @@ def build_spatial_match_targets(
     except Exception:
         return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
 
-    field_name = bay_field
+    field_name = key_col
     if field_name not in joined.columns:
-        alt = f"{bay_field}_bay"
-        field_name = alt if alt in joined.columns else bay_field
+        alt = f"{key_col}_bay"
+        field_name = alt if alt in joined.columns else key_col
 
     if joined.index.duplicated().any():
         try:
@@ -4078,6 +4108,60 @@ def build_spatial_match_targets(
 
     series = joined[field_name] if field_name in joined.columns else pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
     series = series.reindex(line_gdf.index)
+
+    # Nearest-bay fallback for features that do not intersect any Line Bay polygon.
+    try:
+        missing_mask = series.isna() | series.map(lambda v: normalize_value_for_compare(v) == "")
+    except Exception:
+        missing_mask = series.isna()
+
+    if bool(missing_mask.any()):
+        try:
+            bay_geom_name = bay.geometry.name if hasattr(bay, "geometry") else geom_name
+            bay_refs: list[tuple[Any, Any]] = []
+            for _, bay_row in bay.iterrows():
+                key_val = bay_row.get(key_col)
+                geom = bay_row.get(bay_geom_name)
+                if geom is None or getattr(geom, "is_empty", True):
+                    continue
+                try:
+                    ref_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+                except Exception:
+                    try:
+                        ref_pt = geom.representative_point()
+                    except Exception:
+                        continue
+                if ref_pt is None or getattr(ref_pt, "is_empty", True):
+                    continue
+                bay_refs.append((key_val, ref_pt))
+
+            if bay_refs and hasattr(line_gdf, "geometry") and line_gdf.geometry is not None:
+                for idx_val in series.index[missing_mask]:
+                    try:
+                        geom = line_gdf.loc[idx_val, line_gdf.geometry.name]
+                    except Exception:
+                        continue
+                    if geom is None or getattr(geom, "is_empty", True):
+                        continue
+                    try:
+                        src_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+                    except Exception:
+                        continue
+                    best_key = None
+                    best_dist = None
+                    for key_val, ref_pt in bay_refs:
+                        try:
+                            dist = src_pt.distance(ref_pt)
+                        except Exception:
+                            continue
+                        if best_dist is None or dist < best_dist:
+                            best_dist = dist
+                            best_key = key_val
+                    if best_key is not None:
+                        series.at[idx_val] = best_key
+        except Exception:
+            pass
+
     return series.map(normalize_value_for_compare)
 
 
@@ -5066,6 +5150,45 @@ def fill_one_gpkg(
     if not type_map_local:
         type_map_local = _extract_type_map(seq_entries)
 
+    file_name = _get_file_name(file_obj)
+
+    if normalize_for_compare(device_name) in ASPATIAL_DEVICES:
+        table_instances: list[dict[str, Any]] = []
+        if seq_entries:
+            for entry in seq_entries:
+                fields = dict(entry.get("fields", {}) or {})
+                table_instances.append(
+                    {
+                        "fields": fields,
+                        "order": list(fields.keys()),
+                        "type_map": entry.get("type_map") or type_map_local,
+                    }
+                )
+        elif field_map:
+            fields = dict(field_map)
+            table_instances = [
+                {
+                    "fields": fields,
+                    "order": list(field_order or fields.keys()),
+                    "type_map": type_map_local,
+                }
+            ]
+        elif sup_wb_path is not None and sup_sheet is not None:
+            table_instances = parse_supervisor_device_table(sup_wb_path, sup_sheet, device_name)
+
+        if not table_instances:
+            raise ValueError(f"No entries found for device '{device_name}' in sheet '{sup_sheet}'.")
+
+        out_df = build_device_table_from_instances(table_instances)
+        if out_df.empty and len(out_df.columns) == 0:
+            raise ValueError(f"No fields available for aspatial device '{device_name}'.")
+
+        layer_name = layer_override or derive_layer_name_from_filename(file_name or device_name)
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmpout:
+            out_path = Path(tmpout.name)
+        write_aspatial_gpkg_layer(out_df, out_path, layer_name)
+        return out_path, layer_name
+
     block_assign = normalize_for_compare(device_name) in BLOCK_ASSIGN_DEVICES
     strict_line_bay = normalize_for_compare(device_name) == normalize_for_compare("Line Bay")
 
@@ -5133,7 +5256,6 @@ def fill_one_gpkg(
         if seq_order and row_rank < len(seq_order):
             return seq_entries[seq_order[row_rank]]
         return seq_entries[row_rank % len(seq_entries)]
-    file_name = _get_file_name(file_obj)
     gpkg_path = _coerce_gpkg_path(file_obj)
     if gpkg_path is None:
         raise ValueError("Could not read the GeoPackage.")
@@ -5675,6 +5797,131 @@ def fill_one_gpkg(
         crs=gdf_sup_local.crs,
     )
 
+    def _is_device_target(targets: set[str]) -> bool:
+        hit = normalize_for_compare(device_name) in targets
+        if not hit:
+            try:
+                layer_norm = normalize_for_compare(layer or "")
+                hit = any(target in layer_norm or layer_norm == target for target in targets)
+            except Exception:
+                hit = False
+        if not hit:
+            try:
+                file_norm = normalize_for_compare(Path(file_name).stem)
+                hit = any(target in file_norm or file_norm == target for target in targets)
+            except Exception:
+                hit = False
+        return hit
+
+    # Remove exact duplicate point features for outdoor VT/CT layers.
+    if _is_device_target(
+        {
+            normalize_for_compare("Voltage Transformer"),
+            normalize_for_compare("Current Transformer"),
+        }
+    ) and hasattr(out_gdf, "geometry") and out_gdf.geometry is not None:
+        keep_idx: list[Any] = []
+        seen_geom: set[str] = set()
+        for idx_val, geom in out_gdf.geometry.items():
+            if geom is None or getattr(geom, "is_empty", True):
+                keep_idx.append(idx_val)
+                continue
+            try:
+                geom_key = geom.wkb_hex
+            except Exception:
+                try:
+                    geom_key = geom.wkt
+                except Exception:
+                    keep_idx.append(idx_val)
+                    continue
+            if geom_key in seen_geom:
+                continue
+            seen_geom.add(geom_key)
+            keep_idx.append(idx_val)
+        if keep_idx and len(keep_idx) < len(out_gdf):
+            out_gdf = out_gdf.loc[keep_idx].copy()
+
+    def _fill_missing_bay_keys_by_nearest(raw_keys: list[str]) -> list[str]:
+        if not raw_keys or len(raw_keys) != len(out_gdf):
+            return raw_keys
+        if not hasattr(out_gdf, "geometry") or out_gdf.geometry is None:
+            return raw_keys
+        missing_pos = [
+            i for i, val in enumerate(raw_keys)
+            if normalize_value_for_compare(val) == ""
+        ]
+        if not missing_pos:
+            return raw_keys
+
+        bay_centroid_by_key: dict[str, Any] = {}
+        if isinstance(line_bay_info, dict):
+            raw_centroids = line_bay_info.get("bay_centroid_by_key")
+            if isinstance(raw_centroids, dict):
+                for key, pt in raw_centroids.items():
+                    norm_key = normalize_value_for_compare(key)
+                    if not norm_key or pt is None or getattr(pt, "is_empty", True):
+                        continue
+                    bay_centroid_by_key[norm_key] = pt
+
+        if not bay_centroid_by_key and isinstance(line_bay_info, dict):
+            try:
+                bay_gdf = load_line_bay_layer(
+                    line_bay_info.get("path"),
+                    line_bay_info.get("layer"),
+                    line_bay_info.get("field"),
+                )
+            except Exception:
+                bay_gdf = None
+            if bay_gdf is not None and not bay_gdf.empty and hasattr(bay_gdf, "geometry"):
+                bay_geom_name = bay_gdf.geometry.name
+                bay_field = _pick_line_bay_name_field(bay_gdf, line_bay_info.get("field"))
+                for _, row in bay_gdf.iterrows():
+                    key_raw = row.get(bay_field)
+                    key_norm = normalize_value_for_compare(key_raw)
+                    geom = row.get(bay_geom_name)
+                    if not key_norm or geom is None or getattr(geom, "is_empty", True):
+                        continue
+                    try:
+                        ref_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+                    except Exception:
+                        try:
+                            ref_pt = geom.representative_point()
+                        except Exception:
+                            continue
+                    if ref_pt is None or getattr(ref_pt, "is_empty", True):
+                        continue
+                    bay_centroid_by_key.setdefault(key_norm, ref_pt)
+
+        if not bay_centroid_by_key:
+            return raw_keys
+
+        resolved = list(raw_keys)
+        refs = list(bay_centroid_by_key.items())
+        for pos in missing_pos:
+            try:
+                geom = out_gdf.geometry.iloc[pos]
+            except Exception:
+                continue
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            try:
+                src_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+            except Exception:
+                continue
+            best_key = None
+            best_dist = None
+            for key_norm, ref_pt in refs:
+                try:
+                    dist = src_pt.distance(ref_pt)
+                except Exception:
+                    continue
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_key = key_norm
+            if best_key:
+                resolved[pos] = best_key
+        return resolved
+
     def _overwrite_device_ids_from_line_bay(
         device_targets: set[str],
         id_aliases: list[str],
@@ -5740,6 +5987,12 @@ def fill_one_gpkg(
                 pass
         if not bay_keys and line_bay_col:
             bay_keys = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
+        if bay_keys and len(bay_keys) == len(out_gdf):
+            bay_keys = _fill_missing_bay_keys_by_nearest(bay_keys)
+        if bay_keys:
+            has_any_key = any(normalize_value_for_compare(v) for v in bay_keys)
+            if not has_any_key:
+                bay_keys = []
         if not bay_keys:
             return
 
@@ -5766,7 +6019,14 @@ def fill_one_gpkg(
             norm_val = normalize_value_for_compare(raw_val)
             if not norm_val:
                 return ""
-            return reverse_name_to_id.get(norm_val, norm_val)
+            mapped = reverse_name_to_id.get(norm_val, norm_val)
+            try:
+                match = re.search(r"e0*(\d+)", mapped)
+                if match:
+                    return f"e{int(match.group(1))}"
+            except Exception:
+                pass
+            return mapped
 
         unique_bays: list[str] = []
         seen_bays: set[str] = set()
@@ -5882,20 +6142,7 @@ def fill_one_gpkg(
     )
 
     def _matches_device_targets(targets: set[str]) -> bool:
-        hit = normalize_for_compare(device_name) in targets
-        if not hit:
-            try:
-                layer_norm = normalize_for_compare(layer or "")
-                hit = any(target in layer_norm or layer_norm == target for target in targets)
-            except Exception:
-                hit = False
-        if not hit:
-            try:
-                file_norm = normalize_for_compare(Path(file_name).stem)
-                hit = any(target in file_norm or file_norm == target for target in targets)
-            except Exception:
-                hit = False
-        return hit
+        return _is_device_target(targets)
 
     def _resolve_bay_keys_and_base() -> tuple[list[str], dict[str, int]]:
         if len(out_gdf) <= 0:
@@ -5939,6 +6186,12 @@ def fill_one_gpkg(
                 pass
         if not bay_keys_raw and line_bay_col:
             bay_keys_raw = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
+        if bay_keys_raw and len(bay_keys_raw) == len(out_gdf):
+            bay_keys_raw = _fill_missing_bay_keys_by_nearest(bay_keys_raw)
+        if bay_keys_raw:
+            has_any_key = any(normalize_value_for_compare(v) for v in bay_keys_raw)
+            if not has_any_key:
+                bay_keys_raw = []
         if not bay_keys_raw:
             return [], {}
 
@@ -5955,7 +6208,14 @@ def fill_one_gpkg(
             norm_val = normalize_value_for_compare(raw_val)
             if not norm_val:
                 return ""
-            return reverse_name_to_id.get(norm_val, norm_val)
+            mapped = reverse_name_to_id.get(norm_val, norm_val)
+            try:
+                match = re.search(r"e0*(\d+)", mapped)
+                if match:
+                    return f"e{int(match.group(1))}"
+            except Exception:
+                pass
+            return mapped
 
         def _extract_base(raw_val: Any) -> int | None:
             norm_val = _canon(raw_val)
@@ -7110,7 +7370,14 @@ def run_app() -> None:
                             norm_val = normalize_value_for_compare(raw_val)
                             if not norm_val:
                                 return ""
-                            return reverse_name_to_id.get(norm_val, norm_val)
+                            mapped = reverse_name_to_id.get(norm_val, norm_val)
+                            try:
+                                match = re.search(r"e0*(\d+)", mapped)
+                                if match:
+                                    return f"e{int(match.group(1))}"
+                            except Exception:
+                                pass
+                            return mapped
 
                         bay_centroid_by_key: dict[str, Any] = {}
                         if bay_val_col and geom_col_ref:
