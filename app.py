@@ -705,6 +705,12 @@ def resolve_equipment_name(file_name: str, equipment_options: list[str], equip_m
                 for opt in equipment_options:
                     if normalize_for_compare(opt) == normalize_for_compare(preferred):
                         return opt
+        # Some files map to a canonical device name whose sheet rows may live under
+        # a fallback alias instead of the canonical label. Return the canonical
+        # device here so workbook fallback lookup can run, rather than fuzzily
+        # collapsing to an unrelated device and rewriting geometry incorrectly.
+        if mapped_norm in SUPERVISOR_DEVICE_FALLBACKS:
+            return mapped
         if mapped in equipment_options:
             return mapped
         try:
@@ -881,6 +887,9 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
                 "current transformer id",
                 "currenttransformerid",
                 "current transfomer id",
+                "circuitbreakerid",
+                "circuitbreaker_id",
+                "circuit breaker id",
                 "switchgearid",
                 "switchgear_id",
                 "mv_switchgear_id",
@@ -2744,6 +2753,67 @@ def collect_device_polygons_from_uploads(
     return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
 
 
+def collect_device_linear_geometries_from_uploads(
+    files: list[Any] | None,
+    target_crs,
+    device_options: list[str],
+    equip_map: dict[str, str],
+    target_device_norms: set[str],
+) -> gpd.GeoDataFrame | None:
+    """Collect line geometries from uploads for specific devices (e.g., High Voltage Line)."""
+    if not files or not target_device_norms:
+        return None
+    frames: list[gpd.GeoDataFrame] = []
+    for file_obj in files:
+        try:
+            file_name = _get_file_name(file_obj)
+            dev_name = resolve_equipment_name(file_name, device_options, equip_map)
+        except Exception:
+            dev_name = None
+        if normalize_for_compare(dev_name) not in target_device_norms:
+            continue
+        try:
+            gpkg_path = _coerce_gpkg_path(file_obj)
+            if gpkg_path is None:
+                continue
+            layers = list_gpkg_layers(gpkg_path)
+            if not layers:
+                continue
+            for layer in layers:
+                try:
+                    gdf = gpd.read_file(gpkg_path, layer=layer)
+                except Exception:
+                    continue
+                if gdf.empty or not hasattr(gdf, "geometry"):
+                    continue
+                geom_series = gdf.geometry
+                try:
+                    geom_types = geom_series.geom_type
+                except Exception:
+                    continue
+                line_mask = geom_types.isin(["LineString", "MultiLineString"])
+                if not bool(line_mask.any()):
+                    continue
+                gdf_lines = gdf.loc[line_mask].copy()
+                try:
+                    if (gdf_lines.geometry.geom_type == "MultiLineString").any():
+                        gdf_lines = gdf_lines.explode(index_parts=False)
+                except Exception:
+                    pass
+                if target_crs is not None and gdf_lines.crs is not None and gdf_lines.crs != target_crs:
+                    try:
+                        gdf_lines = gdf_lines.to_crs(target_crs)
+                    except Exception:
+                        pass
+                frames.append(gpd.GeoDataFrame(geometry=gdf_lines.geometry, crs=target_crs or gdf_lines.crs))
+        except Exception:
+            continue
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
+
+
 def map_points_to_bays(
     points_gdf: gpd.GeoDataFrame | None,
     bay_gdf: gpd.GeoDataFrame,
@@ -2920,6 +2990,267 @@ def _build_line_bay_id_name_map(workbook_path: Path | None, sheet_name: str | No
     return mapping
 
 
+def _collect_geom_points(geom: Any) -> list[Any]:
+    """Flatten a geometry into point members when available."""
+    if geom is None or getattr(geom, "is_empty", True):
+        return []
+    geom_type = getattr(geom, "geom_type", "")
+    if geom_type == "Point":
+        return [geom]
+    if geom_type == "MultiPoint":
+        try:
+            return [part for part in geom.geoms if part is not None and not getattr(part, "is_empty", True)]
+        except Exception:
+            return []
+    points: list[Any] = []
+    try:
+        for part in geom.geoms:
+            points.extend(_collect_geom_points(part))
+    except Exception:
+        return []
+    return points
+
+
+def _build_line_exit_reference_point(line_geom: Any, bay_geom: Any, bay_center: Any) -> Any | None:
+    """Pick a boundary-side reference point for a line entering or leaving a bay."""
+    if (
+        line_geom is None
+        or getattr(line_geom, "is_empty", True)
+        or bay_geom is None
+        or getattr(bay_geom, "is_empty", True)
+    ):
+        return None
+    try:
+        from shapely.geometry import Point
+        from shapely.ops import nearest_points
+    except Exception:
+        return None
+
+    center = bay_center
+    if center is None or getattr(center, "is_empty", True):
+        try:
+            center = bay_geom.centroid
+        except Exception:
+            center = None
+
+    segments = [line_geom]
+    try:
+        if getattr(line_geom, "geom_type", "") == "MultiLineString":
+            segments = [seg for seg in line_geom.geoms if seg is not None and not getattr(seg, "is_empty", True)]
+    except Exception:
+        segments = [line_geom]
+
+    boundary = None
+    try:
+        boundary = bay_geom.boundary
+    except Exception:
+        boundary = None
+
+    best_pt = None
+    best_score = None
+    for seg in segments:
+        try:
+            coords = list(seg.coords)
+        except Exception:
+            continue
+        if len(coords) < 2:
+            continue
+        endpoints = [Point(coords[0]), Point(coords[-1])]
+        if center is not None and not getattr(center, "is_empty", True):
+            outer_endpoint = max(endpoints, key=lambda pt: float(pt.distance(center)))
+        else:
+            outer_endpoint = endpoints[0]
+
+        candidate = None
+        if boundary is not None:
+            try:
+                boundary_hits = _collect_geom_points(seg.intersection(boundary))
+            except Exception:
+                boundary_hits = []
+            if boundary_hits:
+                candidate = min(boundary_hits, key=lambda pt: float(pt.distance(outer_endpoint)))
+        if candidate is None:
+            candidate = outer_endpoint
+            if boundary is not None:
+                try:
+                    candidate = nearest_points(candidate, boundary)[1]
+                except Exception:
+                    pass
+        try:
+            score = float(candidate.distance(outer_endpoint))
+        except Exception:
+            score = 0.0
+        if best_score is None or score < best_score:
+            best_pt = candidate
+            best_score = score
+    return best_pt
+
+
+def enrich_line_bay_reference_info(
+    files: list[Any] | None,
+    device_options: list[str],
+    equip_map: dict[str, str],
+    line_bay_info: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Populate per-bay centroids and reference points used by post-fill device placement."""
+    if not isinstance(line_bay_info, dict):
+        return line_bay_info
+    bay_ref_gdf = load_line_bay_layer(
+        line_bay_info.get("path"),
+        line_bay_info.get("layer"),
+        line_bay_info.get("field"),
+    )
+    if bay_ref_gdf is None or bay_ref_gdf.empty:
+        return line_bay_info
+
+    geom_col_ref = bay_ref_gdf.geometry.name if hasattr(bay_ref_gdf, "geometry") else None
+    bay_val_cols = [c for c in bay_ref_gdf.columns if c != geom_col_ref]
+    bay_val_col = bay_val_cols[0] if bay_val_cols else None
+
+    id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
+    reverse_name_to_id: dict[str, str] = {}
+    if isinstance(id_name_map, dict):
+        for k, v in id_name_map.items():
+            k_norm = normalize_value_for_compare(k)
+            v_norm = normalize_value_for_compare(v)
+            if k_norm and v_norm and v_norm not in reverse_name_to_id:
+                reverse_name_to_id[v_norm] = k_norm
+
+    def _canon_bay_key(raw_val: Any) -> str:
+        norm_val = normalize_value_for_compare(raw_val)
+        if not norm_val:
+            return ""
+        mapped = reverse_name_to_id.get(norm_val, norm_val)
+        try:
+            match = re.search(r"e0*(\d+)", mapped)
+            if match:
+                return f"e{int(match.group(1))}"
+        except Exception:
+            pass
+        return mapped
+
+    bay_centroid_by_key: dict[str, Any] = {}
+    bay_geom_by_idx: dict[int, Any] = {}
+    bay_center_by_idx: dict[int, Any] = {}
+    if bay_val_col and geom_col_ref:
+        for idx, row in bay_ref_gdf.iterrows():
+            key = _canon_bay_key(row.get(bay_val_col))
+            geom = row.get(geom_col_ref)
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            try:
+                idx_key = int(idx)
+            except Exception:
+                idx_key = idx
+            bay_geom_by_idx[idx_key] = geom
+            try:
+                center = geom.centroid
+            except Exception:
+                try:
+                    center = geom.representative_point()
+                except Exception:
+                    center = None
+            if center is not None and not getattr(center, "is_empty", True):
+                bay_center_by_idx[idx_key] = center
+                if key:
+                    bay_centroid_by_key[key] = center
+    line_bay_info["bay_centroid_by_key"] = bay_centroid_by_key
+
+    def _group_points_by_key(points_gdf: gpd.GeoDataFrame | None) -> dict[str, Any]:
+        refs_by_key: dict[str, Any] = {}
+        if points_gdf is None or points_gdf.empty or not bay_val_col:
+            return refs_by_key
+        points_by_bay = map_points_to_bays(points_gdf, bay_ref_gdf)
+        grouped_pts: dict[str, list[Any]] = {}
+        for bay_idx, pts in points_by_bay.items():
+            if not pts:
+                continue
+            try:
+                bay_row = bay_ref_gdf.iloc[int(bay_idx)]
+            except Exception:
+                continue
+            key = _canon_bay_key(bay_row.get(bay_val_col))
+            if not key:
+                continue
+            grouped_pts.setdefault(key, []).extend(pts)
+        for key, pts in grouped_pts.items():
+            valid_pts = [p for p in pts if p is not None and not getattr(p, "is_empty", True)]
+            if not valid_pts:
+                continue
+            if len(valid_pts) == 1:
+                refs_by_key[key] = valid_pts[0]
+                continue
+            try:
+                from shapely.geometry import MultiPoint
+
+                refs_by_key[key] = MultiPoint(valid_pts).centroid
+            except Exception:
+                refs_by_key[key] = valid_pts[0]
+        return refs_by_key
+
+    vt_norms = {normalize_for_compare("Voltage Transformer")}
+    vt_points = collect_device_points_from_uploads(
+        files,
+        bay_ref_gdf.crs,
+        device_options,
+        equip_map,
+        vt_norms,
+    )
+    line_bay_info["vt_ref_by_key"] = _group_points_by_key(vt_points)
+
+    hv_line_norms = {normalize_for_compare("High Voltage Line")}
+    hv_lines = collect_device_linear_geometries_from_uploads(
+        files,
+        bay_ref_gdf.crs,
+        device_options,
+        equip_map,
+        hv_line_norms,
+    )
+    exit_points: list[Any] = []
+    if hv_lines is not None and not hv_lines.empty:
+        for line_geom in hv_lines.geometry:
+            if line_geom is None or getattr(line_geom, "is_empty", True):
+                continue
+            for bay_idx, bay_geom in bay_geom_by_idx.items():
+                if bay_geom is None or getattr(bay_geom, "is_empty", True):
+                    continue
+                try:
+                    if not line_geom.intersects(bay_geom):
+                        continue
+                except Exception:
+                    continue
+                ref_pt = _build_line_exit_reference_point(
+                    line_geom,
+                    bay_geom,
+                    bay_center_by_idx.get(bay_idx),
+                )
+                if ref_pt is not None and not getattr(ref_pt, "is_empty", True):
+                    exit_points.append(ref_pt)
+    exit_points_gdf = (
+        gpd.GeoDataFrame(geometry=exit_points, crs=bay_ref_gdf.crs) if exit_points else None
+    )
+    line_bay_info["line_exit_ref_by_key"] = _group_points_by_key(exit_points_gdf)
+
+    busbar_norms = {normalize_for_compare("High Voltage Busbar/Medium Voltage Busbar")}
+    busbar_lines = collect_device_linear_geometries_from_uploads(
+        files,
+        bay_ref_gdf.crs,
+        device_options,
+        equip_map,
+        busbar_norms,
+    )
+    if busbar_lines is not None and not busbar_lines.empty:
+        line_bay_info["busbar_geometries"] = [
+            geom
+            for geom in busbar_lines.geometry
+            if geom is not None and not getattr(geom, "is_empty", True)
+        ]
+    else:
+        line_bay_info["busbar_geometries"] = []
+
+    return line_bay_info
+
+
 def _extract_bay_name_from_row(row: pd.Series, name_field: str | None, id_name_map: dict[str, Any]) -> Any:
     """Resolve a bay name from a row, falling back to id->name map and other name-like columns."""
     bay_val = row.get(name_field) if name_field else None
@@ -2983,6 +3314,7 @@ def _fill_supervisor_batch(
     fill_one_gpkg_fn,
     seq_assign_fallback: bool = True,
     output_prefix: str | None = None,
+    id_validation_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[str, Path]], list[str], list[dict[str, Any]]]:
     """Fill a batch of supervisor GeoPackages and return outputs + logs + domain rows."""
     logs: list[str] = []
@@ -2990,7 +3322,9 @@ def _fill_supervisor_batch(
     instance_cache: dict[str, list[dict[str, Any]]] = {}
     uploaded_device_norms: set[str] = set()
     run_domain_rows: list[dict[str, Any]] = []
+    validated_rewrite_devices: set[str] = set()
     prefix_label = f"{output_prefix}/" if output_prefix else ""
+    substation_label = output_prefix or ""
 
     def _record_output(name: str, out_path: Path) -> None:
         arc_name = Path(name).name
@@ -3003,6 +3337,42 @@ def _fill_supervisor_batch(
         if gpkg_path is None:
             raise ValueError("Could not read GeoPackage.")
         return gpkg_path
+
+    def _append_validation_log(row: dict[str, Any], output_name: str | None) -> None:
+        status = row.get("status")
+        if status == "ok":
+            return
+        label = f"{prefix_label}{output_name}" if output_name else f"{prefix_label}{row.get('device', 'device')}"
+        logs.append(
+            f"{label}: rewritten ID validation {status} "
+            f"(missing workbook ids={row.get('missing_workbook_id_count', 0)}, "
+            f"extra output ids={row.get('extra_output_id_count', 0)})."
+        )
+
+    def _validate_rewritten_output(
+        device_name: str | None,
+        output_name: str | None,
+        out_path: Path | None,
+        instances: list[dict[str, Any]] | None,
+    ) -> None:
+        spec = _get_rewritten_id_validation_spec(device_name)
+        if spec is None:
+            return
+        validated_rewrite_devices.add(normalize_for_compare(device_name))
+        row = build_rewritten_id_validation_row(
+            substation_label,
+            sup_wb_path,
+            sup_sheet,
+            spec.get("device_name", device_name or ""),
+            output_name,
+            out_path,
+            instances,
+        )
+        if row is None:
+            return
+        if id_validation_rows is not None:
+            id_validation_rows.append(row)
+        _append_validation_log(row, output_name)
 
     def _pick_instance_for_file(name: str, instances: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not instances:
@@ -3046,96 +3416,12 @@ def _fill_supervisor_batch(
             control_panel_polygons_cached = []
 
     if isinstance(line_bay_info, dict):
-        line_bay_info = dict(line_bay_info)
-        try:
-            bay_ref_gdf = load_line_bay_layer(
-                line_bay_info.get("path"),
-                line_bay_info.get("layer"),
-                line_bay_info.get("field"),
-            )
-        except Exception:
-            bay_ref_gdf = None
-        if bay_ref_gdf is not None and not bay_ref_gdf.empty:
-            geom_col_ref = bay_ref_gdf.geometry.name if hasattr(bay_ref_gdf, "geometry") else None
-            bay_val_cols = [c for c in bay_ref_gdf.columns if c != geom_col_ref]
-            bay_val_col = bay_val_cols[0] if bay_val_cols else None
-
-            id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-            reverse_name_to_id: dict[str, str] = {}
-            if isinstance(id_name_map, dict):
-                for k, v in id_name_map.items():
-                    k_norm = normalize_value_for_compare(k)
-                    v_norm = normalize_value_for_compare(v)
-                    if k_norm and v_norm and v_norm not in reverse_name_to_id:
-                        reverse_name_to_id[v_norm] = k_norm
-
-            def _canon_bay_key(raw_val: Any) -> str:
-                norm_val = normalize_value_for_compare(raw_val)
-                if not norm_val:
-                    return ""
-                mapped = reverse_name_to_id.get(norm_val, norm_val)
-                try:
-                    match = re.search(r"e0*(\d+)", mapped)
-                    if match:
-                        return f"e{int(match.group(1))}"
-                except Exception:
-                    pass
-                return mapped
-
-            bay_centroid_by_key: dict[str, Any] = {}
-            if bay_val_col and geom_col_ref:
-                for _, row in bay_ref_gdf.iterrows():
-                    key = _canon_bay_key(row.get(bay_val_col))
-                    geom = row.get(geom_col_ref)
-                    if not key or geom is None or getattr(geom, "is_empty", True):
-                        continue
-                    try:
-                        bay_centroid_by_key[key] = geom.centroid
-                    except Exception:
-                        try:
-                            bay_centroid_by_key[key] = geom.representative_point()
-                        except Exception:
-                            continue
-            line_bay_info["bay_centroid_by_key"] = bay_centroid_by_key
-
-            vt_ref_by_key: dict[str, Any] = {}
-            if bay_val_col:
-                vt_norms = {normalize_for_compare("Voltage Transformer")}
-                vt_points = collect_device_points_from_uploads(
-                    files,
-                    bay_ref_gdf.crs,
-                    device_options,
-                    equip_map_sup,
-                    vt_norms,
-                )
-                if vt_points is not None and not vt_points.empty:
-                    points_by_bay = map_points_to_bays(vt_points, bay_ref_gdf)
-                    grouped_pts: dict[str, list[Any]] = {}
-                    for bay_idx, pts in points_by_bay.items():
-                        if not pts:
-                            continue
-                        try:
-                            bay_row = bay_ref_gdf.iloc[int(bay_idx)]
-                        except Exception:
-                            continue
-                        key = _canon_bay_key(bay_row.get(bay_val_col))
-                        if not key:
-                            continue
-                        grouped_pts.setdefault(key, []).extend(pts)
-                    for key, pts in grouped_pts.items():
-                        valid_pts = [p for p in pts if p is not None and not getattr(p, "is_empty", True)]
-                        if not valid_pts:
-                            continue
-                        if len(valid_pts) == 1:
-                            vt_ref_by_key[key] = valid_pts[0]
-                            continue
-                        try:
-                            from shapely.geometry import MultiPoint
-
-                            vt_ref_by_key[key] = MultiPoint(valid_pts).centroid
-                        except Exception:
-                            vt_ref_by_key[key] = valid_pts[0]
-            line_bay_info["vt_ref_by_key"] = vt_ref_by_key
+        line_bay_info = enrich_line_bay_reference_info(
+            files,
+            device_options,
+            equip_map_sup,
+            dict(line_bay_info),
+        )
 
     for file_obj in files:
         file_name = _get_file_name(file_obj)
@@ -3147,25 +3433,25 @@ def _fill_supervisor_batch(
                 logs.append(f"{prefix_label}{file_name}: skipped fill (kept original geometry).")
                 continue
             device_for_file = resolve_equipment_name(file_name, device_options, equip_map_sup)
-            if device_for_file not in device_options:
-                logs.append(
-                    f"{prefix_label}{file_name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
-                )
-                continue
             device_norm = normalize_for_compare(device_for_file)
-            if device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
+            if device_norm and device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
                 uploaded_device_norms.add(device_norm)
             if device_for_file not in instance_cache:
                 instance_cache[device_for_file] = parse_supervisor_device_table(
                     sup_wb_path, sup_sheet, device_for_file
                 )
-            inst = _pick_instance_for_file(file_name, instance_cache.get(device_for_file, []))
-            seq_arg = None
             cached_instances = instance_cache.get(device_for_file, [])
             type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
             if not cached_instances:
-                logs.append(f"{prefix_label}{file_name}: skipped (no instances in sheet).")
+                out_path = _write_original_file(file_obj)
+                _record_output(file_name, out_path)
+                logs.append(
+                    f"{prefix_label}{file_name}: kept original file (no supervisor rows for device '{device_for_file or 'unknown'}')."
+                )
+                _validate_rewritten_output(device_for_file, file_name, out_path, cached_instances)
                 continue
+            inst = _pick_instance_for_file(file_name, cached_instances)
+            seq_arg = None
             if len(cached_instances) > 1:
                 seq_arg = cached_instances
             elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
@@ -3225,10 +3511,17 @@ def _fill_supervisor_batch(
             logs.append(
                 f"{prefix_label}{file_name}: filled using device '{device_for_file}' ({chosen_label}) on layer '{used_layer}'."
             )
+            _validate_rewritten_output(device_for_file, file_name, out_path, cached_instances)
         except Exception as exc:
             out_path = _write_original_file(file_obj)
             _record_output(file_name, out_path)
             logs.append(f"{prefix_label}{file_name}: failed ({exc}); kept original file.")
+            _validate_rewritten_output(
+                locals().get("device_for_file"),
+                file_name,
+                out_path,
+                locals().get("cached_instances"),
+            )
 
     protection_devices = [
         dev for dev in device_options if normalize_for_compare(dev) in PROTECTION_LAYOUT_DEVICES
@@ -3685,6 +3978,23 @@ def _fill_supervisor_batch(
         )
         logs.append(f"{prefix_label}{dev_name}: auto-created from template ({len(geoms)} feature(s)).")
 
+    for spec in _rewritten_id_validation_specs():
+        dev_name = spec.get("device_name")
+        dev_norm = normalize_for_compare(dev_name)
+        if not dev_norm or dev_norm in validated_rewrite_devices:
+            continue
+        if dev_name not in instance_cache:
+            instance_cache[dev_name] = parse_supervisor_device_table(sup_wb_path, sup_sheet, dev_name)
+        instances = instance_cache.get(dev_name, [])
+        workbook_ids = _dedupe_id_texts([
+            inst.get("id_value")
+            for inst in instances
+            if isinstance(inst, dict)
+        ])
+        if not workbook_ids:
+            continue
+        _validate_rewritten_output(dev_name, None, None, instances)
+
     return outputs, logs, run_domain_rows
 
 
@@ -4030,6 +4340,7 @@ def build_spatial_match_targets(
     bay_path: Path,
     bay_layer: str | None,
     bay_field: str | None,
+    allow_nearest_fallback: bool = True,
 ) -> pd.Series:
     """Return normalized match targets for each line feature based on Line Bay polygons."""
     if line_gdf is None or line_gdf.empty or bay_path is None or bay_layer is None or bay_field is None:
@@ -4109,7 +4420,10 @@ def build_spatial_match_targets(
     series = joined[field_name] if field_name in joined.columns else pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
     series = series.reindex(line_gdf.index)
 
-    # Nearest-bay fallback for features that do not intersect any Line Bay polygon.
+    # Optional nearest-bay fallback for features that do not intersect any Line Bay polygon.
+    if not allow_nearest_fallback:
+        return series.map(normalize_value_for_compare)
+
     try:
         missing_mask = series.isna() | series.map(lambda v: normalize_value_for_compare(v) == "")
     except Exception:
@@ -4357,6 +4671,201 @@ def normalize_value_for_compare(value: Any) -> str:
 
     text = text.lower().replace("_", "").replace("-", "")
     return " ".join(text.split()).strip()
+
+
+def id_validation_rows_to_csv(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    fieldnames = sorted({key for row in rows for key in row.keys()})
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def _rewritten_id_validation_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "device_name": "Voltage Transformer",
+            "output_id_aliases": [
+                "VoltageTransfomer_ID",
+                "VoltageTransformer_ID",
+                "Voltage Transformer ID",
+            ],
+        },
+        {
+            "device_name": "Current Transformer",
+            "output_id_aliases": [
+                "Current Transfomer ID",
+                "CurrentTransformer_ID",
+                "CurrentTransformerID",
+                "Current Transformer ID",
+            ],
+        },
+        {
+            "device_name": "Lightning Arrester",
+            "output_id_aliases": [
+                "ArresterID",
+                "Arrester_ID",
+                "Arrester ID",
+                "LightningArresterID",
+                "Lightning Arrester ID",
+            ],
+        },
+        {
+            "device_name": "High Voltage Circuit Breaker/High Voltage Circuit Breaker",
+            "output_id_aliases": [
+                "CircuitBreakerID",
+                "Circuit_Breaker_ID",
+                "Circuit Breaker ID",
+            ],
+        },
+        {
+            "device_name": "High Voltage Switch/High Voltage Switch",
+            "output_id_aliases": [
+                "HV_Switch_ID",
+                "HV Switch ID",
+                "HVSwitchID",
+                "Disconnector_ID",
+                "Disconnector ID",
+            ],
+        },
+    ]
+
+
+def _get_rewritten_id_validation_spec(device_name: Any) -> dict[str, Any] | None:
+    dev_norm = normalize_for_compare(device_name)
+    if not dev_norm:
+        return None
+    for spec in _rewritten_id_validation_specs():
+        if normalize_for_compare(spec.get("device_name")) == dev_norm:
+            return spec
+    return None
+
+
+def _dedupe_id_texts(values: list[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            if value is None or pd.isna(value):
+                continue
+        except Exception:
+            if value is None:
+                continue
+        text = str(value).strip()
+        if not text:
+            continue
+        norm = normalize_value_for_compare(text)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(text)
+    return out
+
+
+def _pick_existing_column_name(columns: list[str], aliases: list[str]) -> str | None:
+    lookup = {normalize_for_compare(col): col for col in columns}
+    for alias in aliases:
+        col = lookup.get(normalize_for_compare(alias))
+        if col:
+            return col
+    return None
+
+
+def _read_output_ids_for_validation(out_path: Path, id_aliases: list[str]) -> tuple[list[str], str | None, str | None]:
+    try:
+        layers = list_gpkg_layers(out_path)
+    except Exception:
+        layers = []
+    try:
+        if layers:
+            out_gdf = gpd.read_file(out_path, layer=layers[0])
+        else:
+            out_gdf = gpd.read_file(out_path)
+    except Exception as exc:
+        return [], None, f"{type(exc).__name__}: {exc}"
+    id_col = _pick_existing_column_name(list(out_gdf.columns), id_aliases)
+    if not id_col:
+        return [], None, "id column not found"
+    return _dedupe_id_texts(out_gdf[id_col].tolist()), id_col, None
+
+
+def build_rewritten_id_validation_row(
+    substation_name: str | None,
+    workbook_path: Path | None,
+    sheet_name: str | None,
+    device_name: str,
+    output_name: str | None,
+    out_path: Path | None,
+    instances: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    spec = _get_rewritten_id_validation_spec(device_name)
+    if spec is None:
+        return None
+
+    workbook_ids = _dedupe_id_texts([
+        inst.get("id_value")
+        for inst in (instances or [])
+        if isinstance(inst, dict)
+    ])
+    output_ids: list[str] = []
+    output_id_col = None
+    read_error = None
+    if out_path is not None:
+        output_ids, output_id_col, read_error = _read_output_ids_for_validation(
+            out_path,
+            spec.get("output_id_aliases", []),
+        )
+
+    workbook_lookup = {normalize_value_for_compare(val): val for val in workbook_ids}
+    output_lookup = {normalize_value_for_compare(val): val for val in output_ids}
+    missing_workbook_ids = [
+        workbook_lookup[norm]
+        for norm in workbook_lookup
+        if norm not in output_lookup
+    ]
+    extra_output_ids = [
+        output_lookup[norm]
+        for norm in output_lookup
+        if norm not in workbook_lookup
+    ]
+
+    if out_path is None:
+        status = "output_missing"
+    elif read_error:
+        status = "output_read_failed"
+    elif not workbook_ids and output_ids:
+        status = "workbook_ids_missing"
+    elif extra_output_ids and missing_workbook_ids:
+        status = "extra_and_missing"
+    elif extra_output_ids:
+        status = "extra_output_ids"
+    elif missing_workbook_ids:
+        status = "missing_workbook_ids"
+    else:
+        status = "ok"
+
+    return {
+        "substation": substation_name or "",
+        "workbook": workbook_path.name if workbook_path else "",
+        "sheet": sheet_name or "",
+        "device": device_name,
+        "output_file": output_name or "",
+        "output_id_column": output_id_col or "",
+        "status": status,
+        "workbook_id_count": len(workbook_ids),
+        "output_id_count": len(output_ids),
+        "missing_workbook_id_count": len(missing_workbook_ids),
+        "extra_output_id_count": len(extra_output_ids),
+        "workbook_ids": "; ".join(workbook_ids),
+        "output_ids": "; ".join(output_ids),
+        "missing_workbook_ids": "; ".join(missing_workbook_ids),
+        "extra_output_ids": "; ".join(extra_output_ids),
+        "read_error": read_error or "",
+    }
 
 # Hard overrides for filename -> device label when heuristics/alias map are insufficient.
 FILE_DEVICE_OVERRIDES = {
@@ -5813,11 +6322,14 @@ def fill_one_gpkg(
                 hit = False
         return hit
 
-    # Remove exact duplicate point features for outdoor VT/CT layers.
+    # Remove exact duplicate point features for rewritten outdoor point devices.
     if _is_device_target(
         {
             normalize_for_compare("Voltage Transformer"),
             normalize_for_compare("Current Transformer"),
+            normalize_for_compare("Lightning Arrester"),
+            normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker"),
+            normalize_for_compare("High Voltage Switch/High Voltage Switch"),
         }
     ) and hasattr(out_gdf, "geometry") and out_gdf.geometry is not None:
         keep_idx: list[Any] = []
@@ -5922,227 +6434,199 @@ def fill_one_gpkg(
                 resolved[pos] = best_key
         return resolved
 
-    def _overwrite_device_ids_from_line_bay(
-        device_targets: set[str],
-        id_aliases: list[str],
-        name_aliases: list[str],
-        default_id_col: str,
-        id_prefix: str,
-    ) -> None:
-        if len(out_gdf) <= 0:
-            return
-        dev_match = normalize_for_compare(device_name) in device_targets
-        if not dev_match:
-            try:
-                layer_norm = normalize_for_compare(layer or "")
-                dev_match = any(target in layer_norm or layer_norm == target for target in device_targets)
-            except Exception:
-                dev_match = False
-        if not dev_match:
-            try:
-                file_norm = normalize_for_compare(Path(file_name).stem)
-                dev_match = any(target in file_norm or file_norm == target for target in device_targets)
-            except Exception:
-                dev_match = False
-        if not dev_match:
-            return
-
-        norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
-        line_bay_aliases = [
-            "Line_Bay_ID",
-            "Line Bay ID",
-            "LineBayID",
-            "LineBay_ID",
-            "Line_Bay_Name",
-            "Line Bay Name",
-            "LineBayName",
-            "Line Bay",
-            "Line_Bay",
-        ]
-        line_bay_col = None
-        for alias in line_bay_aliases:
-            col = norm_lookup.get(normalize_for_compare(alias))
-            if col:
-                line_bay_col = col
-                break
-
-        bay_keys: list[str] = []
-        if (
-            line_bay_info is not None
-            and hasattr(out_gdf, "geometry")
-            and out_gdf.geometry is not None
-        ):
-            try:
-                spatial_series = build_spatial_match_targets(
-                    out_gdf,
-                    line_bay_info.get("path"),
-                    line_bay_info.get("layer"),
-                    line_bay_info.get("field"),
-                )
-                if spatial_series is not None and len(spatial_series) == len(out_gdf):
-                    spatial_keys = [normalize_value_for_compare(v) for v in spatial_series.tolist()]
-                    if any(spatial_keys):
-                        bay_keys = spatial_keys
-            except Exception:
-                pass
-        if not bay_keys and line_bay_col:
-            bay_keys = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
-        if bay_keys and len(bay_keys) == len(out_gdf):
-            bay_keys = _fill_missing_bay_keys_by_nearest(bay_keys)
-        if bay_keys:
-            has_any_key = any(normalize_value_for_compare(v) for v in bay_keys)
-            if not has_any_key:
-                bay_keys = []
-        if not bay_keys:
-            return
-
-        id_col = None
-        for alias in id_aliases:
-            col = norm_lookup.get(normalize_for_compare(alias))
-            if col:
-                id_col = col
-                break
-        if id_col is None:
-            id_col = default_id_col
-            out_gdf[id_col] = pd.NA
-
-        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-        reverse_name_to_id: dict[str, str] = {}
-        if isinstance(id_name_map, dict):
-            for k, v in id_name_map.items():
-                k_norm = normalize_value_for_compare(k)
-                v_norm = normalize_value_for_compare(v)
-                if k_norm and v_norm and v_norm not in reverse_name_to_id:
-                    reverse_name_to_id[v_norm] = k_norm
-
-        def _canonical_bay_key(raw_val: Any) -> str:
-            norm_val = normalize_value_for_compare(raw_val)
-            if not norm_val:
-                return ""
-            mapped = reverse_name_to_id.get(norm_val, norm_val)
-            try:
-                match = re.search(r"e0*(\d+)", mapped)
-                if match:
-                    return f"e{int(match.group(1))}"
-            except Exception:
-                pass
-            return mapped
-
-        unique_bays: list[str] = []
-        seen_bays: set[str] = set()
-        for raw in bay_keys:
-            key = _canonical_bay_key(raw)
-            if key not in seen_bays:
-                seen_bays.add(key)
-                unique_bays.append(key)
-
-        def _extract_base(raw_val: Any) -> int | None:
-            norm_val = _canonical_bay_key(raw_val)
-            if not norm_val:
-                return None
-            try:
-                match = re.search(r"e0*(\d+)", norm_val)
-                if match:
-                    return int(match.group(1))
-                digits = re.findall(r"\d+", norm_val)
-                if digits:
-                    return int(digits[-1])
-            except Exception:
-                return None
-            return None
-
-        bay_base: dict[str, int] = {}
-        used_bases: set[int] = set()
-        for key in unique_bays:
-            base = _extract_base(key)
-            if base is not None and base > 0:
-                bay_base[key] = base
-                used_bases.add(base)
-
-        next_base = max(used_bases) + 1 if used_bases else 1
-        for key in unique_bays:
-            if key in bay_base:
-                continue
-            while next_base in used_bases:
-                next_base += 1
-            bay_base[key] = next_base
-            used_bases.add(next_base)
-            next_base += 1
-
-        bay_counts: dict[str, int] = {}
-        new_ids: list[str] = []
-        for raw in bay_keys:
-            key = _canonical_bay_key(raw)
-            base = bay_base.get(key)
-            if base is None:
-                while next_base in used_bases:
-                    next_base += 1
-                base = next_base
-                used_bases.add(base)
-                next_base += 1
-                bay_base[key] = base
-            bay_counts[key] = bay_counts.get(key, 0) + 1
-            seq = bay_counts[key]
-            new_ids.append(f"{id_prefix}{base}-{seq}")
-        out_gdf[id_col] = new_ids
-
-        name_cols: list[str] = []
-        for alias in name_aliases:
-            col = norm_lookup.get(normalize_for_compare(alias))
-            if col and col not in name_cols:
-                name_cols.append(col)
-        for col in name_cols:
-            out_gdf[col] = new_ids
-
-    # Post-fill: overwrite Voltage Transformer IDs using Line Bay IDs (E03 -> VT3-1, VT3-2, ...).
-    _overwrite_device_ids_from_line_bay(
-        {
-            normalize_for_compare("Voltage Transformer"),
-        },
-        [
-            "VoltageTransfomer_ID",
-            "Voltage Transformer ID",
-            "VoltageTransfomerID",
-            "Voltage Transformer Id",
-            "VoltageTransformerID",
-        ],
-        [
-            "Voltage Transformer Name",
-            "VoltageTransfomer_Name",
-            "VoltageTransformerName",
-            "Name",
-            "name",
-        ],
-        default_id_col="VoltageTransfomer_ID",
-        id_prefix="VT",
-    )
-
-    # Post-fill: overwrite Current Transformer IDs using Line Bay IDs (E03 -> CT3-1, CT3-2, ...).
-    _overwrite_device_ids_from_line_bay(
-        {
-            normalize_for_compare("Current Transformer"),
-        },
-        [
-            "CurrentTransfomer_ID",
-            "CurrentTransformer_ID",
-            "Current Transformer ID",
-            "Current Transformer Id",
-            "CurrentTransfomerID",
-            "CurrentTransformerID",
-        ],
-        [
-            "Current Transformer Name",
-            "CurrentTransfomer_Name",
-            "CurrentTransformerName",
-            "Name",
-            "name",
-        ],
-        default_id_col="CurrentTransfomerID",
-        id_prefix="CT",
-    )
-
     def _matches_device_targets(targets: set[str]) -> bool:
         return _is_device_target(targets)
+
+    def _order_group_indices(indices: list[Any]) -> list[Any]:
+        if len(indices) <= 1 or not hasattr(out_gdf, "geometry"):
+            return list(indices)
+        try:
+            ordered = order_indices_by_location(out_gdf.loc[indices].geometry)
+            if ordered:
+                return ordered
+        except Exception:
+            pass
+        return list(indices)
+
+    def _indices_near_busbar(max_distance: float = 2.0) -> set[Any]:
+        if not hasattr(out_gdf, "geometry") or out_gdf.geometry is None:
+            return set()
+        if not isinstance(line_bay_info, dict):
+            return set()
+        busbar_geometries = line_bay_info.get("busbar_geometries")
+        if not isinstance(busbar_geometries, list) or not busbar_geometries:
+            return set()
+        hits: set[Any] = set()
+        for idx_val, geom in out_gdf.geometry.items():
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            try:
+                pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
+            except Exception:
+                continue
+            if pt is None or getattr(pt, "is_empty", True):
+                continue
+            for busbar_geom in busbar_geometries:
+                if busbar_geom is None or getattr(busbar_geom, "is_empty", True):
+                    continue
+                try:
+                    if pt.distance(busbar_geom) <= max_distance:
+                        hits.add(idx_val)
+                        break
+                except Exception:
+                    continue
+        return hits
+
+    def _existing_text_id_by_index(id_col: str | None) -> dict[Any, str]:
+        out: dict[Any, str] = {}
+        if not id_col or id_col not in out_gdf.columns:
+            return out
+        try:
+            series = out_gdf[id_col]
+        except Exception:
+            return out
+        for idx_val, raw_val in series.items():
+            try:
+                if raw_val is None or pd.isna(raw_val):
+                    continue
+            except Exception:
+                if raw_val is None:
+                    continue
+            text = str(raw_val).strip()
+            if text:
+                out[idx_val] = text
+        return out
+
+    def _flatten_sheet_ids_by_base(sheet_ids_by_base: dict[int, list[str]]) -> list[str]:
+        flat: list[str] = []
+        for base in sorted(sheet_ids_by_base):
+            flat.extend(sheet_ids_by_base.get(base, []))
+        return flat
+
+    def _flatten_switch_sheet_ids_by_base(sheet_ids_by_base: dict[int, dict[str, list[str]]]) -> list[str]:
+        flat: list[str] = []
+        for base in sorted(sheet_ids_by_base):
+            role_map = sheet_ids_by_base.get(base, {})
+            flat.extend(role_map.get("Q9", []))
+            flat.extend(role_map.get("Q1", []))
+        return flat
+
+    def _assign_remaining_ids(
+        candidate_indices: list[Any],
+        all_sheet_ids: list[str],
+        used_ids: set[str],
+        existing_ids_by_index: dict[Any, str],
+    ) -> dict[Any, str]:
+        assigned: dict[Any, str] = {}
+        ordered_candidates = _order_group_indices(candidate_indices)
+        remaining_lookup: dict[str, str] = {}
+        for text_id in all_sheet_ids:
+            norm_id = normalize_value_for_compare(text_id)
+            if not norm_id or norm_id in used_ids or norm_id in remaining_lookup:
+                continue
+            remaining_lookup[norm_id] = text_id
+
+        pending: list[Any] = []
+        for idx_val in ordered_candidates:
+            existing_id = existing_ids_by_index.get(idx_val)
+            norm_existing = normalize_value_for_compare(existing_id)
+            if norm_existing and norm_existing in remaining_lookup:
+                assigned[idx_val] = remaining_lookup.pop(norm_existing)
+                used_ids.add(norm_existing)
+            else:
+                pending.append(idx_val)
+
+        remaining_ids = list(remaining_lookup.values())
+        for idx_val, text_id in zip(pending, remaining_ids):
+            norm_id = normalize_value_for_compare(text_id)
+            if not norm_id or norm_id in used_ids:
+                continue
+            assigned[idx_val] = text_id
+            used_ids.add(norm_id)
+
+        return assigned
+
+    def _parse_vt_ct_sheet_id(raw_id: Any, prefix: str) -> tuple[int, int] | None:
+        if raw_id is None or pd.isna(raw_id):
+            return None
+        text = str(raw_id).strip().upper().replace(" ", "").replace("_", "")
+        match = re.match(rf"^{prefix}0*(\d+)-?0*(\d+)$", text)
+        if not match:
+            return None
+        try:
+            return int(match.group(1)), int(match.group(2))
+        except Exception:
+            return None
+
+    def _parse_cb_sheet_id(raw_id: Any) -> tuple[int, int] | None:
+        if raw_id is None or pd.isna(raw_id):
+            return None
+        text = str(raw_id).strip().upper().replace(" ", "").replace("_", "")
+        match = re.match(r"^CB0*(\d+)$", text)
+        if not match:
+            return None
+        try:
+            return int(match.group(1)), 0
+        except Exception:
+            return None
+
+    def _parse_switch_sheet_id(raw_id: Any) -> tuple[int, str, int] | None:
+        if raw_id is None or pd.isna(raw_id):
+            return None
+        text = str(raw_id).strip().upper().replace(" ", "").replace("_", "")
+        match = re.match(r"^(Q1|Q9)-?0*(\d+)$", text)
+        if not match:
+            return None
+        try:
+            return int(match.group(2)), match.group(1), 0
+        except Exception:
+            return None
+
+    def _build_sheet_ids_by_base(id_parser) -> dict[int, list[str]]:
+        grouped: dict[int, list[tuple[int, str]]] = {}
+        seen: dict[int, set[str]] = {}
+        for entry in seq_entries:
+            raw_id = entry.get("id") or entry.get("name")
+            parsed = id_parser(raw_id)
+            if not parsed:
+                continue
+            base, sort_key = parsed
+            text_id = str(raw_id).strip()
+            if not text_id:
+                continue
+            seen.setdefault(base, set())
+            if text_id in seen[base]:
+                continue
+            seen[base].add(text_id)
+            grouped.setdefault(base, []).append((sort_key, text_id))
+        out: dict[int, list[str]] = {}
+        for base, items in grouped.items():
+            out[base] = [text_id for _, text_id in sorted(items, key=lambda t: (t[0], t[1]))]
+        return out
+
+    def _build_switch_sheet_ids_by_base() -> dict[int, dict[str, list[str]]]:
+        grouped: dict[int, dict[str, list[str]]] = {}
+        seen: dict[int, dict[str, set[str]]] = {}
+        for entry in seq_entries:
+            raw_id = entry.get("id") or entry.get("name")
+            parsed = _parse_switch_sheet_id(raw_id)
+            if not parsed:
+                continue
+            base, role, sort_key = parsed
+            text_id = str(raw_id).strip()
+            if not text_id:
+                continue
+            seen.setdefault(base, {}).setdefault(role, set())
+            if text_id in seen[base][role]:
+                continue
+            seen[base][role].add(text_id)
+            grouped.setdefault(base, {}).setdefault(role, []).append((sort_key, text_id))
+        out: dict[int, dict[str, list[str]]] = {}
+        for base, role_map in grouped.items():
+            out[base] = {}
+            for role, items in role_map.items():
+                out[base][role] = [text_id for _, text_id in sorted(items, key=lambda t: (t[0], t[1]))]
+        return out
 
     def _resolve_bay_keys_and_base() -> tuple[list[str], dict[str, int]]:
         if len(out_gdf) <= 0:
@@ -6177,6 +6661,7 @@ def fill_one_gpkg(
                     line_bay_info.get("path"),
                     line_bay_info.get("layer"),
                     line_bay_info.get("field"),
+                    allow_nearest_fallback=False,
                 )
                 if spatial_series is not None and len(spatial_series) == len(out_gdf):
                     vals = [normalize_value_for_compare(v) for v in spatial_series.tolist()]
@@ -6186,8 +6671,6 @@ def fill_one_gpkg(
                 pass
         if not bay_keys_raw and line_bay_col:
             bay_keys_raw = [normalize_value_for_compare(v) for v in out_gdf[line_bay_col].tolist()]
-        if bay_keys_raw and len(bay_keys_raw) == len(out_gdf):
-            bay_keys_raw = _fill_missing_bay_keys_by_nearest(bay_keys_raw)
         if bay_keys_raw:
             has_any_key = any(normalize_value_for_compare(v) for v in bay_keys_raw)
             if not has_any_key:
@@ -6242,12 +6725,16 @@ def fill_one_gpkg(
         bay_base: dict[str, int] = {}
         used: set[int] = set()
         for k in unique:
+            if not k:
+                continue
             b = _extract_base(k)
             if b is not None and b > 0:
                 bay_base[k] = b
                 used.add(b)
         nxt = max(used) + 1 if used else 1
         for k in unique:
+            if not k:
+                continue
             if k in bay_base:
                 continue
             while nxt in used:
@@ -6256,6 +6743,182 @@ def fill_one_gpkg(
             used.add(nxt)
             nxt += 1
         return bay_keys, bay_base
+
+    def _assign_sheet_device_ids_from_line_bay(
+        device_targets: set[str],
+        id_aliases: list[str],
+        name_aliases: list[str],
+        default_id_col: str,
+        id_prefix: str,
+    ) -> None:
+        nonlocal out_gdf
+        if len(out_gdf) <= 0 or not _matches_device_targets(device_targets):
+            return
+
+        bay_keys, bay_base = _resolve_bay_keys_and_base()
+        if not bay_keys or len(bay_keys) != len(out_gdf):
+            return
+
+        norm_lookup = {normalize_for_compare(c): c for c in out_gdf.columns}
+        id_col = None
+        for alias in id_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col:
+                id_col = col
+                break
+        if id_col is None:
+            id_col = default_id_col
+            out_gdf[id_col] = pd.NA
+        existing_ids_by_index = _existing_text_id_by_index(id_col)
+
+        name_cols: list[str] = []
+        for alias in name_aliases:
+            col = norm_lookup.get(normalize_for_compare(alias))
+            if col and col not in name_cols:
+                name_cols.append(col)
+
+        sheet_ids_by_base = _build_sheet_ids_by_base(
+            lambda raw_id: _parse_vt_ct_sheet_id(raw_id, id_prefix)
+        )
+        has_sheet_ids = bool(sheet_ids_by_base)
+        exclude_from_bay_matching: set[Any] = set()
+        if id_prefix == "VT":
+            exclude_from_bay_matching = _indices_near_busbar()
+
+        groups: dict[str, list[Any]] = {}
+        for idx_val, key in zip(list(out_gdf.index), bay_keys):
+            if idx_val in exclude_from_bay_matching:
+                key = ""
+            groups.setdefault(key, []).append(idx_val)
+
+        selected: list[Any] = []
+        new_ids: dict[Any, str] = {}
+        used_sheet_ids: set[str] = set()
+        for key, idxs in groups.items():
+            base = bay_base.get(key)
+            if base is None:
+                continue
+            ids_for_base = sheet_ids_by_base.get(base, [])
+            if has_sheet_ids and not ids_for_base:
+                continue
+            ordered = _order_group_indices(idxs)
+            if ids_for_base:
+                for idx_val, sheet_id in zip(ordered, ids_for_base):
+                    selected.append(idx_val)
+                    new_ids[idx_val] = sheet_id
+                    norm_id = normalize_value_for_compare(sheet_id)
+                    if norm_id:
+                        used_sheet_ids.add(norm_id)
+
+        if new_ids:
+            remaining_ids = _assign_remaining_ids(
+                [idx_val for idx_val in out_gdf.index if idx_val not in new_ids],
+                _flatten_sheet_ids_by_base(sheet_ids_by_base),
+                used_sheet_ids,
+                existing_ids_by_index,
+            )
+            new_ids.update(remaining_ids)
+            selected_set = set(new_ids)
+            ordered_selected = [idx_val for idx_val in out_gdf.index if idx_val in selected_set]
+            out_gdf = out_gdf.loc[ordered_selected].copy()
+            for idx_val, sheet_id in new_ids.items():
+                if idx_val not in out_gdf.index:
+                    continue
+                out_gdf.at[idx_val, id_col] = sheet_id
+                for col in name_cols:
+                    out_gdf.at[idx_val, col] = sheet_id
+            return
+
+        # Fallback when no workbook IDs could be resolved for this device.
+        bay_counts: dict[str, int] = {}
+        generated_ids: list[str] = []
+        used_bases: set[int] = {b for b in bay_base.values() if b is not None}
+        next_base = max(used_bases) + 1 if used_bases else 1
+        for key in bay_keys:
+            base = bay_base.get(key)
+            if base is None:
+                while next_base in used_bases:
+                    next_base += 1
+                base = next_base
+                bay_base[key] = base
+                used_bases.add(base)
+                next_base += 1
+            bay_counts[key] = bay_counts.get(key, 0) + 1
+            generated_ids.append(f"{id_prefix}{base}-{bay_counts[key]}")
+        out_gdf[id_col] = generated_ids
+        for col in name_cols:
+            out_gdf[col] = generated_ids
+
+    # Post-fill: assign workbook VT IDs to bays using the Line Bay arrangement logic.
+    _assign_sheet_device_ids_from_line_bay(
+        {
+            normalize_for_compare("Voltage Transformer"),
+        },
+        [
+            "VoltageTransfomer_ID",
+            "Voltage Transformer ID",
+            "VoltageTransfomerID",
+            "Voltage Transformer Id",
+            "VoltageTransformerID",
+        ],
+        [
+            "Voltage Transformer Name",
+            "VoltageTransfomer_Name",
+            "VoltageTransformerName",
+            "Name",
+            "name",
+        ],
+        default_id_col="VoltageTransfomer_ID",
+        id_prefix="VT",
+    )
+
+    # Post-fill: assign workbook CT IDs to bays using the Line Bay arrangement logic.
+    _assign_sheet_device_ids_from_line_bay(
+        {
+            normalize_for_compare("Current Transformer"),
+        },
+        [
+            "CurrentTransfomer_ID",
+            "CurrentTransformer_ID",
+            "Current Transformer ID",
+            "Current Transformer Id",
+            "CurrentTransfomerID",
+            "CurrentTransformerID",
+            "Current Transfomer ID",
+        ],
+        [
+            "Current Transformer Name",
+            "CurrentTransfomer_Name",
+            "CurrentTransformerName",
+            "Name",
+            "name",
+        ],
+        default_id_col="CurrentTransfomerID",
+        id_prefix="CT",
+    )
+
+    # Post-fill: assign workbook Lightning Arrester IDs using line-bay arrangement where applicable.
+    _assign_sheet_device_ids_from_line_bay(
+        {
+            normalize_for_compare("Lightning Arrester"),
+        },
+        [
+            "ArresterID",
+            "Arrester_ID",
+            "Arrester ID",
+            "LightningArresterID",
+            "Lightning Arrester ID",
+        ],
+        [
+            "Lightining Arrester Name",
+            "Lightning Arrester Name",
+            "Arrester Name",
+            "Name",
+            "name",
+        ],
+        default_id_col="ArresterID",
+        id_prefix="SA",
+    )
 
     # Post-fill: keep one middle HV CB per bay and rename to CB{bay} (E01 -> CB1, E02 -> CB2).
     if _matches_device_targets({normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker")}):
@@ -6273,7 +6936,10 @@ def fill_one_gpkg(
             if cb_id_col is None:
                 cb_id_col = "CircuitBreakerID"
                 out_gdf[cb_id_col] = pd.NA
+            existing_cb_ids_by_index = _existing_text_id_by_index(cb_id_col)
 
+            cb_sheet_ids_by_base = _build_sheet_ids_by_base(_parse_cb_sheet_id)
+            has_cb_sheet_ids = bool(cb_sheet_ids_by_base)
             bay_centroids = line_bay_info.get("bay_centroid_by_key", {}) if isinstance(line_bay_info, dict) else {}
 
             def _point_dist(idx_val: Any, ref_pt: Any) -> float:
@@ -6299,15 +6965,14 @@ def fill_one_gpkg(
 
             selected: list[Any] = []
             cb_new_ids: dict[Any, str] = {}
+            used_cb_ids: set[str] = set()
             for key, idxs in groups.items():
                 if not idxs:
                     continue
                 if not key:
-                    selected.extend(idxs)
                     continue
                 base = bay_base.get(key)
                 if base is None:
-                    selected.extend(idxs)
                     continue
                 chosen = None
                 ref_center = bay_centroids.get(key) if isinstance(bay_centroids, dict) else None
@@ -6325,10 +6990,25 @@ def fill_one_gpkg(
                         chosen = None
                 if chosen is None:
                     chosen = idxs[len(idxs) // 2]
+                sheet_ids = cb_sheet_ids_by_base.get(base, [])
+                if has_cb_sheet_ids and not sheet_ids:
+                    continue
                 selected.append(chosen)
-                cb_new_ids[chosen] = f"CB{base}"
+                cb_id = sheet_ids[0] if sheet_ids else f"CB{base}"
+                cb_new_ids[chosen] = cb_id
+                norm_id = normalize_value_for_compare(cb_id)
+                if norm_id:
+                    used_cb_ids.add(norm_id)
 
-            selected_set = set(selected)
+            remaining_cb_ids = _assign_remaining_ids(
+                [idx_val for idx_val in out_gdf.index if idx_val not in cb_new_ids],
+                _flatten_sheet_ids_by_base(cb_sheet_ids_by_base),
+                used_cb_ids,
+                existing_cb_ids_by_index,
+            )
+            cb_new_ids.update(remaining_cb_ids)
+
+            selected_set = set(cb_new_ids)
             ordered_selected = [idx_val for idx_val in out_gdf.index if idx_val in selected_set]
             if ordered_selected:
                 out_gdf = out_gdf.loc[ordered_selected].copy()
@@ -6344,7 +7024,7 @@ def fill_one_gpkg(
                     for col in cb_name_cols:
                         out_gdf.at[idx_val, col] = newid
 
-    # Post-fill: keep 2 disconnector switches per bay, Q9-{bay} near VT and Q1-{bay} for the other.
+    # Post-fill: keep 2 disconnector switches per bay, with Q9-{bay} at the line exit side.
     if _matches_device_targets({normalize_for_compare("High Voltage Switch/High Voltage Switch")}):
         bay_keys, bay_base = _resolve_bay_keys_and_base()
         if bay_keys and len(bay_keys) == len(out_gdf):
@@ -6366,8 +7046,12 @@ def fill_one_gpkg(
             if sw_id_col is None:
                 sw_id_col = "HV_Switch_ID"
                 out_gdf[sw_id_col] = pd.NA
+            existing_sw_ids_by_index = _existing_text_id_by_index(sw_id_col)
 
+            sw_sheet_ids_by_base = _build_switch_sheet_ids_by_base()
+            has_sw_sheet_ids = bool(sw_sheet_ids_by_base)
             bay_centroids = line_bay_info.get("bay_centroid_by_key", {}) if isinstance(line_bay_info, dict) else {}
+            line_exit_refs = line_bay_info.get("line_exit_ref_by_key", {}) if isinstance(line_bay_info, dict) else {}
             vt_refs = line_bay_info.get("vt_ref_by_key", {}) if isinstance(line_bay_info, dict) else {}
 
             def _point_dist(idx_val: Any, ref_pt: Any) -> float:
@@ -6393,46 +7077,73 @@ def fill_one_gpkg(
 
             selected: list[Any] = []
             sw_new_ids: dict[Any, str] = {}
+            used_sw_ids: set[str] = set()
             for key, idxs in groups.items():
                 if not idxs:
                     continue
                 if not key:
-                    selected.extend(idxs)
                     continue
                 base = bay_base.get(key)
                 if base is None:
-                    selected.extend(idxs)
                     continue
 
+                ref_exit = line_exit_refs.get(key) if isinstance(line_exit_refs, dict) else None
                 ref_vt = vt_refs.get(key) if isinstance(vt_refs, dict) else None
                 ref_center = bay_centroids.get(key) if isinstance(bay_centroids, dict) else None
+                sheet_ids = sw_sheet_ids_by_base.get(base, {})
+                q9_ids = sheet_ids.get("Q9", [])
+                q1_ids = sheet_ids.get("Q1", [])
+                if has_sw_sheet_ids and not q9_ids and not q1_ids:
+                    continue
 
-                if ref_vt is not None:
-                    q9_idx = min(idxs, key=lambda i: _point_dist(i, ref_vt))
+                if ref_exit is not None:
+                    q9_idx = min(idxs, key=lambda i: _point_dist(i, ref_exit))
+                elif ref_vt is not None:
+                    q9_idx = max(idxs, key=lambda i: _point_dist(i, ref_vt))
                 elif ref_center is not None:
-                    q9_idx = min(idxs, key=lambda i: _point_dist(i, ref_center))
+                    q9_idx = max(idxs, key=lambda i: _point_dist(i, ref_center))
                 else:
                     try:
                         ordered = order_indices_by_location(out_gdf.loc[idxs].geometry)
-                        q9_idx = ordered[len(ordered) // 2] if ordered else idxs[0]
+                        q9_idx = ordered[0] if ordered else idxs[0]
                     except Exception:
                         q9_idx = idxs[0]
 
-                selected.append(q9_idx)
-                sw_new_ids[q9_idx] = f"Q9-{base}"
+                if q9_ids or not has_sw_sheet_ids:
+                    q9_id = q9_ids[0] if q9_ids else f"Q9-{base}"
+                    selected.append(q9_idx)
+                    sw_new_ids[q9_idx] = q9_id
+                    norm_id = normalize_value_for_compare(q9_id)
+                    if norm_id:
+                        used_sw_ids.add(norm_id)
 
                 remaining = [i for i in idxs if i != q9_idx]
                 if remaining:
-                    if ref_vt is not None:
-                        q1_idx = max(remaining, key=lambda i: _point_dist(i, ref_vt))
+                    if ref_exit is not None:
+                        q1_idx = max(remaining, key=lambda i: _point_dist(i, ref_exit))
+                    elif ref_vt is not None:
+                        q1_idx = min(remaining, key=lambda i: _point_dist(i, ref_vt))
                     elif ref_center is not None:
-                        q1_idx = max(remaining, key=lambda i: _point_dist(i, ref_center))
+                        q1_idx = min(remaining, key=lambda i: _point_dist(i, ref_center))
                     else:
-                        q1_idx = remaining[0]
-                    selected.append(q1_idx)
-                    sw_new_ids[q1_idx] = f"Q1-{base}"
+                        q1_idx = remaining[-1]
+                    if q1_ids or not has_sw_sheet_ids:
+                        q1_id = q1_ids[0] if q1_ids else f"Q1-{base}"
+                        selected.append(q1_idx)
+                        sw_new_ids[q1_idx] = q1_id
+                        norm_id = normalize_value_for_compare(q1_id)
+                        if norm_id:
+                            used_sw_ids.add(norm_id)
 
-            selected_set = set(selected)
+            remaining_sw_ids = _assign_remaining_ids(
+                [idx_val for idx_val in out_gdf.index if idx_val not in sw_new_ids],
+                _flatten_switch_sheet_ids_by_base(sw_sheet_ids_by_base),
+                used_sw_ids,
+                existing_sw_ids_by_index,
+            )
+            sw_new_ids.update(remaining_sw_ids)
+
+            selected_set = set(sw_new_ids)
             ordered_selected = [idx_val for idx_val in out_gdf.index if idx_val in selected_set]
             if ordered_selected:
                 out_gdf = out_gdf.loc[ordered_selected].copy()
@@ -6844,6 +7555,7 @@ def run_app() -> None:
                 logs: list[str] = []
                 outputs: list[tuple[str, Path]] = []
                 run_domain_rows: list[dict[str, Any]] = []
+                run_id_validation_rows: list[dict[str, Any]] = []
                 try:
                     zip_files = sup_gpkg_zip if isinstance(sup_gpkg_zip, list) else [sup_gpkg_zip]
                     gpkg_paths: list[Path] = []
@@ -7004,6 +7716,7 @@ def run_app() -> None:
                                     fill_one_gpkg,
                                     seq_assign_fallback=seq_assign_fallback,
                                     output_prefix=substation_name,
+                                    id_validation_rows=run_id_validation_rows,
                                 )
                                 outputs.extend(batch_outputs)
                                 logs.extend(batch_logs)
@@ -7025,6 +7738,11 @@ def run_app() -> None:
                                 zf.write(out_path, arcname=name)
                             if run_domain_rows:
                                 zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                            if run_id_validation_rows:
+                                zf.writestr(
+                                    "rewritten_id_validation_report.csv",
+                                    id_validation_rows_to_csv(run_id_validation_rows),
+                                )
                         with open(zip_path, "rb") as f:
                             data = f.read()
                         st.download_button(
@@ -7343,96 +8061,12 @@ def run_app() -> None:
                         control_panel_polygons_cached = []
 
                 if isinstance(line_bay_info, dict):
-                    line_bay_info = dict(line_bay_info)
-                    try:
-                        bay_ref_gdf = load_line_bay_layer(
-                            line_bay_info.get("path"),
-                            line_bay_info.get("layer"),
-                            line_bay_info.get("field"),
-                        )
-                    except Exception:
-                        bay_ref_gdf = None
-                    if bay_ref_gdf is not None and not bay_ref_gdf.empty:
-                        geom_col_ref = bay_ref_gdf.geometry.name if hasattr(bay_ref_gdf, "geometry") else None
-                        bay_val_cols = [c for c in bay_ref_gdf.columns if c != geom_col_ref]
-                        bay_val_col = bay_val_cols[0] if bay_val_cols else None
-
-                        id_name_map = line_bay_info.get("id_name_map") if isinstance(line_bay_info, dict) else {}
-                        reverse_name_to_id: dict[str, str] = {}
-                        if isinstance(id_name_map, dict):
-                            for k, v in id_name_map.items():
-                                k_norm = normalize_value_for_compare(k)
-                                v_norm = normalize_value_for_compare(v)
-                                if k_norm and v_norm and v_norm not in reverse_name_to_id:
-                                    reverse_name_to_id[v_norm] = k_norm
-
-                        def _canon_bay_key(raw_val: Any) -> str:
-                            norm_val = normalize_value_for_compare(raw_val)
-                            if not norm_val:
-                                return ""
-                            mapped = reverse_name_to_id.get(norm_val, norm_val)
-                            try:
-                                match = re.search(r"e0*(\d+)", mapped)
-                                if match:
-                                    return f"e{int(match.group(1))}"
-                            except Exception:
-                                pass
-                            return mapped
-
-                        bay_centroid_by_key: dict[str, Any] = {}
-                        if bay_val_col and geom_col_ref:
-                            for _, row in bay_ref_gdf.iterrows():
-                                key = _canon_bay_key(row.get(bay_val_col))
-                                geom = row.get(geom_col_ref)
-                                if not key or geom is None or getattr(geom, "is_empty", True):
-                                    continue
-                                try:
-                                    bay_centroid_by_key[key] = geom.centroid
-                                except Exception:
-                                    try:
-                                        bay_centroid_by_key[key] = geom.representative_point()
-                                    except Exception:
-                                        continue
-                        line_bay_info["bay_centroid_by_key"] = bay_centroid_by_key
-
-                        vt_ref_by_key: dict[str, Any] = {}
-                        if bay_val_col:
-                            vt_norms = {normalize_for_compare("Voltage Transformer")}
-                            vt_points = collect_device_points_from_uploads(
-                                files,
-                                bay_ref_gdf.crs,
-                                device_options,
-                                equip_map_sup,
-                                vt_norms,
-                            )
-                            if vt_points is not None and not vt_points.empty:
-                                points_by_bay = map_points_to_bays(vt_points, bay_ref_gdf)
-                                grouped_pts: dict[str, list[Any]] = {}
-                                for bay_idx, pts in points_by_bay.items():
-                                    if not pts:
-                                        continue
-                                    try:
-                                        bay_row = bay_ref_gdf.iloc[int(bay_idx)]
-                                    except Exception:
-                                        continue
-                                    key = _canon_bay_key(bay_row.get(bay_val_col))
-                                    if not key:
-                                        continue
-                                    grouped_pts.setdefault(key, []).extend(pts)
-                                for key, pts in grouped_pts.items():
-                                    valid_pts = [p for p in pts if p is not None and not getattr(p, "is_empty", True)]
-                                    if not valid_pts:
-                                        continue
-                                    if len(valid_pts) == 1:
-                                        vt_ref_by_key[key] = valid_pts[0]
-                                        continue
-                                    try:
-                                        from shapely.geometry import MultiPoint
-
-                                        vt_ref_by_key[key] = MultiPoint(valid_pts).centroid
-                                    except Exception:
-                                        vt_ref_by_key[key] = valid_pts[0]
-                        line_bay_info["vt_ref_by_key"] = vt_ref_by_key
+                    line_bay_info = enrich_line_bay_reference_info(
+                        files,
+                        device_options,
+                        equip_map_sup,
+                        dict(line_bay_info),
+                    )
 
                 for file_obj in files:
                     file_name = _get_file_name(file_obj)
@@ -7444,25 +8078,25 @@ def run_app() -> None:
                             logs.append(f"{prefix_label}{file_name}: skipped fill (kept original geometry).")
                             continue
                         device_for_file = resolve_equipment_name(file_name, device_options, equip_map_sup)
-                        if device_for_file not in device_options:
-                            logs.append(
-                                f"{prefix_label}{file_name}: skipped (device '{device_for_file or 'unknown'}' not present in supervisor sheet)."
-                            )
-                            continue
                         device_norm = normalize_for_compare(device_for_file)
-                        if device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
+                        if device_norm and device_norm not in FORCED_CABIN_AUTO_CREATE_DEVICES:
                             uploaded_device_norms.add(device_norm)
                         if device_for_file not in instance_cache:
                             instance_cache[device_for_file] = parse_supervisor_device_table(
                                 sup_wb_path, sup_sheet, device_for_file
                             )
-                        inst = _pick_instance_for_file(file_name, instance_cache.get(device_for_file, []))
-                        seq_arg = None
                         cached_instances = instance_cache.get(device_for_file, [])
                         type_map_device = cached_instances[0].get("type_map", {}) if cached_instances else {}
                         if not cached_instances:
-                            logs.append(f"{prefix_label}{file_name}: skipped (no instances in sheet).")
+                            out_path = _write_original_file(file_obj)
+                            _record_output(file_name, out_path)
+                            logs.append(
+                                f"{prefix_label}{file_name}: kept original file (no supervisor rows for device '{device_for_file or 'unknown'}')."
+                            )
+                            _validate_rewritten_output(device_for_file, file_name, out_path, cached_instances)
                             continue
+                        inst = _pick_instance_for_file(file_name, cached_instances)
+                        seq_arg = None
                         if len(cached_instances) > 1:
                             seq_arg = cached_instances
                         elif normalize_for_compare(device_for_file) in SEQUENTIAL_FILL_DEVICES:
@@ -8242,6 +8876,7 @@ def run_app() -> None:
             else:
                 st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically using a per-file device match.")
                 if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
+                    run_id_validation_rows: list[dict[str, Any]] = []
                     outputs, logs, run_domain_rows = _fill_supervisor_batch(
                         sup_gpkg_files,
                         device_options,
@@ -8252,6 +8887,7 @@ def run_app() -> None:
                         ups_anchor_info,
                         fill_one_gpkg,
                         seq_assign_fallback=seq_assign_fallback,
+                        id_validation_rows=run_id_validation_rows,
                     )
 
                     if outputs:
@@ -8262,6 +8898,11 @@ def run_app() -> None:
                                 zf.write(out_path, arcname=name)
                             if run_domain_rows:
                                 zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                            if run_id_validation_rows:
+                                zf.writestr(
+                                    "rewritten_id_validation_report.csv",
+                                    id_validation_rows_to_csv(run_id_validation_rows),
+                                )
                         with open(zip_path, "rb") as f:
                             data = f.read()
                         st.download_button(
