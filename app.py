@@ -2708,13 +2708,17 @@ def collect_device_polygons_from_uploads(
     if not files or not target_device_norms:
         return None
     frames: list[gpd.GeoDataFrame] = []
+    cabin_norm = normalize_for_compare("Substation/Cabin")
     for file_obj in files:
         try:
             file_name = _get_file_name(file_obj)
+            stem_norm = normalize_for_compare(Path(file_name).stem)
             dev_name = resolve_equipment_name(file_name, device_options, equip_map)
         except Exception:
+            stem_norm = ""
             dev_name = None
-        if normalize_for_compare(dev_name) not in target_device_norms:
+        is_cabin_file = cabin_norm in target_device_norms and "cabin" in stem_norm
+        if normalize_for_compare(dev_name) not in target_device_norms and not is_cabin_file:
             continue
         try:
             gpkg_path = _coerce_gpkg_path(file_obj)
