@@ -772,12 +772,13 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
             if pd.isna(dom_val) or pd.isna(code_val):
                 continue
             dom_norm = normalize_value_for_compare(dom_val)
-            if dom_norm and dom_norm not in domain_code_map:
-                domain_code_map[dom_norm] = code_val
+            if dom_norm:
+                existing = domain_code_map.get(dom_norm)
+                domain_code_map[dom_norm] = prefer_domain_code_value(dom_val, existing, code_val)
     global_domain_map = load_domain_code_lookup()
     for key, val in global_domain_map.items():
-        if key not in domain_code_map:
-            domain_code_map[key] = val
+        existing = domain_code_map.get(key)
+        domain_code_map[key] = prefer_domain_code_value(key, existing, val)
     instances: list[dict[str, Any]] = []
     current_fields: dict[str, Any] | None = None
     type_map_device: dict[str, str] = {}
@@ -825,6 +826,33 @@ def parse_supervisor_device_table(workbook_path: Path, sheet_name: str, device_n
 
         # Always honor explicit Domain Code when provided (even for text fields).
         if not _is_blank(domain_code):
+            explicit_norm = normalize_value_for_compare(domain_code)
+            domain_norm = normalize_value_for_compare(val)
+            remapped = None
+
+            if explicit_norm:
+                mapped_from_code = domain_code_map.get(explicit_norm)
+                if (
+                    mapped_from_code is not None
+                    and normalize_value_for_compare(mapped_from_code) != explicit_norm
+                ):
+                    remapped = mapped_from_code
+
+            if remapped is None and domain_norm and explicit_norm == domain_norm:
+                mapped_from_domain = domain_code_map.get(domain_norm)
+                if (
+                    mapped_from_domain is not None
+                    and normalize_value_for_compare(mapped_from_domain) != explicit_norm
+                ):
+                    remapped = mapped_from_domain
+
+            if remapped is not None and not _is_blank(remapped):
+                return remapped, {
+                    "field": field_name,
+                    "domain": val,
+                    "code": remapped,
+                    "source": "mapped_explicit",
+                }
             return domain_code, {
                 "field": field_name,
                 "domain": val,
@@ -4328,8 +4356,15 @@ def load_domain_code_lookup() -> dict[str, Any]:
                 dom_norm = normalize_value_for_compare(dom_val)
                 if not dom_norm:
                     continue
-                if dom_norm not in lookup or prefer_new_data:
-                    lookup[dom_norm] = code_val
+                existing = lookup.get(dom_norm)
+                chosen = prefer_domain_code_value(
+                    dom_val,
+                    existing,
+                    code_val,
+                    prefer_candidate_on_tie=prefer_new_data,
+                )
+                if normalize_value_for_compare(chosen) != normalize_value_for_compare(existing):
+                    lookup[dom_norm] = chosen
                     updated = True
     if updated:
         try:
@@ -4675,6 +4710,51 @@ def normalize_value_for_compare(value: Any) -> str:
 
     text = text.lower().replace("_", "").replace("-", "")
     return " ".join(text.split()).strip()
+
+
+def domain_code_quality(domain_value: Any, code_value: Any) -> int:
+    code_norm = normalize_value_for_compare(code_value)
+    if not code_norm:
+        return 0
+
+    score = 1
+    domain_norm = normalize_value_for_compare(domain_value)
+    if domain_norm and code_norm != domain_norm:
+        score += 2
+
+    try:
+        parsed = float(str(code_value).strip())
+        if math.isfinite(parsed):
+            score += 2
+    except Exception:
+        pass
+
+    return score
+
+
+def prefer_domain_code_value(
+    domain_value: Any,
+    existing_code: Any,
+    candidate_code: Any,
+    *,
+    prefer_candidate_on_tie: bool = False,
+) -> Any:
+    existing_score = domain_code_quality(domain_value, existing_code)
+    candidate_score = domain_code_quality(domain_value, candidate_code)
+
+    if candidate_score == 0:
+        return existing_code
+    if existing_score == 0:
+        return candidate_code
+    if candidate_score > existing_score:
+        return candidate_code
+    if (
+        prefer_candidate_on_tie
+        and candidate_score == existing_score
+        and normalize_value_for_compare(candidate_code) != normalize_value_for_compare(existing_code)
+    ):
+        return candidate_code
+    return existing_code
 
 
 def id_validation_rows_to_csv(rows: list[dict[str, Any]]) -> str:
@@ -6509,10 +6589,18 @@ def fill_one_gpkg(
 
     def _flatten_switch_sheet_ids_by_base(sheet_ids_by_base: dict[int, dict[str, list[str]]]) -> list[str]:
         flat: list[str] = []
+        def _role_sort_key(role: str) -> tuple[int, str]:
+            match = re.match(r"^Q(\d+)$", str(role).strip().upper())
+            if match:
+                try:
+                    return int(match.group(1)), role
+                except Exception:
+                    pass
+            return 10**9, role
         for base in sorted(sheet_ids_by_base):
             role_map = sheet_ids_by_base.get(base, {})
-            flat.extend(role_map.get("Q9", []))
-            flat.extend(role_map.get("Q1", []))
+            for role in sorted(role_map, key=_role_sort_key):
+                flat.extend(role_map.get(role, []))
         return flat
 
     def _assign_remaining_ids(
@@ -6578,11 +6666,13 @@ def fill_one_gpkg(
         if raw_id is None or pd.isna(raw_id):
             return None
         text = str(raw_id).strip().upper().replace(" ", "").replace("_", "")
-        match = re.match(r"^(Q1|Q9)-?0*(\d+)$", text)
+        match = re.match(r"^(Q\d+)-?0*(\d+)$", text)
         if not match:
             return None
         try:
-            return int(match.group(2)), match.group(1), 0
+            role = match.group(1)
+            role_num = int(role[1:])
+            return int(match.group(2)), role, role_num
         except Exception:
             return None
 
@@ -6785,6 +6875,8 @@ def fill_one_gpkg(
             lambda raw_id: _parse_vt_ct_sheet_id(raw_id, id_prefix)
         )
         has_sheet_ids = bool(sheet_ids_by_base)
+        if not has_sheet_ids:
+            return
         exclude_from_bay_matching: set[Any] = set()
         if id_prefix == "VT":
             exclude_from_bay_matching = _indices_near_busbar()
@@ -6832,26 +6924,6 @@ def fill_one_gpkg(
                 for col in name_cols:
                     out_gdf.at[idx_val, col] = sheet_id
             return
-
-        # Fallback when no workbook IDs could be resolved for this device.
-        bay_counts: dict[str, int] = {}
-        generated_ids: list[str] = []
-        used_bases: set[int] = {b for b in bay_base.values() if b is not None}
-        next_base = max(used_bases) + 1 if used_bases else 1
-        for key in bay_keys:
-            base = bay_base.get(key)
-            if base is None:
-                while next_base in used_bases:
-                    next_base += 1
-                base = next_base
-                bay_base[key] = base
-                used_bases.add(base)
-                next_base += 1
-            bay_counts[key] = bay_counts.get(key, 0) + 1
-            generated_ids.append(f"{id_prefix}{base}-{bay_counts[key]}")
-        out_gdf[id_col] = generated_ids
-        for col in name_cols:
-            out_gdf[col] = generated_ids
 
     # Post-fill: assign workbook VT IDs to bays using the Line Bay arrangement logic.
     _assign_sheet_device_ids_from_line_bay(
@@ -6924,7 +6996,7 @@ def fill_one_gpkg(
         id_prefix="SA",
     )
 
-    # Post-fill: keep one middle HV CB per bay and rename to CB{bay} (E01 -> CB1, E02 -> CB2).
+    # Post-fill: keep one middle HV CB per bay using workbook IDs only.
     if _matches_device_targets({normalize_for_compare("High Voltage Circuit Breaker/High Voltage Circuit Breaker")}):
         bay_keys, bay_base = _resolve_bay_keys_and_base()
         if bay_keys and len(bay_keys) == len(out_gdf):
@@ -6995,10 +7067,10 @@ def fill_one_gpkg(
                 if chosen is None:
                     chosen = idxs[len(idxs) // 2]
                 sheet_ids = cb_sheet_ids_by_base.get(base, [])
-                if has_cb_sheet_ids and not sheet_ids:
+                if not sheet_ids:
                     continue
                 selected.append(chosen)
-                cb_id = sheet_ids[0] if sheet_ids else f"CB{base}"
+                cb_id = sheet_ids[0]
                 cb_new_ids[chosen] = cb_id
                 norm_id = normalize_value_for_compare(cb_id)
                 if norm_id:
@@ -7028,7 +7100,7 @@ def fill_one_gpkg(
                     for col in cb_name_cols:
                         out_gdf.at[idx_val, col] = newid
 
-    # Post-fill: keep 2 disconnector switches per bay, with Q9-{bay} at the line exit side.
+    # Post-fill: assign disconnector IDs from workbook rows, keeping Q9 on the line-exit side.
     if _matches_device_targets({normalize_for_compare("High Voltage Switch/High Voltage Switch")}):
         bay_keys, bay_base = _resolve_bay_keys_and_base()
         if bay_keys and len(bay_keys) == len(out_gdf):
@@ -7097,7 +7169,7 @@ def fill_one_gpkg(
                 sheet_ids = sw_sheet_ids_by_base.get(base, {})
                 q9_ids = sheet_ids.get("Q9", [])
                 q1_ids = sheet_ids.get("Q1", [])
-                if has_sw_sheet_ids and not q9_ids and not q1_ids:
+                if not sheet_ids:
                     continue
 
                 if ref_exit is not None:
@@ -7113,8 +7185,8 @@ def fill_one_gpkg(
                     except Exception:
                         q9_idx = idxs[0]
 
-                if q9_ids or not has_sw_sheet_ids:
-                    q9_id = q9_ids[0] if q9_ids else f"Q9-{base}"
+                if q9_ids:
+                    q9_id = q9_ids[0]
                     selected.append(q9_idx)
                     sw_new_ids[q9_idx] = q9_id
                     norm_id = normalize_value_for_compare(q9_id)
@@ -7131,8 +7203,8 @@ def fill_one_gpkg(
                         q1_idx = min(remaining, key=lambda i: _point_dist(i, ref_center))
                     else:
                         q1_idx = remaining[-1]
-                    if q1_ids or not has_sw_sheet_ids:
-                        q1_id = q1_ids[0] if q1_ids else f"Q1-{base}"
+                    if q1_ids:
+                        q1_id = q1_ids[0]
                         selected.append(q1_idx)
                         sw_new_ids[q1_idx] = q1_id
                         norm_id = normalize_value_for_compare(q1_id)
