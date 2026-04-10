@@ -1,3 +1,4 @@
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,14 @@ from .equipment import PROTECTION_LAYOUT_DEVICES
 from .fill import (
     ASPATIAL_DEVICES,
     BLOCK_ASSIGN_DEVICES,
+    DROP_OUTPUT_COLUMNS,
     FillBatchDependencies,
     LINE_BAY_SPATIAL_DEVICES,
     PREFIX_GROUP_DEVICES,
     PROTECTION_LAYOUT_SPACING,
     SUBSTATION_FORCE_TYPES,
     SUBSTATION_PRESERVE_FIELDS,
+    SUBSTATION_PRESERVE_ORDER,
     build_device_gdf_from_instances,
     build_device_table_from_instances,
     build_spatial_match_targets,
@@ -259,7 +262,7 @@ def fill_one_gpkg(
             gdf_sup_local = gdf_sup_local.copy()
             for idx_pt, pt in enumerate(points):
                 try:
-                    gdf_sup_local.geometry.iat[idx_pt] = pt
+                    gdf_sup_local.at[gdf_sup_local.index[idx_pt], geom_name] = pt
                 except Exception:
                     continue
             return True
