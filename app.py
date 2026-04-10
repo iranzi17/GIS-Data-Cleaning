@@ -61,8 +61,10 @@ from gis_loader.fill import (
     append_domain_code_log,
     build_device_gdf_from_instances,
     build_device_table_from_instances,
+    build_spatial_match_targets,
     collect_domain_log_entries as _collect_domain_log_entries,
     domain_log_rows_to_csv,
+    ensure_name_fields_string,
     fill_supervisor_batch,
     repeat_instances,
     split_instance_prefix_suffix,
@@ -2777,20 +2779,6 @@ def apply_line_bay_names(out_gdf: gpd.GeoDataFrame, line_bay_info: dict[str, Any
     return out_gdf
 
 
-def ensure_name_fields_string(gdf: gpd.GeoDataFrame, fields: list[str]) -> gpd.GeoDataFrame:
-    """Force name-like fields to string dtype to avoid GPKG schema errors."""
-    for col in fields:
-        if col in gdf.columns:
-            try:
-                gdf[col] = gdf[col].astype("string")
-            except Exception:
-                try:
-                    gdf[col] = gdf[col].astype(str)
-                except Exception:
-                    pass
-    return gdf
-
-
 def group_points_by_perp_gap(
     items: list[tuple[Any, float, float]],
     group_count: int,
@@ -2882,150 +2870,6 @@ def build_lines_from_points_in_polygon(
     if len(lines) != count:
         return build_parallel_lines_for_polygon(polygon, count)
     return lines
-
-
-def build_spatial_match_targets(
-    line_gdf: gpd.GeoDataFrame,
-    bay_path: Path,
-    bay_layer: str | None,
-    bay_field: str | None,
-    allow_nearest_fallback: bool = True,
-) -> pd.Series:
-    """Return normalized match targets for each line feature based on Line Bay polygons."""
-    if line_gdf is None or line_gdf.empty or bay_path is None or bay_layer is None or bay_field is None:
-        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-    try:
-        bay_gdf = gpd.read_file(bay_path, layer=bay_layer)
-    except Exception:
-        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-    if not hasattr(bay_gdf, "geometry"):
-        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-
-    geom_name = bay_gdf.geometry.name
-    norm_lookup = {normalize_for_compare(c): c for c in bay_gdf.columns}
-    key_col = None
-    for alias in ["Line_Bay_ID", "Line Bay ID", "LineBayID", "LineBay_ID", "Line_BayID", "line_bay_id"]:
-        col = norm_lookup.get(normalize_for_compare(alias))
-        if col:
-            key_col = col
-            break
-    if key_col is None and bay_field in bay_gdf.columns:
-        key_col = bay_field
-    if key_col is None:
-        fallback_cols = [c for c in bay_gdf.columns if c != geom_name]
-        key_col = fallback_cols[0] if fallback_cols else None
-    if key_col is None:
-        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-
-    keep_cols = [geom_name, key_col]
-    if bay_field in bay_gdf.columns and bay_field not in keep_cols:
-        keep_cols.append(bay_field)
-    bay = bay_gdf[keep_cols].copy()
-    try:
-        bay = bay[bay[geom_name].notna() & ~bay[geom_name].is_empty]
-    except Exception:
-        pass
-    try:
-        bay_keys_norm = bay[key_col].map(normalize_value_for_compare)
-        bay = bay[bay_keys_norm != ""]
-    except Exception:
-        pass
-    if line_gdf.crs is not None and bay.crs is not None and line_gdf.crs != bay.crs:
-        try:
-            bay = bay.to_crs(line_gdf.crs)
-        except Exception:
-            pass
-
-    try:
-        joined = gpd.sjoin(line_gdf, bay, how="left", predicate="intersects", rsuffix="bay")
-    except TypeError:
-        joined = gpd.sjoin(line_gdf, bay, how="left", op="intersects", rsuffix="bay")
-    except Exception:
-        return pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-
-    field_name = key_col
-    if field_name not in joined.columns:
-        alt = f"{key_col}_bay"
-        field_name = alt if alt in joined.columns else key_col
-
-    if joined.index.duplicated().any():
-        try:
-            joined["_left_index"] = joined.index
-            right_geom = bay.geometry
-            def _inter_len(row: pd.Series) -> float:
-                try:
-                    idx_right = row.get("index_right")
-                    if pd.isna(idx_right):
-                        return 0.0
-                    return row.geometry.intersection(right_geom.loc[idx_right]).length
-                except Exception:
-                    return 0.0
-            joined["__inter_len__"] = joined.apply(_inter_len, axis=1)
-            joined = joined.sort_values("__inter_len__", ascending=False).drop_duplicates(subset="_left_index")
-            joined = joined.set_index("_left_index")
-        except Exception:
-            joined = joined[~joined.index.duplicated(keep="first")]
-
-    series = joined[field_name] if field_name in joined.columns else pd.Series([pd.NA] * len(line_gdf), index=line_gdf.index)
-    series = series.reindex(line_gdf.index)
-
-    # Optional nearest-bay fallback for features that do not intersect any Line Bay polygon.
-    if not allow_nearest_fallback:
-        return series.map(normalize_value_for_compare)
-
-    try:
-        missing_mask = series.isna() | series.map(lambda v: normalize_value_for_compare(v) == "")
-    except Exception:
-        missing_mask = series.isna()
-
-    if bool(missing_mask.any()):
-        try:
-            bay_geom_name = bay.geometry.name if hasattr(bay, "geometry") else geom_name
-            bay_refs: list[tuple[Any, Any]] = []
-            for _, bay_row in bay.iterrows():
-                key_val = bay_row.get(key_col)
-                geom = bay_row.get(bay_geom_name)
-                if geom is None or getattr(geom, "is_empty", True):
-                    continue
-                try:
-                    ref_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
-                except Exception:
-                    try:
-                        ref_pt = geom.representative_point()
-                    except Exception:
-                        continue
-                if ref_pt is None or getattr(ref_pt, "is_empty", True):
-                    continue
-                bay_refs.append((key_val, ref_pt))
-
-            if bay_refs and hasattr(line_gdf, "geometry") and line_gdf.geometry is not None:
-                for idx_val in series.index[missing_mask]:
-                    try:
-                        geom = line_gdf.loc[idx_val, line_gdf.geometry.name]
-                    except Exception:
-                        continue
-                    if geom is None or getattr(geom, "is_empty", True):
-                        continue
-                    try:
-                        src_pt = geom if getattr(geom, "geom_type", "") == "Point" else geom.centroid
-                    except Exception:
-                        continue
-                    best_key = None
-                    best_dist = None
-                    for key_val, ref_pt in bay_refs:
-                        try:
-                            dist = src_pt.distance(ref_pt)
-                        except Exception:
-                            continue
-                        if best_dist is None or dist < best_dist:
-                            best_dist = dist
-                            best_key = key_val
-                    if best_key is not None:
-                        series.at[idx_val] = best_key
-        except Exception:
-            pass
-
-    return series.map(normalize_value_for_compare)
 
 
 _NUM_REGEX = re.compile(r"[-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?".replace("\\\\", "\\"))
