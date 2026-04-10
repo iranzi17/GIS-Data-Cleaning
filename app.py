@@ -52,6 +52,7 @@ from gis_loader.fill import (
     build_device_table_from_instances,
     collect_domain_log_entries as _collect_domain_log_entries,
     domain_log_rows_to_csv,
+    id_validation_rows_to_csv,
     ensure_name_fields_string,
     fill_supervisor_batch,
     repeat_instances,
@@ -105,6 +106,7 @@ from gis_loader.geopackage import (
     sanitize_gdf_for_gpkg,
     write_aspatial_gpkg_layer,
 )
+from gis_loader.reporting import RunReport, build_report_bundle
 from gis_loader.text import (
     INVISIBLE_HEADER_CHARS,
     clean_column_name as _clean_column_name,
@@ -112,12 +114,81 @@ from gis_loader.text import (
     normalize_for_compare,
     normalize_value_for_compare,
 )
+from gis_loader.validation import (
+    build_dataset_profile,
+    build_field_mapping_rows,
+    build_join_validations,
+    build_mapping_validations,
+    build_output_validations,
+    build_rewritten_id_validations,
+)
 
 _SUB_COL_CACHE: dict[tuple[str, str], str | None] = {}
 
 
 def run_app() -> None:
     st.set_page_config(page_title="Internal Substation Attribute Loader", layout="wide")
+
+    def _add_validation_results(report: RunReport, results: list[dict[str, Any]] | None) -> None:
+        for result in results or []:
+            report.add_validation_result(result)
+
+    def _ingest_log_lines(report: RunReport, lines: list[str] | None, context: dict[str, Any] | None = None) -> None:
+        for line in lines or []:
+            lowered = line.lower()
+            if "failed" in lowered or "error" in lowered or "traceback" in lowered:
+                report.error("workflow_log", line, context)
+            elif "skipped" in lowered or "warning" in lowered:
+                report.warning("workflow_log", line, context)
+            else:
+                report.info("workflow_log", line, context)
+
+    def _render_report_downloads(
+        report: RunReport,
+        *,
+        key_prefix: str,
+        bundle_name: str,
+        extra_files: dict[str, str | bytes] | None = None,
+    ) -> None:
+        summary = report.summary()
+        st.caption(
+            "Run report: "
+            f"{summary['event_count']} event(s), "
+            f"{summary['validation_count']} validation(s), "
+            f"{summary['warning_count']} warning(s), "
+            f"{summary['error_count']} error(s)."
+        )
+        st.download_button(
+            "Download run report (json)",
+            data=report.to_json_bytes(),
+            file_name=f"{bundle_name}_run_report.json",
+            mime="application/json",
+            key=f"{key_prefix}_report_json",
+        )
+        st.download_button(
+            "Download run report bundle (zip)",
+            data=build_report_bundle(report, extra_files=extra_files),
+            file_name=f"{bundle_name}_run_report_bundle.zip",
+            mime="application/zip",
+            key=f"{key_prefix}_report_bundle",
+        )
+
+    def _attach_fill_report_sections(
+        report: RunReport,
+        *,
+        domain_rows: list[dict[str, Any]] | None = None,
+        id_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, bytes]:
+        extra_files: dict[str, bytes] = {}
+        if domain_rows:
+            report.add_section_rows("domain_code_log", domain_rows)
+            report.info("domain_code_log_attached", f"Captured {len(domain_rows)} domain-code log row(s).")
+            extra_files["domain_code_log.csv"] = domain_log_rows_to_csv(domain_rows).encode("utf-8")
+        if id_rows:
+            report.add_section_rows("rewritten_id_validation", id_rows)
+            _add_validation_results(report, build_rewritten_id_validations(id_rows))
+            extra_files["rewritten_id_validation_report.csv"] = id_validation_rows_to_csv(id_rows).encode("utf-8")
+        return extra_files
 
     st.title("Internal Substation Attribute Loader")
     st.caption("Use the internal master workbook to populate attributes for a single substation.")
@@ -228,10 +299,48 @@ def run_app() -> None:
 
     # Merge button
     if st.button("Merge and Prepare Updated GeoPackage"):
+        report = RunReport(workflow="single_merge", title=gpkg_file.name)
+        report.set_metadata(
+            workbook=selected_label,
+            sheet=sheet,
+            substation=selected_sub,
+            left_key=left_key,
+            right_key=right_key,
+        )
+        report.add_artifact(
+            "input_dataset",
+            gpkg_file.name,
+            details=build_dataset_profile(gdf, name=gpkg_file.name, layer_name="", source_format="gpkg"),
+        )
+        report.add_artifact(
+            "reference_sheet",
+            f"{selected_label}:{sheet}",
+            path=workbook_path,
+            details=build_dataset_profile(filtered_df, name=selected_label, layer_name=sheet, source_format="excel"),
+        )
+        _add_validation_results(
+            report,
+            build_join_validations(
+                gdf,
+                filtered_df,
+                left_key,
+                right_key,
+                left_label="GeoPackage",
+                right_label="Excel sheet",
+            ),
+        )
         try:
             merged = merge_without_duplicates(gdf, filtered_df, left_key, right_key)
             st.success("Merge successful!")
             st_dataframe_safe(merged, PREVIEW_ROWS)
+            _add_validation_results(
+                report,
+                build_output_validations(
+                    merged,
+                    geometry_required=hasattr(gdf, "geometry"),
+                    label="merged output",
+                ),
+            )
 
             # Save temp file
             layer_name = derive_layer_name_from_filename(gpkg_file.name)
@@ -241,6 +350,13 @@ def run_app() -> None:
 
             safe = sanitize_gdf_for_gpkg(merged)
             safe.to_file(temp_path, driver="GPKG", layer=layer_name)
+            report.add_artifact(
+                "output_dataset",
+                Path(gpkg_file.name).name,
+                temp_path,
+                details=build_dataset_profile(safe, name=gpkg_file.name, layer_name=layer_name, source_format="gpkg"),
+            )
+            report.info("merge_completed", f"{gpkg_file.name}: merged '{left_key}' to '{right_key}'.")
 
             with open(temp_path, "rb") as f:
                 data = f.read()
@@ -252,9 +368,20 @@ def run_app() -> None:
                 file_name=download_name,
                 mime="application/geopackage+sqlite3",
             )
+            _render_report_downloads(
+                report,
+                key_prefix="single_merge",
+                bundle_name=f"{Path(gpkg_file.name).stem}_merge",
+            )
 
         except Exception as e:
+            report.exception("single_merge_failed", e, {"input_name": gpkg_file.name})
             st.error(f"Merge failed: {e}")
+            _render_report_downloads(
+                report,
+                key_prefix="single_merge_failed",
+                bundle_name=f"{Path(gpkg_file.name).stem}_merge_failed",
+            )
 
     # =====================================================================
     # AUTOMATED BATCH LOADER (ZIP)
@@ -279,17 +406,26 @@ def run_app() -> None:
         tmp_in_dir = Path(tempfile.mkdtemp())
         tmp_out_dir = Path(tempfile.mkdtemp())
         log_lines = []
+        report = RunReport(workflow="automated_batch_merge", title=getattr(batch_zip, "name", "batch_zip"))
+        report.set_metadata(
+            workbook=selected_label,
+            fallback_sheet=fallback_sheet,
+            auto_sheet=auto_sheet,
+        )
         try:
             zip_path = tmp_in_dir / "input.zip"
             with open(zip_path, "wb") as f:
                 f.write(batch_zip.getbuffer())
+            report.add_artifact("input_archive", zip_path.name, zip_path)
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(tmp_in_dir)
 
             gpkg_paths = list(tmp_in_dir.rglob("*.gpkg"))
             if not gpkg_paths:
+                report.error("batch_merge_input_missing", "No GeoPackages found inside the ZIP.")
                 st.error("No GeoPackages found inside the ZIP.")
             else:
+                report.info("batch_merge_input_scan", f"Found {len(gpkg_paths)} GeoPackage(s) inside the ZIP.")
                 ref_wbs = list_reference_workbooks()
                 # Prioritize the user-selected workbook, then others.
                 ordered_refs: list[tuple[str, Path]] = []
@@ -308,6 +444,13 @@ def run_app() -> None:
                         layers = list_gpkg_layers(gpkg_path)
                         layer_name = layers[0] if layers else None
                         gdf_in = gpd.read_file(gpkg_path, layer=layer_name) if layer_name else gpd.read_file(gpkg_path)
+                        report.add_artifact(
+                            "input_dataset",
+                            gpkg_path.name,
+                            gpkg_path,
+                            details=build_dataset_profile(gdf_in, name=gpkg_path.name, layer_name=layer_name, source_format="gpkg"),
+                        )
+                        report.set_metadata(input_dataset_count=len(gpkg_paths))
 
                         merged_ok = False
 
@@ -355,14 +498,51 @@ def run_app() -> None:
                                     match_count = 0
                                 if left_key is None or right_key is None:
                                     continue
+                                _add_validation_results(
+                                    report,
+                                    build_join_validations(
+                                        gdf_in,
+                                        filtered_df,
+                                        left_key,
+                                        right_key,
+                                        left_label=gpkg_path.name,
+                                        right_label=f"{wb_label}:{chosen_sheet}",
+                                    ),
+                                )
 
                                 merged = merge_without_duplicates(gdf_in, filtered_df, left_key, right_key)
                                 safe = sanitize_gdf_for_gpkg(merged)
                                 out_layer = layer_name or derive_layer_name_from_filename(gpkg_path.name)
                                 out_path = tmp_out_dir / gpkg_path.name
                                 safe.to_file(out_path, driver="GPKG", layer=out_layer)
+                                _add_validation_results(
+                                    report,
+                                    build_output_validations(
+                                        safe,
+                                        geometry_required=hasattr(gdf_in, "geometry"),
+                                        label=gpkg_path.name,
+                                    ),
+                                )
+                                report.add_artifact(
+                                    "output_dataset",
+                                    out_path.name,
+                                    out_path,
+                                    details=build_dataset_profile(safe, name=out_path.name, layer_name=out_layer, source_format="gpkg"),
+                                )
                                 log_lines.append(
                                     f"{gpkg_path.name}: merged using workbook '{wb_label}', sheet '{chosen_sheet}' on {left_key} -> {right_key} (matches: {match_count})."
+                                )
+                                report.info(
+                                    "batch_merge_completed",
+                                    log_lines[-1],
+                                    {
+                                        "input_name": gpkg_path.name,
+                                        "workbook": wb_label,
+                                        "sheet": chosen_sheet,
+                                        "left_key": left_key,
+                                        "right_key": right_key,
+                                        "match_count": match_count,
+                                    },
                                 )
                                 merged_ok = True
                                 break
@@ -370,12 +550,22 @@ def run_app() -> None:
                                 continue
 
                         if not merged_ok:
-                            log_lines.append(f"{gpkg_path.name}: skipped (no rows found for substation '{substation_name}' in any workbook).")
+                            attempted = ", ".join(substation_candidates)
+                            msg = f"{gpkg_path.name}: skipped (no rows found for substation '{attempted}' in any workbook)."
+                            log_lines.append(msg)
+                            report.warning(
+                                "batch_merge_skipped",
+                                msg,
+                                {"input_name": gpkg_path.name, "substation_candidates": substation_candidates},
+                            )
                     except Exception as exc:
-                        log_lines.append(f"{gpkg_path.name}: failed ({exc}).")
+                        msg = f"{gpkg_path.name}: failed ({exc})."
+                        log_lines.append(msg)
+                        report.exception("batch_merge_failed", exc, {"input_name": gpkg_path.name})
 
                 if list(tmp_out_dir.glob("*.gpkg")):
                     zip_out = shutil.make_archive(str(tmp_out_dir / "merged"), "zip", root_dir=tmp_out_dir, base_dir=".")
+                    report.add_artifact("output_archive", Path(zip_out).name, zip_out)
                     with open(zip_out, "rb") as f:
                         data = f.read()
                     st.download_button(
@@ -384,7 +574,13 @@ def run_app() -> None:
                         file_name="merged_geopackages.zip",
                         mime="application/zip",
                     )
-                st.text_area("Batch log", value="\n".join(log_lines) if log_lines else "No logs.", height=200)
+                _ingest_log_lines(report, log_lines)
+                st.text_area("Batch log", value=report.log_text(), height=200)
+                _render_report_downloads(
+                    report,
+                    key_prefix="batch_merge",
+                    bundle_name="batch_merge",
+                )
         finally:
             shutil.rmtree(tmp_in_dir, ignore_errors=True)
             shutil.rmtree(tmp_out_dir, ignore_errors=True)
@@ -437,8 +633,11 @@ def run_app() -> None:
     if sup_gpkg_zip:
         if st.button("Fill all substation folders (zip)", key="sup_fill_zip"):
             wb_map = list_supervisor_workbooks()
+            zip_report = RunReport(workflow="supervisor_zip_fill", title="supervisor_zip_fill")
+            zip_report.set_metadata(zip_input_count=len(sup_gpkg_zip) if isinstance(sup_gpkg_zip, list) else 1)
             if not wb_map:
                 folders_label = ", ".join(str(p) for p in SUPERVISOR_WORKBOOK_DIRS)
+                zip_report.error("supervisor_workbook_missing", f"No supervisor workbooks found in {folders_label}.")
                 st.error(f"No supervisor workbooks found in {folders_label}.")
             else:
                 tmp_in_dir = Path(tempfile.mkdtemp())
@@ -454,6 +653,7 @@ def run_app() -> None:
                         zip_path = tmp_in_dir / f"sup_batch_{idx}.zip"
                         with open(zip_path, "wb") as f:
                             f.write(zip_file.getbuffer())
+                        zip_report.add_artifact("input_archive", Path(zip_file.name).name, zip_path)
                         extract_dir = tmp_in_dir / f"zip_{idx}"
                         extract_dir.mkdir(parents=True, exist_ok=True)
                         zip_root_labels[extract_dir.name] = Path(getattr(zip_file, "name", f"zip_{idx}")).stem
@@ -462,8 +662,10 @@ def run_app() -> None:
                         gpkg_paths.extend(list(extract_dir.rglob("*.gpkg")))
 
                     if not gpkg_paths:
+                        zip_report.error("supervisor_zip_input_missing", "No GeoPackages found inside the ZIP(s).")
                         st.error("No GeoPackages found inside the ZIP(s).")
                     else:
+                        zip_report.info("supervisor_zip_input_scan", f"Found {len(gpkg_paths)} GeoPackage(s) across ZIP inputs.")
                         wb_index = _build_supervisor_workbook_index(wb_map)
                         equip_map_sup = load_gpkg_equipment_map()
 
@@ -484,29 +686,41 @@ def run_app() -> None:
                                 substation_name, wb_map, wb_index
                             )
                             if wb_path is None:
-                                logs.append(f"{substation_name}: skipped (no matching supervisor workbook).")
+                                msg = f"{substation_name}: skipped (no matching supervisor workbook)."
+                                logs.append(msg)
+                                zip_report.warning("supervisor_workbook_skipped", msg, {"substation": substation_name})
                                 continue
                             try:
                                 sup_excel = pd.ExcelFile(wb_path)
                             except Exception as exc:
-                                logs.append(f"{substation_name}: failed to read workbook '{wb_label}' ({exc}).")
+                                msg = f"{substation_name}: failed to read workbook '{wb_label}' ({exc})."
+                                logs.append(msg)
+                                zip_report.exception("supervisor_workbook_read_failed", exc, {"substation": substation_name, "workbook": wb_label})
                                 continue
                             sup_sheet = pick_supervisor_sheet(sup_excel)
                             if not sup_sheet:
-                                logs.append(f"{substation_name}: skipped (no sheets found in '{wb_label}').")
+                                msg = f"{substation_name}: skipped (no sheets found in '{wb_label}')."
+                                logs.append(msg)
+                                zip_report.warning("supervisor_sheet_missing", msg, {"substation": substation_name, "workbook": wb_label})
                                 continue
                             try:
                                 raw_sup = pd.read_excel(wb_path, sheet_name=sup_sheet, dtype=str, header=None)
                                 if raw_sup.empty:
-                                    logs.append(f"{substation_name}: skipped (sheet '{sup_sheet}' is empty).")
+                                    msg = f"{substation_name}: skipped (sheet '{sup_sheet}' is empty)."
+                                    logs.append(msg)
+                                    zip_report.warning("supervisor_sheet_empty", msg, {"substation": substation_name, "sheet": sup_sheet})
                                     continue
                                 raw_sup.iloc[:, 0] = raw_sup.iloc[:, 0].ffill()
                                 device_options = sorted(set(raw_sup.iloc[:, 0].dropna().astype(str)))
                             except Exception as exc:
-                                logs.append(f"{substation_name}: failed to read '{sup_sheet}' in '{wb_label}' ({exc}).")
+                                msg = f"{substation_name}: failed to read '{sup_sheet}' in '{wb_label}' ({exc})."
+                                logs.append(msg)
+                                zip_report.exception("supervisor_sheet_read_failed", exc, {"substation": substation_name, "sheet": sup_sheet, "workbook": wb_label})
                                 continue
                             if not device_options:
-                                logs.append(f"{substation_name}: skipped (no devices found in '{wb_label}').")
+                                msg = f"{substation_name}: skipped (no devices found in '{wb_label}')."
+                                logs.append(msg)
+                                zip_report.warning("supervisor_devices_missing", msg, {"substation": substation_name, "workbook": wb_label})
                                 continue
 
                             protection_in_uploads = False
@@ -590,9 +804,13 @@ def run_app() -> None:
                                 except Exception:
                                     ups_anchor_info = None
                             elif protection_in_uploads:
-                                logs.append(f"{substation_name}: protection layout skipped (UPS not found).")
+                                msg = f"{substation_name}: protection layout skipped (UPS not found)."
+                                logs.append(msg)
+                                zip_report.warning("ups_layout_skipped", msg, {"substation": substation_name})
 
-                            logs.append(f"{substation_name}: using workbook '{wb_label}' (sheet '{sup_sheet}').")
+                            msg = f"{substation_name}: using workbook '{wb_label}' (sheet '{sup_sheet}')."
+                            logs.append(msg)
+                            zip_report.info("supervisor_batch_started", msg, {"substation": substation_name, "workbook": wb_label, "sheet": sup_sheet})
 
                             try:
                                 batch_outputs, batch_logs, batch_domain_rows = fill_supervisor_batch(
@@ -611,8 +829,11 @@ def run_app() -> None:
                                 outputs.extend(batch_outputs)
                                 logs.extend(batch_logs)
                                 run_domain_rows.extend(batch_domain_rows)
+                                _ingest_log_lines(zip_report, batch_logs, {"substation": substation_name, "workbook": wb_label, "sheet": sup_sheet})
                             except Exception as exc:
-                                logs.append(f"{substation_name}: batch failed ({type(exc).__name__}: {exc})")
+                                msg = f"{substation_name}: batch failed ({type(exc).__name__}: {exc})"
+                                logs.append(msg)
+                                zip_report.exception("supervisor_batch_failed", exc, {"substation": substation_name, "workbook": wb_label, "sheet": sup_sheet})
                                 try:
                                     import traceback
 
@@ -633,6 +854,7 @@ def run_app() -> None:
                                     "rewritten_id_validation_report.csv",
                                     id_validation_rows_to_csv(run_id_validation_rows),
                                 )
+                        zip_report.add_artifact("output_archive", zip_path.name, zip_path, details={"output_count": len(outputs)})
                         with open(zip_path, "rb") as f:
                             data = f.read()
                         st.download_button(
@@ -642,7 +864,19 @@ def run_app() -> None:
                             mime="application/zip",
                             key="sup_download_zip_batch",
                         )
-                    st.text_area("Supervisor batch log", value="\n".join(logs) if logs else "No logs.", height=220)
+                    extra_files = _attach_fill_report_sections(
+                        zip_report,
+                        domain_rows=run_domain_rows,
+                        id_rows=run_id_validation_rows,
+                    )
+                    _ingest_log_lines(zip_report, logs)
+                    st.text_area("Supervisor batch log", value=zip_report.log_text(), height=220)
+                    _render_report_downloads(
+                        zip_report,
+                        key_prefix="supervisor_zip_fill",
+                        bundle_name="supervisor_zip_fill",
+                        extra_files=extra_files,
+                    )
                 finally:
                     shutil.rmtree(tmp_in_dir, ignore_errors=True)
     elif sup_gpkg_files and sup_wb_path:
@@ -937,6 +1171,17 @@ def run_app() -> None:
                     except Exception:
                         st.warning("Could not auto-inspect the GeoPackage to suggest a match column.")
                 if sup_layers and st.button("Fill attributes from supervisor sheet", key="sup_fill"):
+                    fill_report = RunReport(workflow="supervisor_fill_single", title=sup_gpkg.name)
+                    fill_report.set_metadata(
+                        workbook=sup_wb_path.name if sup_wb_path else "",
+                        sheet=sup_sheet,
+                        device=device_choice,
+                        layer=sup_layer,
+                        fill_mode=fill_mode,
+                    )
+                    fill_report.add_artifact("input_dataset", sup_gpkg.name, details={"layer": sup_layer, "device": device_choice})
+                    if sup_wb_path is not None:
+                        fill_report.add_artifact("reference_workbook", sup_wb_path.name, sup_wb_path, details={"sheet": sup_sheet})
                     try:
                         if fill_mode == "One GeoPackage per instance" and instance_labels:
                             outputs: list[tuple[str, Path]] = []
@@ -959,6 +1204,7 @@ def run_app() -> None:
                                 label_slug = normalize_for_compare(inst.get("label", "instance")).replace(" ", "_")[:40]
                                 fname = f"{Path(sup_gpkg.name).stem}_{label_slug}.gpkg"
                                 outputs.append((fname, out_path))
+                                fill_report.add_artifact("output_dataset", fname, out_path, details={"mode": "per_instance"})
                                 # Log domain codes applied for this instance output.
                                 run_domain_rows.extend(append_domain_code_log(
                                     _collect_domain_log_entries([inst]),
@@ -977,6 +1223,11 @@ def run_app() -> None:
                                     zf.write(out_path, arcname=fname)
                                 if run_domain_rows:
                                     zf.writestr("domain_code_log.csv", domain_log_rows_to_csv(run_domain_rows))
+                            fill_report.add_artifact("output_archive", zip_path.name, zip_path, details={"output_count": len(outputs)})
+                            fill_report.info(
+                                "supervisor_fill_completed",
+                                f"{sup_gpkg.name}: generated {len(outputs)} per-instance GeoPackage(s).",
+                            )
                             with open(zip_path, "rb") as f:
                                 data = f.read()
                             st.download_button(
@@ -985,6 +1236,13 @@ def run_app() -> None:
                                 file_name=f"{Path(sup_gpkg.name).stem}_instances.zip",
                                 mime="application/zip",
                                 key="sup_download_instances",
+                            )
+                            extra_files = _attach_fill_report_sections(fill_report, domain_rows=run_domain_rows)
+                            _render_report_downloads(
+                                fill_report,
+                                key_prefix="sup_fill_instances",
+                                bundle_name=f"{Path(sup_gpkg.name).stem}_instances",
+                                extra_files=extra_files,
                             )
                         elif fill_mode == "Match rows to instances (single GPKG)" and instance_labels:
                             use_line_bay_match = line_bay_info is not None
@@ -1053,6 +1311,12 @@ def run_app() -> None:
                                     "output": sup_gpkg.name,
                                 },
                             )
+                            fill_report.add_artifact("output_dataset", sup_gpkg.name, out_path, details={"layer": layer_name, "mode": "row_match"})
+                            fill_report.info(
+                                "supervisor_fill_completed",
+                                f"{sup_gpkg.name}: filled by matching workbook instances to '{match_column_choice or 'spatial/layout logic'}'.",
+                                {"match_column": match_column_choice or ""},
+                            )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
                             st.download_button(
@@ -1074,6 +1338,13 @@ def run_app() -> None:
                                     mime="application/zip",
                                     key="sup_download_rowmatch_with_log",
                                 )
+                            extra_files = _attach_fill_report_sections(fill_report, domain_rows=run_domain_rows)
+                            _render_report_downloads(
+                                fill_report,
+                                key_prefix="sup_fill_rowmatch",
+                                bundle_name=f"{Path(sup_gpkg.name).stem}_rowmatch",
+                                extra_files=extra_files,
+                            )
                         else:
                             out_path, layer_name = fill_one_gpkg(
                                 sup_gpkg,
@@ -1098,6 +1369,11 @@ def run_app() -> None:
                                     "output": sup_gpkg.name,
                                 },
                             )
+                            fill_report.add_artifact("output_dataset", sup_gpkg.name, out_path, details={"layer": layer_name, "mode": "single"})
+                            fill_report.info(
+                                "supervisor_fill_completed",
+                                f"{sup_gpkg.name}: filled using selected supervisor instance data.",
+                            )
                             with open(out_path, "rb") as f:
                                 data_bytes = f.read()
                             st.download_button(
@@ -1119,12 +1395,31 @@ def run_app() -> None:
                                     mime="application/zip",
                                     key="sup_download_with_log",
                                 )
+                            extra_files = _attach_fill_report_sections(fill_report, domain_rows=run_domain_rows)
+                            _render_report_downloads(
+                                fill_report,
+                                key_prefix="sup_fill_single",
+                                bundle_name=f"{Path(sup_gpkg.name).stem}_single_fill",
+                                extra_files=extra_files,
+                            )
                     except Exception as exc:
+                        fill_report.exception("supervisor_fill_failed", exc, {"device": device_choice, "layer": sup_layer})
                         st.error(f"Supervisor fill failed: {exc}")
+                        _render_report_downloads(
+                            fill_report,
+                            key_prefix="sup_fill_failed",
+                            bundle_name=f"{Path(sup_gpkg.name).stem}_fill_failed",
+                        )
             else:
                 st.info(f"{len(sup_gpkg_files)} GeoPackages uploaded; the first layer of each will be filled automatically using a per-file device match.")
                 if st.button("Fill all uploaded GeoPackages", key="sup_fill_all"):
                     run_id_validation_rows: list[dict[str, Any]] = []
+                    fill_all_report = RunReport(workflow="supervisor_fill_multi", title="supervisor_fill_multi")
+                    fill_all_report.set_metadata(
+                        workbook=sup_wb_path.name if sup_wb_path else "",
+                        sheet=sup_sheet,
+                        input_count=len(sup_gpkg_files),
+                    )
                     outputs, logs, run_domain_rows = fill_supervisor_batch(
                         sup_gpkg_files,
                         device_options,
@@ -1151,6 +1446,7 @@ def run_app() -> None:
                                     "rewritten_id_validation_report.csv",
                                     id_validation_rows_to_csv(run_id_validation_rows),
                                 )
+                        fill_all_report.add_artifact("output_archive", zip_path.name, zip_path, details={"output_count": len(outputs)})
                         with open(zip_path, "rb") as f:
                             data = f.read()
                         st.download_button(
@@ -1160,7 +1456,19 @@ def run_app() -> None:
                             mime="application/zip",
                             key="sup_download_zip",
                         )
-                    st.text_area("Supervisor fill log", value="\n".join(logs) if logs else "No logs.", height=180)
+                    extra_files = _attach_fill_report_sections(
+                        fill_all_report,
+                        domain_rows=run_domain_rows,
+                        id_rows=run_id_validation_rows,
+                    )
+                    _ingest_log_lines(fill_all_report, logs)
+                    st.text_area("Supervisor fill log", value=fill_all_report.log_text(), height=180)
+                    _render_report_downloads(
+                        fill_all_report,
+                        key_prefix="sup_fill_multi",
+                        bundle_name="supervisor_fill_multi",
+                        extra_files=extra_files,
+                    )
         finally:
             pass
 
@@ -1321,6 +1629,36 @@ def run_app() -> None:
                         )
 
                         if st.button("Generate Standardized GPKG", key="gen_std_gpkg"):
+                            mapping_report = RunReport(workflow="schema_mapping_single", title=map_file.name)
+                            mapping_report.set_metadata(
+                                schema_workbook=schema_label,
+                                schema_sheet=schema_sheet,
+                                equipment=equipment_name,
+                                source_layer=layer_map,
+                                source_type=source_type,
+                                output_format=output_choice,
+                                keep_unmatched=keep_unmatched,
+                            )
+                            mapping_rows = build_field_mapping_rows(
+                                list(gdf_map.columns),
+                                schema_fields,
+                                mapping,
+                                suggested_mapping=suggested,
+                                score_map=score_map,
+                                geometry_name=gdf_map.geometry.name if hasattr(gdf_map, "geometry") else None,
+                                low_confidence_threshold=accept_threshold,
+                            )
+                            mapping_report.add_section_rows("field_mapping", mapping_rows)
+                            _add_validation_results(
+                                mapping_report,
+                                build_mapping_validations(mapping_rows, low_confidence_threshold=accept_threshold),
+                            )
+                            mapping_report.add_artifact(
+                                "input_dataset",
+                                map_file.name,
+                                details=build_dataset_profile(gdf_map, name=map_file.name, layer_name=layer_map, source_format=source_type),
+                            )
+                            mapping_report.add_artifact("schema_workbook", schema_path.name, schema_path, details={"sheet": schema_sheet})
                             try:
                                 out_cols = {}
                                 for f in schema_fields:
@@ -1362,6 +1700,12 @@ def run_app() -> None:
                                     with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as tmp_out:
                                         out_path = tmp_out.name
                                     out_gdf.to_file(out_path, driver="GPKG", layer=layer_name)
+                                    mapping_report.add_artifact(
+                                        "output_dataset",
+                                        Path(map_file.name).name,
+                                        out_path,
+                                        details=build_dataset_profile(out_gdf, name=map_file.name, layer_name=layer_name, source_format="gpkg"),
+                                    )
                                     with open(out_path, "rb") as f:
                                         data_bytes = f.read()
                                     st.download_button(
@@ -1375,6 +1719,12 @@ def run_app() -> None:
                                     out_dir = Path(tmp_dir) / f"{layer_name}.gdb"
                                     out_gdf.to_file(out_dir, driver="FileGDB", layer=layer_name)
                                     zip_path = shutil.make_archive(str(out_dir), "zip", root_dir=tmp_dir, base_dir=out_dir.name)
+                                    mapping_report.add_artifact(
+                                        "output_archive",
+                                        Path(zip_path).name,
+                                        zip_path,
+                                        details=build_dataset_profile(out_gdf, name=map_file.name, layer_name=layer_name, source_format="FileGDB"),
+                                    )
                                     with open(zip_path, "rb") as f:
                                         data_bytes = f.read()
                                     st.download_button(
@@ -1384,14 +1734,47 @@ def run_app() -> None:
                                         mime="application/zip",
                                     )
                                     shutil.rmtree(tmp_dir, ignore_errors=True)
+                                _add_validation_results(
+                                    mapping_report,
+                                    build_output_validations(
+                                        out_gdf,
+                                        expected_fields=schema_fields,
+                                        geometry_required=hasattr(gdf_map, "geometry"),
+                                        label="standardized output",
+                                    ),
+                                )
+                                mapping_report.info(
+                                    "schema_mapping_completed",
+                                    f"{map_file.name}: standardized layer '{layer_map}' to schema '{equipment_name}'.",
+                                )
+                                _render_report_downloads(
+                                    mapping_report,
+                                    key_prefix="schema_mapping_single",
+                                    bundle_name=f"{Path(map_file.name).stem}_schema_mapping",
+                                )
                             except Exception as exc:
+                                mapping_report.exception("schema_mapping_failed", exc, {"input_name": map_file.name, "layer": layer_map})
                                 st.error(f"Schema mapping failed: {exc}")
+                                _render_report_downloads(
+                                    mapping_report,
+                                    key_prefix="schema_mapping_single_failed",
+                                    bundle_name=f"{Path(map_file.name).stem}_schema_mapping_failed",
+                                )
 
                         # ---------------- BATCH MODE ----------------
                         st.markdown("---")
                         st.subheader("Batch Map Multiple Layers")
                         selected_layers = st.multiselect("Select layers to batch map", layers_map, default=layers_map)
                         if st.button("Generate Batch Standardized Package", key="gen_batch"):
+                            batch_map_report = RunReport(workflow="schema_mapping_batch_layers", title=map_file.name)
+                            batch_map_report.set_metadata(
+                                schema_workbook=schema_label,
+                                schema_sheet=schema_sheet,
+                                equipment=equipment_name,
+                                source_type=source_type,
+                                selected_layer_count=len(selected_layers),
+                                keep_unmatched=keep_unmatched,
+                            )
                             try:
                                 default_driver = "FileGDB" if source_type.startswith("FileGDB") else "GPKG"
                                 tmp_dir = Path(tempfile.mkdtemp())
@@ -1403,6 +1786,20 @@ def run_app() -> None:
                                     exclude_layer_cols = {gdf_layer.geometry.name} if hasattr(gdf_layer, "geometry") else set()
                                     suggested_batch, score_map_batch = fuzzy_map_columns_with_scores(
                                         list(gdf_layer.columns), schema_fields, threshold=mapping_threshold, exclude=exclude_layer_cols
+                                    )
+                                    layer_mapping_rows = build_field_mapping_rows(
+                                        list(gdf_layer.columns),
+                                        schema_fields,
+                                        suggested_batch,
+                                        suggested_mapping=suggested_batch,
+                                        score_map=score_map_batch,
+                                        geometry_name=gdf_layer.geometry.name if hasattr(gdf_layer, "geometry") else None,
+                                        low_confidence_threshold=0.6,
+                                    )
+                                    batch_map_report.add_section_rows(f"{lyr}_field_mapping", layer_mapping_rows)
+                                    _add_validation_results(
+                                        batch_map_report,
+                                        build_mapping_validations(layer_mapping_rows, low_confidence_threshold=0.6),
                                     )
                                     norm_col_lookup_batch = {normalize_for_compare(c): c for c in gdf_layer.columns}
                                     out_cols_batch = {}
@@ -1441,10 +1838,25 @@ def run_app() -> None:
                                                 out_path.unlink(missing_ok=True)
                                         out_path = tmp_dir / "mapped.gpkg"
                                         out_layer.to_file(out_path, driver=driver, layer=layer_name_out)
+                                    _add_validation_results(
+                                        batch_map_report,
+                                        build_output_validations(
+                                            out_layer,
+                                            expected_fields=schema_fields,
+                                            geometry_required=hasattr(gdf_layer, "geometry"),
+                                            label=f"batch layer {lyr}",
+                                        ),
+                                    )
+                                    batch_map_report.add_artifact(
+                                        "output_layer",
+                                        f"{Path(map_file.name).name}:{layer_name_out}",
+                                        details=build_dataset_profile(out_layer, name=map_file.name, layer_name=layer_name_out, source_format=driver),
+                                    )
 
                                 if driver == "GPKG":
                                     with open(out_path, "rb") as f:
                                         data_bytes = f.read()
+                                    batch_map_report.add_artifact("output_dataset", out_path.name, out_path)
                                     st.download_button(
                                         "Download Batch Standardized GeoPackage",
                                         data=data_bytes,
@@ -1457,6 +1869,7 @@ def run_app() -> None:
                                     zip_path = shutil.make_archive(str(out_path), "zip", root_dir=out_path.parent, base_dir=out_path.name)
                                     with open(zip_path, "rb") as f:
                                         data_bytes = f.read()
+                                    batch_map_report.add_artifact("output_archive", Path(zip_path).name, zip_path)
                                     st.download_button(
                                         "Download Batch Standardized FileGDB (zip)",
                                         data=data_bytes,
@@ -1465,8 +1878,23 @@ def run_app() -> None:
                                         key="dl_batch_gdb",
                                     )
                                     shutil.rmtree(tmp_dir, ignore_errors=True)
+                                batch_map_report.info(
+                                    "schema_batch_mapping_completed",
+                                    f"{map_file.name}: standardized {len(selected_layers)} layer(s).",
+                                )
+                                _render_report_downloads(
+                                    batch_map_report,
+                                    key_prefix="schema_mapping_batch",
+                                    bundle_name=f"{Path(map_file.name).stem}_batch_schema_mapping",
+                                )
                             except Exception as exc:
+                                batch_map_report.exception("schema_batch_mapping_failed", exc, {"input_name": map_file.name})
                                 st.error(f"Batch mapping failed: {exc}")
+                                _render_report_downloads(
+                                    batch_map_report,
+                                    key_prefix="schema_mapping_batch_failed",
+                                    bundle_name=f"{Path(map_file.name).stem}_batch_schema_mapping_failed",
+                                )
         finally:
             if temp_gdb_dir:
                 shutil.rmtree(temp_gdb_dir, ignore_errors=True)
@@ -1528,10 +1956,19 @@ def run_app() -> None:
                     tmp_in = Path(tempfile.mkdtemp())
                     tmp_out = Path(tempfile.mkdtemp())
                     logs = []
+                    auto_report = RunReport(workflow="automated_schema_mapping_zip", title=getattr(auto_zip, "name", "auto_schema_zip"))
+                    auto_report.set_metadata(
+                        schema_workbook=schema_label_auto,
+                        schema_sheet=schema_sheet_auto,
+                        fallback_equipment=equipment_name_auto,
+                        mapping_threshold=mapping_threshold_auto,
+                        keep_unmatched=keep_unmatched_auto,
+                    )
                     try:
                         zip_in = tmp_in / "input.zip"
                         with open(zip_in, "wb") as f:
                             f.write(auto_zip.getbuffer())
+                        auto_report.add_artifact("input_archive", zip_in.name, zip_in)
                         with zipfile.ZipFile(zip_in, "r") as zf:
                             zf.extractall(tmp_in)
 
@@ -1547,8 +1984,14 @@ def run_app() -> None:
                         gdb_paths = list(tmp_in.rglob("*.gdb"))
 
                         status_msg.info(f"Unzipped. Found {len(gpkg_paths)} GPKG and {len(gdb_paths)} GDB paths. Starting mapping...")
+                        auto_report.info(
+                            "auto_schema_input_scan",
+                            f"Found {len(gpkg_paths)} GPKG and {len(gdb_paths)} GDB path(s) in uploaded archive.",
+                            {"gpkg_count": len(gpkg_paths), "gdb_count": len(gdb_paths)},
+                        )
 
                         if not gpkg_paths and not gdb_paths:
+                            auto_report.error("auto_schema_input_missing", "No GeoPackages or FileGDBs found inside the ZIP.")
                             st.error("No GeoPackages or FileGDBs found inside the ZIP.")
                         else:
                             equip_map = load_gpkg_equipment_map()
@@ -1556,11 +1999,26 @@ def run_app() -> None:
                             accept_threshold = 0.5
                             out_files = []
 
-                            def process_layer(gdf_layer, driver, out_path, layer_name, schema_fields, type_map):
+                            def process_layer(gdf_layer, driver, out_path, layer_name, schema_fields, type_map, report_local: RunReport | None = None):
                                 exclude_cols = {gdf_layer.geometry.name} if hasattr(gdf_layer, "geometry") else set()
                                 suggested, score_map = fuzzy_map_columns_with_scores(
                                     list(gdf_layer.columns), schema_fields, threshold=mapping_threshold_auto, exclude=exclude_cols
                                 )
+                                if report_local is not None:
+                                    mapping_rows = build_field_mapping_rows(
+                                        list(gdf_layer.columns),
+                                        schema_fields,
+                                        suggested,
+                                        suggested_mapping=suggested,
+                                        score_map=score_map,
+                                        geometry_name=gdf_layer.geometry.name if hasattr(gdf_layer, "geometry") else None,
+                                        low_confidence_threshold=accept_threshold,
+                                    )
+                                    report_local.add_section_rows(f"{layer_name}_field_mapping", mapping_rows)
+                                    _add_validation_results(
+                                        report_local,
+                                        build_mapping_validations(mapping_rows, low_confidence_threshold=accept_threshold),
+                                    )
                                 norm_col_lookup = {normalize_for_compare(c): c for c in gdf_layer.columns}
                                 n = len(gdf_layer)
                                 def _na_series():
@@ -1586,6 +2044,21 @@ def run_app() -> None:
                                 out_layer = gpd.GeoDataFrame(out_cols, geometry=geom_series, crs=gdf_layer.crs)
                                 out_layer = sanitize_gdf_for_gpkg(out_layer)
                                 out_layer.to_file(out_path, driver=driver, layer=layer_name)
+                                if report_local is not None:
+                                    _add_validation_results(
+                                        report_local,
+                                        build_output_validations(
+                                            out_layer,
+                                            expected_fields=schema_fields,
+                                            geometry_required=hasattr(gdf_layer, "geometry"),
+                                            label=layer_name,
+                                        ),
+                                    )
+                                    report_local.add_artifact(
+                                        "output_layer",
+                                        layer_name,
+                                        details=build_dataset_profile(out_layer, name=layer_name, layer_name=layer_name, source_format=driver),
+                                    )
 
                             # Process GPKG files
                             gpkg_args = [
@@ -1604,17 +2077,23 @@ def run_app() -> None:
                             ]
                             # Sequential mapping to avoid pool hangs in some environments
                             for args in gpkg_args:
-                                out_path, log_msg = process_single_gpkg(args)
+                                out_path, log_msg, gpkg_report = process_single_gpkg(args)
                                 if out_path:
                                     out_files.append(out_path)
                                 logs.append(log_msg)
+                                auto_report.extend(gpkg_report, section_prefix=Path(args[0]).stem)
 
                             # Process FileGDB folders
                             for gdb in sorted(gdb_paths):
+                                gdb_report = RunReport(workflow="automated_schema_mapping_gdb", title=gdb.name)
+                                gdb_report.set_metadata(schema_workbook=schema_label_auto, schema_sheet=schema_sheet_auto, input_name=gdb.name)
                                 try:
                                     layers = list_gpkg_layers(gdb)
                                     if not layers:
-                                        logs.append(f"{gdb.name}: no layers found.")
+                                        msg = f"{gdb.name}: no layers found."
+                                        logs.append(msg)
+                                        gdb_report.warning("gdb_layers_missing", msg, {"input_name": gdb.name})
+                                        auto_report.extend(gdb_report, section_prefix=gdb.stem)
                                         continue
                                     equipment_name = resolve_equipment_name(gdb.name, equipment_options_auto, equip_map)
                                     schema_fields_auto, type_map_auto = load_schema_fields(schema_path_auto, schema_sheet_auto, equipment_name)
@@ -1622,14 +2101,26 @@ def run_app() -> None:
                                     for lyr in layers:
                                         gdf_layer = gpd.read_file(gdb, layer=lyr)
                                         layer_name_out = derive_layer_name_from_filename(lyr)
-                                        process_layer(gdf_layer, "FileGDB", out_path, layer_name_out, schema_fields_auto, type_map_auto)
+                                        gdb_report.add_artifact(
+                                            "input_layer",
+                                            f"{gdb.name}:{lyr}",
+                                            details=build_dataset_profile(gdf_layer, name=gdb.name, layer_name=lyr, source_format="FileGDB"),
+                                        )
+                                        process_layer(gdf_layer, "FileGDB", out_path, layer_name_out, schema_fields_auto, type_map_auto, gdb_report)
                                     out_files.append(out_path)
-                                    logs.append(f"{gdb.name}: mapped {len(layers)} layer(s) using equipment '{equipment_name}'.")
+                                    msg = f"{gdb.name}: mapped {len(layers)} layer(s) using equipment '{equipment_name}'."
+                                    logs.append(msg)
+                                    gdb_report.add_artifact("output_dataset", out_path.name, out_path, details={"layer_count": len(layers), "equipment_name": equipment_name})
+                                    gdb_report.info("gdb_mapping_completed", msg)
                                 except Exception as exc:
-                                    logs.append(f"{gdb.name}: failed ({exc}).")
+                                    msg = f"{gdb.name}: failed ({exc})."
+                                    logs.append(msg)
+                                    gdb_report.exception("gdb_mapping_failed", exc, {"input_name": gdb.name})
+                                auto_report.extend(gdb_report, section_prefix=gdb.stem)
 
                             if out_files:
                                 zip_out = shutil.make_archive(str(tmp_out / "auto_mapped"), "zip", root_dir=tmp_out, base_dir=".")
+                                auto_report.add_artifact("output_archive", Path(zip_out).name, zip_out, details={"output_count": len(out_files)})
                                 with open(zip_out, "rb") as f:
                                     data = f.read()
                                 st.download_button(
@@ -1640,7 +2131,13 @@ def run_app() -> None:
                                     key="dl_auto_schema_zip",
                                 )
                             status_msg.success(f"Mapping complete. Generated {len(out_files)} output files.")
-                            st.text_area("Auto mapping log", value="\n".join(logs) if logs else "No logs.", height=220)
+                            _ingest_log_lines(auto_report, logs)
+                            st.text_area("Auto mapping log", value=auto_report.log_text(), height=220)
+                            _render_report_downloads(
+                                auto_report,
+                                key_prefix="auto_schema_mapping",
+                                bundle_name="auto_schema_mapping",
+                            )
                     finally:
                         status_msg.empty()
                         shutil.rmtree(tmp_in, ignore_errors=True)
